@@ -14,6 +14,7 @@ import com.mythofcrawl.crawler.excel.ExcelSpecMatcher;
 import com.mythofcrawl.crawler.excel.ParamExtractor;
 import com.mythofcrawl.crawler.model.ActionGroup;
 import com.mythofcrawl.crawler.model.ApiCall;
+import com.mythofcrawl.crawler.model.AuditNote;
 import com.mythofcrawl.crawler.model.CapturedApiEntry;
 import com.mythofcrawl.crawler.model.CrawlConfig;
 import com.mythofcrawl.crawler.model.CrawlState;
@@ -22,6 +23,7 @@ import com.mythofcrawl.crawler.model.PathNamer;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Set;
 import java.util.function.Consumer;
@@ -151,6 +153,16 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
         boolean shouldCapture = (st == CrawlState.Status.RUNNING) || passiveCapture;
         if (shouldCapture && !req.method().equalsIgnoreCase("OPTIONS")) {
             processApiCapture(req, interceptedResponse);
+        }
+
+        // 2b. Intercept top-level HTTP 3xx off-host redirects during active auto-crawl
+        int statusCode = interceptedResponse.statusCode();
+        if (st == CrawlState.Status.RUNNING && config.isAllowAutoRequests()
+            && statusCode >= 300 && statusCode < 400 && isTopLevelDocumentNavigation(req, reqPath)) {
+            HttpResponse redirectBounce = handleOffHostHttpRedirect(req, interceptedResponse, statusCode);
+            if (redirectBounce != null) {
+                return ProxyResponseReceivedAction.doNotIntercept(redirectBounce);
+            }
         }
 
         // 3. Inject Browser DOM Crawler Agent into top-level HTML pages when armed or running (skip iframes)
@@ -422,6 +434,86 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
             return html.substring(0, body.start()) + SCRIPT_TAG + "\n" + html.substring(body.start());
         }
         return SCRIPT_TAG + "\n" + html;
+    }
+
+    private static boolean isTopLevelDocumentNavigation(HttpRequest req, String reqPath) {
+        String fetchDest = req.headerValue("Sec-Fetch-Dest");
+        String fetchMode = req.headerValue("Sec-Fetch-Mode");
+        if (fetchMode != null && !fetchMode.trim().isEmpty() && !"navigate".equalsIgnoreCase(fetchMode.trim())) {
+            return false;
+        }
+        if (fetchDest != null && !fetchDest.trim().isEmpty()) {
+            return "document".equalsIgnoreCase(fetchDest.trim());
+        }
+        if (isStaticAsset(reqPath)) {
+            return false;
+        }
+        String accept = req.headerValue("Accept");
+        return accept != null && accept.toLowerCase().contains("text/html");
+    }
+
+    private HttpResponse handleOffHostHttpRedirect(
+        HttpRequest req,
+        InterceptedResponse resp,
+        int statusCode
+    ) {
+        String locationHeader = resp.headerValue("Location");
+        if (locationHeader == null || locationHeader.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            String reqUrl = req.url() != null ? req.url() : "";
+            URI base = URI.create(reqUrl);
+            URI resolved = base.resolve(locationHeader.trim());
+            String scheme = resolved.getScheme() != null ? resolved.getScheme().toLowerCase() : "";
+            if (!"http".equals(scheme) && !"https".equals(scheme)) {
+                return null;
+            }
+            String targetHost = resolved.getHost();
+            if (targetHost == null || config.isHostAllowed(targetHost)) {
+                return null;
+            }
+            String destUrl = resolved.toString();
+            ActionGroup grp = state.getCurrentGroup();
+            if (grp == null) {
+                grp = state.getActionGroups().openGroup(
+                    state.getCurrentActionPath(), "", "", state.getCurrentPageUrl());
+            }
+            state.getActionGroups().recordStandaloneNote(
+                grp,
+                AuditNote.Severity.WARN,
+                AuditNote.Type.EXTERNAL_REDIRECT,
+                "NAV",
+                destUrl,
+                "HTTP " + statusCode + " chuyển hướng ngoài host: " + destUrl
+            );
+            CrawlState.BacktrackResult bt = state.recordRedirectBounce(reqUrl, destUrl, true);
+            String backUrl = bt.targetUrl;
+            String html;
+            if (bt.exhausted || backUrl.isEmpty()) {
+                state.setStatus(CrawlState.Status.STOPPED);
+                log("[Redirect Guard] HTTP " + statusCode + " -> " + destUrl + " (Hết URL an toàn, dừng crawl)");
+                html = "<!doctype html><html><meta charset=\"utf-8\"><body>"
+                    + "<p>Đã chặn chuyển hướng ngoài host và hoàn tất hàng đợi.</p></body></html>";
+            } else {
+                log("[Redirect Guard] HTTP " + statusCode + " -> " + destUrl
+                    + ", lùi " + bt.levelsBack + " cấp -> " + backUrl);
+                html = LocalControlServer.buildBounceHtml(backUrl, destUrl);
+            }
+            notifyUi();
+            byte[] bodyBytes = html.getBytes(StandardCharsets.UTF_8);
+            byte[] hdrBytes = ("HTTP/1.1 200 OK\r\n"
+                + "Content-Type: text/html; charset=utf-8\r\n"
+                + "Content-Length: " + bodyBytes.length + "\r\n"
+                + "Cache-Control: no-store, no-cache, must-revalidate\r\n"
+                + "Connection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII);
+            ByteArrayOutputStream raw = new ByteArrayOutputStream(hdrBytes.length + bodyBytes.length);
+            raw.write(hdrBytes, 0, hdrBytes.length);
+            raw.write(bodyBytes, 0, bodyBytes.length);
+            return HttpResponse.httpResponse(ByteArray.byteArray(raw.toByteArray()));
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private void notifyUi() {

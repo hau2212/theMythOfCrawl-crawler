@@ -20,6 +20,7 @@ public final class ActionGroup {
     private long lastSeenMs;
     private int triggerCount = 1;
     private final List<ApiCall> calls = new ArrayList<>();
+    private final List<AuditNote> groupNotes = new ArrayList<>();
 
     public ActionGroup(int id, String actionPath, String kind, String label, String pageUrl, long nowMs) {
         this.id = id;
@@ -39,6 +40,17 @@ public final class ActionGroup {
     synchronized void addCall(ApiCall call) {
         calls.add(call);
         lastSeenMs = System.currentTimeMillis();
+    }
+
+    synchronized void addGroupNote(AuditNote note) {
+        if (note != null) {
+            groupNotes.add(note);
+            lastSeenMs = System.currentTimeMillis();
+        }
+    }
+
+    public synchronized List<AuditNote> getGroupNotes() {
+        return new ArrayList<>(groupNotes);
     }
 
     synchronized List<ApiCall> callsView() {
@@ -62,7 +74,7 @@ public final class ActionGroup {
     }
 
     public synchronized int noteCount() {
-        int n = 0;
+        int n = groupNotes.size();
         for (ApiCall c : calls) {
             n += c.getNotes().size();
         }
@@ -81,6 +93,9 @@ public final class ActionGroup {
 
     public synchronized AuditNote.Severity worstSeverity() {
         AuditNote.Severity w = null;
+        for (AuditNote n : groupNotes) {
+            w = AuditNote.worst(w, n.severity);
+        }
         for (ApiCall c : calls) {
             w = AuditNote.worst(w, c.worstSeverity());
         }

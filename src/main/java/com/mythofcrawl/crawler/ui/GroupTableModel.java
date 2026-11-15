@@ -53,7 +53,7 @@ public final class GroupTableModel {
             List<ActionGroup> all = store != null ? store.snapshotGroups() : Collections.emptyList();
             List<ActionGroup> out = new ArrayList<>(all.size());
             for (ActionGroup g : all) {
-                if ("WITH_APIS".equals(filterMode) && g.callCount() == 0) {
+                if ("WITH_APIS".equals(filterMode) && g.callCount() == 0 && g.noteCount() == 0) {
                     continue;
                 }
                 if ("WITH_NOTES".equals(filterMode) && g.noteCount() == 0) {
@@ -71,6 +71,11 @@ public final class GroupTableModel {
         private static boolean matchesGroup(ActionGroup g, String q) {
             if (g.actionPath.toLowerCase().contains(q) || g.pageUrl.toLowerCase().contains(q)) {
                 return true;
+            }
+            for (AuditNote gn : g.getGroupNotes()) {
+                if (gn.endpoint.toLowerCase().contains(q) || gn.message.toLowerCase().contains(q)) {
+                    return true;
+                }
             }
             for (ApiCall c : g.getCalls()) {
                 if (c.displayPath().toLowerCase().contains(q)

@@ -174,6 +174,7 @@ public final class LocalControlServer {
             resp.put("dangerKeywords", config.getDangerKeywordsList());
             resp.put("normalizeRouteIds", config.isNormalizeRouteIds());
             resp.put("routeRootLabel", config.getRouteRootLabel());
+            resp.put("allowedHosts", new java.util.ArrayList<>(config.getAllowedHostsSet()));
             resp.put("formFill", config.getFormFillProfile().toAgentMap());
             resp.put("clickedSignatures", state.getClickedSignatures(routeKey));
             resp.put("inFlight", state.getInFlightCount());
@@ -257,10 +258,17 @@ public final class LocalControlServer {
         if ("/__myth_crawl/next_page".equals(path)) {
             String curUrl = extractQueryParam(query, "url");
             if (!curUrl.isEmpty()) {
-                state.markUrlVisited(curUrl);
+                state.markUrlCompleted(curUrl);
             }
-            String nextUrl = state.getStatus() == CrawlState.Status.RUNNING
-                ? state.pollNextUnvisitedUrl() : null;
+            String nextUrl = null;
+            int levelsBack = 0;
+            if (state.getStatus() == CrawlState.Status.RUNNING) {
+                CrawlState.BacktrackResult bt = state.resolveBacktrackOrNextPage(curUrl, false, true);
+                if (!bt.exhausted && !bt.targetUrl.isEmpty()) {
+                    nextUrl = bt.targetUrl;
+                    levelsBack = bt.levelsBack;
+                }
+            }
             if (nextUrl == null && state.getStatus() == CrawlState.Status.RUNNING) {
                 state.setStatus(CrawlState.Status.STOPPED);
                 if (logger != null) {
@@ -272,10 +280,158 @@ public final class LocalControlServer {
             }
             Map<String, Object> resp = new LinkedHashMap<>();
             resp.put("nextUrl", nextUrl != null ? nextUrl : "");
+            resp.put("levelsBack", levelsBack);
             resp.put("done", nextUrl == null);
             resp.put("status", state.getStatus().name());
             resp.put("queueRemaining", state.getPendingQueueSize());
             writeJson(out, resp);
+            return;
+        }
+
+        if ("/__myth_crawl/note".equals(path) && "POST".equals(method)) {
+            Map<String, Object> req = MiniJson.parseObject(bodyStr);
+            String actionPath = MiniJson.asString(req, "actionPath", state.getCurrentActionPath());
+            String kind = MiniJson.asString(req, "kind", "");
+            String label = MiniJson.asString(req, "label", "");
+            String pageUrl = MiniJson.asString(req, "pageUrl", state.getCurrentPageUrl());
+            String noteTypeRaw = MiniJson.asString(req, "noteType", "REDIRECT_DEFERRED");
+            String sevRaw = MiniJson.asString(req, "severity", "WARN");
+            String reqMethod = MiniJson.asString(req, "method", "NAV");
+            String endpoint = MiniJson.asString(req, "endpoint", "");
+            String message = MiniJson.asString(req, "message", "");
+            String deferUrl = MiniJson.asString(req, "deferUrl", "");
+
+            com.mythofcrawl.crawler.model.AuditNote.Type noteType = parseNoteType(noteTypeRaw);
+            com.mythofcrawl.crawler.model.AuditNote.Severity sev = parseSeverity(sevRaw);
+            com.mythofcrawl.crawler.model.ActionGroup grp = state.getActionGroups()
+                .openGroup(actionPath, kind, label, pageUrl);
+            state.getActionGroups().recordStandaloneNote(grp, sev, noteType, reqMethod, endpoint, message);
+            if (!deferUrl.isEmpty()) {
+                state.markUrlDeferred(deferUrl);
+            }
+            if (logger != null && !message.isEmpty()) {
+                logger.accept("[NOTE " + noteType.label + "] " + actionPath + " -> " + message);
+            }
+            if (onUiEvent != null) {
+                onUiEvent.run();
+            }
+            Map<String, Object> resp = new LinkedHashMap<>();
+            resp.put("ok", true);
+            resp.put("groupId", grp != null ? grp.id : 0);
+            writeJson(out, resp);
+            return;
+        }
+
+        if ("/__myth_crawl/backtrack".equals(path)) {
+            Map<String, Object> req = "POST".equals(method) && !bodyStr.isEmpty()
+                ? MiniJson.parseObject(bodyStr) : Map.of();
+            String curUrl = extractQueryParam(query, "url");
+            if (curUrl.isEmpty()) {
+                curUrl = MiniJson.asString(req, "url", state.getCurrentPageUrl());
+            }
+            String deferParam = extractQueryParam(query, "defer");
+            if (deferParam.isEmpty()) {
+                deferParam = MiniJson.asString(req, "defer", "");
+            }
+            boolean defer = "1".equals(deferParam) || "true".equalsIgnoreCase(deferParam);
+            String dest = extractQueryParam(query, "dest");
+            if (dest.isEmpty()) {
+                dest = MiniJson.asString(req, "dest", "");
+            }
+            String reason = extractQueryParam(query, "reason");
+            if (reason.isEmpty()) {
+                reason = MiniJson.asString(req, "reason", "");
+            }
+            if (defer && !curUrl.isEmpty()) {
+                state.markUrlDeferred(curUrl);
+            }
+            if (!dest.isEmpty() || !reason.isEmpty()) {
+                com.mythofcrawl.crawler.model.ActionGroup grp = state.getActionGroups().openGroup(
+                    state.getCurrentActionPath(), "", "", curUrl);
+                String msg = !reason.isEmpty() ? reason : ("Tạm NOTE & quay lại từ chuyển hướng: " + dest);
+                state.getActionGroups().recordStandaloneNote(
+                    grp,
+                    com.mythofcrawl.crawler.model.AuditNote.Severity.WARN,
+                    com.mythofcrawl.crawler.model.AuditNote.Type.REDIRECT_DEFERRED,
+                    "NAV",
+                    !dest.isEmpty() ? dest : curUrl,
+                    msg
+                );
+            }
+
+            CrawlState.BacktrackResult bt = state.getStatus() == CrawlState.Status.RUNNING
+                ? state.resolveBacktrackOrNextPage(curUrl, true, true)
+                : new CrawlState.BacktrackResult("", 0, false, true);
+            boolean done = bt.exhausted || bt.targetUrl.isEmpty();
+            if (done && state.getStatus() == CrawlState.Status.RUNNING) {
+                state.setStatus(CrawlState.Status.STOPPED);
+                if (logger != null) {
+                    logger.accept("Hoàn tất backtrack & hàng đợi! Đã duyệt " + state.getVisitedPagesCount() + " trang.");
+                }
+            } else if (!done && logger != null) {
+                logger.accept("[Backtrack " + bt.levelsBack + " cấp] Quay lại: " + bt.targetUrl);
+            }
+            if (onUiEvent != null) {
+                onUiEvent.run();
+            }
+            Map<String, Object> resp = new LinkedHashMap<>();
+            resp.put("targetUrl", bt.targetUrl);
+            resp.put("levelsBack", bt.levelsBack);
+            resp.put("fromQueue", bt.fromQueue);
+            resp.put("done", done);
+            resp.put("status", state.getStatus().name());
+            resp.put("queueRemaining", state.getPendingQueueSize());
+            writeJson(out, resp);
+            return;
+        }
+
+        if ("/__myth_crawl/bounce_back".equals(path)) {
+            String dest = extractQueryParam(query, "dest");
+            String from = extractQueryParam(query, "from");
+            String markFrom = extractQueryParam(query, "markFrom");
+            if (state.getStatus() != CrawlState.Status.RUNNING || !config.isAllowAutoRequests()) {
+                String html = "<!doctype html><html><meta charset=\"utf-8\"><body>"
+                    + "<p>Crawl đang tạm dừng/dừng. Đã chặn chuyển hướng ngoài host.</p>"
+                    + "</body></html>";
+                writeResponse(out, 200, "text/html; charset=utf-8", html.getBytes(StandardCharsets.UTF_8));
+                return;
+            }
+            String pageUrl = !from.isEmpty() ? from : state.getCurrentPageUrl();
+            String actionPath = state.getCurrentActionPath();
+            com.mythofcrawl.crawler.model.ActionGroup grp = state.getActionGroups()
+                .openGroup(actionPath, "", "", pageUrl);
+            state.getActionGroups().recordStandaloneNote(
+                grp,
+                com.mythofcrawl.crawler.model.AuditNote.Severity.WARN,
+                com.mythofcrawl.crawler.model.AuditNote.Type.EXTERNAL_REDIRECT,
+                "NAV",
+                dest,
+                "Đã chặn chuyển hướng ngoài host khi tự động crawl: " + dest
+            );
+            CrawlState.BacktrackResult bt = state.recordRedirectBounce(pageUrl, dest, "1".equals(markFrom));
+            String backUrl = bt.targetUrl;
+            if (bt.exhausted || backUrl.isEmpty()) {
+                state.setStatus(CrawlState.Status.STOPPED);
+                if (logger != null) {
+                    logger.accept("[Redirect Guard] Chặn " + dest + " và hết URL an toàn -> Dừng crawl.");
+                }
+                if (onUiEvent != null) {
+                    onUiEvent.run();
+                }
+                String html = "<!doctype html><html><meta charset=\"utf-8\"><body>"
+                    + "<p>Đã chặn chuyển hướng ngoài host và hoàn tất hàng đợi.</p></body></html>";
+                writeResponse(out, 200, "text/html; charset=utf-8", html.getBytes(StandardCharsets.UTF_8));
+                return;
+            }
+            if (logger != null) {
+                logger.accept("[Redirect Guard] Chặn ra ngoài (" + dest + "), lùi "
+                    + bt.levelsBack + " cấp -> " + backUrl);
+            }
+            if (onUiEvent != null) {
+                onUiEvent.run();
+            }
+            writeResponse(out, 200, "text/html; charset=utf-8",
+                buildBounceHtml(backUrl, dest).getBytes(StandardCharsets.UTF_8));
             return;
         }
 
@@ -308,6 +464,38 @@ public final class LocalControlServer {
         out.write(header.getBytes(StandardCharsets.US_ASCII));
         out.write(body);
         out.flush();
+    }
+
+    private static com.mythofcrawl.crawler.model.AuditNote.Type parseNoteType(String raw) {
+        if (raw != null && !raw.isEmpty()) {
+            try {
+                return com.mythofcrawl.crawler.model.AuditNote.Type.valueOf(raw.trim().toUpperCase());
+            } catch (IllegalArgumentException ignored) {
+                // fall through
+            }
+        }
+        return com.mythofcrawl.crawler.model.AuditNote.Type.REDIRECT_DEFERRED;
+    }
+
+    private static com.mythofcrawl.crawler.model.AuditNote.Severity parseSeverity(String raw) {
+        if (raw != null && !raw.isEmpty()) {
+            try {
+                return com.mythofcrawl.crawler.model.AuditNote.Severity.valueOf(raw.trim().toUpperCase());
+            } catch (IllegalArgumentException ignored) {
+                // fall through
+            }
+        }
+        return com.mythofcrawl.crawler.model.AuditNote.Severity.WARN;
+    }
+
+    public static String buildBounceHtml(String backUrl, String blockedDest) {
+        String jsTarget = MiniJson.stringify(backUrl);
+        String safeDest = blockedDest != null ? blockedDest.replace("<", "&lt;").replace(">", "&gt;") : "";
+        return "<!doctype html><html><head><meta charset=\"utf-8\">"
+            + "<title>Returning to safe crawl page</title></head><body>"
+            + "<p>Blocked off-host redirect to " + safeDest + ". Returning...</p>"
+            + "<script>try{window.location.replace(" + jsTarget + ");}catch(e){window.location.href=" + jsTarget + ";}</script>"
+            + "</body></html>";
     }
 
     private static String extractQueryParam(String query, String targetKey) {

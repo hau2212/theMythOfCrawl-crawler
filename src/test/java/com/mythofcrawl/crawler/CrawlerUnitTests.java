@@ -20,6 +20,7 @@ import com.mythofcrawl.crawler.model.PathNamer;
 import com.mythofcrawl.crawler.proxy.ExtenderPushManager;
 import com.mythofcrawl.crawler.proxy.LocalControlServer;
 import com.mythofcrawl.crawler.ui.CrawlerTabPanel;
+import com.mythofcrawl.crawler.ui.GroupTableModel;
 
 import javax.swing.SwingUtilities;
 
@@ -67,6 +68,9 @@ public final class CrawlerUnitTests {
             testHeaderFilterProfileAndSafeRequestGate();
             testExtenderPushLedgerWithoutWireModification(tmpDir);
             testUiPanelsInitializeWithoutNpe();
+            testMultiLevelTrailBacktrackAndRedirectBounce();
+            testStandaloneAuditNotesAndTableFilter();
+            testLocalControlServerNoteBacktrackAndBounceEndpoints();
             System.out.println("ALL TESTS PASSED (" + passed + " test groups verified).");
         } finally {
             deleteRecursive(tmpDir.toFile());
@@ -522,6 +526,132 @@ public final class CrawlerUnitTests {
             panel.dispose();
         });
         passed++;
+    }
+
+    private static void testMultiLevelTrailBacktrackAndRedirectBounce() {
+        CrawlConfig cfg = new CrawlConfig();
+        cfg.setAllowedHostsCsv("target.local");
+        CrawlState state = new CrawlState();
+        state.resetAll("https://target.local/");
+        state.setStatus(CrawlState.Status.RUNNING);
+
+        // Build 3 trail levels: / -> /promo -> /go-store
+        state.setCurrentContext("toppage > page load", "page load", "", "https://target.local/");
+        state.setCurrentContext("toppage > promo > page load", "page load", "", "https://target.local/promo");
+        state.setCurrentContext("toppage > go-store > page load", "page load", "", "https://target.local/go-store");
+        assertEquals(3, state.getTrailDepth(), "Trail stack depth must be 3");
+
+        // 1-level bounce from /go-store redirector
+        CrawlState.BacktrackResult bt1 = state.recordRedirectBounce(
+            "https://target.local/go-store", "https://apps.apple.com/app/x", true);
+        assertTrue(state.isUrlDeferred("https://target.local/go-store"), "/go-store marked deferred");
+        assertTrue(state.isUrlDeferred("https://apps.apple.com/app/x"), "External target marked deferred");
+        assertEquals(1, bt1.levelsBack, "Bounce back 1 level from /go-store to /promo");
+        assertEquals("https://target.local/promo", bt1.targetUrl, "Landed back on /promo");
+
+        // 2-level bounce: mark /promo deferred, add /child on stack -> bounce pops 2 levels back to /
+        state.setCurrentContext("toppage > child > page load", "page load", "", "https://target.local/child");
+        state.markUrlDeferred("https://target.local/promo");
+        CrawlState.BacktrackResult bt2 = state.recordRedirectBounce(
+            "https://target.local/child", "https://play.google.com/store", true);
+        assertEquals(2, bt2.levelsBack, "Skip deferred parent /promo -> jump 2 levels back to /");
+        assertEquals("https://target.local/", bt2.targetUrl, "Landed back on root /");
+
+        // Button click bounce on active homepage (non-page-load context) must KEEP homepage intact
+        state.setCurrentContext("toppage > Chân trang > Link 'App Store'", "Link", "App Store", "https://target.local/");
+        assertTrue(state.getLastContextActionAtMs() > 0, "Context timestamp updated");
+        CrawlState.BacktrackResult btKeep = state.recordRedirectBounce(
+            "https://target.local/", "https://apps.apple.com/vn", false);
+        assertTrue(!state.isUrlDeferred("https://target.local/"), "Homepage stays non-deferred when button bounced");
+        assertEquals("https://target.local/", btKeep.targetUrl, "Stays on unfinished homepage");
+        assertEquals(0, btKeep.levelsBack, "Zero stack pops when resuming unfinished page");
+
+        // Returning to interrupted unfinished parent before polling queued pages
+        state.resetAll("https://target.local/");
+        state.enqueueUrl("https://target.local/queued", cfg);
+        state.enterPageLevel("https://target.local/");
+        state.markUrlVisited("https://target.local/"); // simulates /discovered at page start
+        state.enterPageLevel("https://target.local/sub");
+        state.markUrlCompleted("https://target.local/sub");
+        CrawlState.BacktrackResult btParent = state.resolveBacktrackOrNextPage("https://target.local/sub", false, true);
+        assertTrue(!btParent.fromQueue, "Must resume unfinished parent before polling queue");
+        assertEquals("https://target.local/", btParent.targetUrl, "Resumed unfinished root page");
+
+        state.markUrlCompleted("https://target.local/");
+        CrawlState.BacktrackResult btQueue = state.resolveBacktrackOrNextPage("https://target.local/", false, true);
+        assertTrue(btQueue.fromQueue, "Now polls frontier queue once stack is clear");
+        assertEquals("https://target.local/queued", btQueue.targetUrl, "Polled queued page");
+        passed++;
+    }
+
+    private static void testStandaloneAuditNotesAndTableFilter() {
+        ActionGroupStore store = new ActionGroupStore();
+        ActionGroup g = store.openGroup(
+            "toppage > Chân trang > Link 'Icon App Store'", "Link", "Icon App Store", "https://target.local/");
+
+        store.recordStandaloneNote(
+            g, AuditNote.Severity.WARN, AuditNote.Type.EXTERNAL_REDIRECT,
+            "NAV", "https://apps.apple.com/vn/app", "Blocked external redirect");
+        // Duplicate same group + type + endpoint must deduplicate cleanly
+        store.recordStandaloneNote(
+            g, AuditNote.Severity.WARN, AuditNote.Type.EXTERNAL_REDIRECT,
+            "NAV", "https://apps.apple.com/vn/app", "Blocked external redirect");
+
+        assertEquals(1, g.getGroupNotes().size(), "Standalone group note deduplicated");
+        assertEquals(1, g.noteCount(), "noteCount includes standalone group notes");
+        assertEquals(AuditNote.Severity.WARN, g.worstSeverity(), "worstSeverity reflects standalone note");
+        assertEquals(1, store.snapshotNotes().size(), "snapshotNotes includes standalone notes");
+
+        GroupTableModel.ActionGroupsModel model = new GroupTableModel.ActionGroupsModel(store);
+        model.setFilter("WITH_APIS", "");
+        assertEquals(1, model.getRowCount(), "WITH_APIS filter retains groups having standalone NOTE");
+        model.setFilter("ALL", "apps.apple.com");
+        assertEquals(1, model.getRowCount(), "Search filter matches standalone note endpoint");
+        passed++;
+    }
+
+    private static void testLocalControlServerNoteBacktrackAndBounceEndpoints() throws Exception {
+        CrawlConfig cfg = new CrawlConfig();
+        cfg.setAllowedHostsCsv("127.0.0.1");
+        cfg.setAllowAutoRequests(true);
+        CrawlState state = new CrawlState();
+        state.resetAll("http://127.0.0.1/home");
+        state.setStatus(CrawlState.Status.RUNNING);
+        state.enqueueUrl("http://127.0.0.1/fallback", cfg);
+
+        LocalControlServer server = new LocalControlServer(cfg, state, null, null);
+        server.start();
+        try {
+            int port = server.getPort();
+            String base = "http://127.0.0.1:" + port;
+
+            httpRequest("POST", base + "/__myth_crawl/context",
+                "{\"actionPath\":\"toppage > page load\",\"kind\":\"page load\",\"label\":\"\",\"pageUrl\":\"http://127.0.0.1/home\"}");
+            httpRequest("POST", base + "/__myth_crawl/context",
+                "{\"actionPath\":\"toppage > sub > page load\",\"kind\":\"page load\",\"label\":\"\",\"pageUrl\":\"http://127.0.0.1/sub\"}");
+            assertEquals(2, state.getTrailDepth(), "Server recorded 2 trail levels via /context");
+
+            String noteResp = httpRequest("POST", base + "/__myth_crawl/note",
+                "{\"actionPath\":\"toppage > Chân trang > Link 'App Store'\",\"kind\":\"Link\",\"label\":\"App Store\",\"pageUrl\":\"http://127.0.0.1/sub\",\"noteType\":\"EXTERNAL_REDIRECT\",\"severity\":\"WARN\",\"method\":\"NAV\",\"endpoint\":\"https://apps.apple.com/x\",\"message\":\"Chặn chuyển hướng ngoài\"}");
+            assertTrue(noteResp.contains("\"ok\":true"), "/note endpoint succeeded");
+            assertTrue(state.getActionGroups().noteCount(AuditNote.Severity.WARN) >= 1, "Note recorded in store");
+
+            String bounceHtml = httpRequest("GET",
+                base + "/__myth_crawl/bounce_back?dest=https%3A%2F%2Fapps.apple.com%2Fx&from=http%3A%2F%2F127.0.0.1%2Fsub&markFrom=1", null);
+            assertTrue(bounceHtml.contains("location.replace"), "bounce_back returns location.replace HTML");
+            assertTrue(bounceHtml.contains("http://127.0.0.1/home"), "bounce_back steps back to /home");
+            assertTrue(state.isUrlDeferred("http://127.0.0.1/sub"), "Redirecting /sub marked deferred");
+
+            String btJson = httpRequest("POST", base + "/__myth_crawl/backtrack",
+                "{\"url\":\"http://127.0.0.1/home\",\"defer\":\"1\",\"dest\":\"https://play.google.com/store\"}");
+            Map<String, Object> btParsed = MiniJson.parseObject(btJson);
+            assertEquals("http://127.0.0.1/fallback", String.valueOf(btParsed.get("targetUrl")),
+                "backtrack moves to queued /fallback once stack levels deferred");
+            assertEquals(Boolean.FALSE, btParsed.get("done"), "Crawl continues with /fallback");
+            passed++;
+        } finally {
+            server.stop();
+        }
     }
 
     private static String httpRequest(String method, String urlStr, String jsonBody) throws Exception {

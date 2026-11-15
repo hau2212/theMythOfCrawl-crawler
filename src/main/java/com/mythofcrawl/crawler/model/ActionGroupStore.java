@@ -188,6 +188,41 @@ public final class ActionGroupStore {
         severityCounts[sev.ordinal()]++;
     }
 
+    /**
+     * Records a standalone group-level audit NOTE (e.g., external redirect link or deferred redirect trap
+     * that did not yield a normal backend API call, so it still appears in Bảng NOTE and on the Group).
+     */
+    public synchronized AuditNote recordStandaloneNote(
+        ActionGroup group,
+        AuditNote.Severity sev,
+        AuditNote.Type type,
+        String method,
+        String endpoint,
+        String msg
+    ) {
+        if (group == null || type == null || msg == null || msg.trim().isEmpty()) {
+            return null;
+        }
+        String safeMethod = (method != null && !method.trim().isEmpty()) ? method.trim() : "NAV";
+        String safeEndpoint = (endpoint != null && !endpoint.trim().isEmpty()) ? endpoint.trim() : group.pageUrl;
+        AuditNote.Severity safeSev = sev != null ? sev : AuditNote.Severity.INFO;
+
+        for (AuditNote existing : group.getGroupNotes()) {
+            if (existing.type == type && existing.endpoint.equals(safeEndpoint)) {
+                return existing;
+            }
+        }
+        AuditNote n = new AuditNote(safeSev, type, group.id, group.actionPath, 0,
+            safeMethod, safeEndpoint, msg.trim(), System.currentTimeMillis());
+        group.addGroupNote(n);
+        if (notes.size() < MAX_NOTES) {
+            notes.add(n);
+        }
+        severityCounts[safeSev.ordinal()]++;
+        version.incrementAndGet();
+        return n;
+    }
+
     public synchronized int sharedGroupCount(String endpointKey) {
         EndpointStats es = endpoints.get(endpointKey);
         return es != null ? es.groupIds.size() : 0;

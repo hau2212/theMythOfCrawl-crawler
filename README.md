@@ -24,9 +24,13 @@ Burp Suite Montoya API extension (Java `--release 17`, không phụ thuộc thư
    - Có nút mẫu nhanh (`+ Mẫu X-Account: a`, `+ Mẫu Authorization`), lưu qua **Burp Preferences**, mặc định áp dụng khi **Browser Crawl qua Proxy** và tắt khi **Đẩy qua Extender** để bảo toàn nguyên vẹn gói tin đẩy lên Elastic.
 
 5. **Nhóm chức năng & Cột/Bảng NOTE Audit (`ActionGroupStore` + `AuditNote`):**
-   - Gom chung toàn bộ API phát sinh khi bấm nút/chức năng vào một **Nhóm Chức Năng** giữ nguyên hoa/thường (`toppage > contact > button 'Send'` hoặc `/`), khử trùng theo `Hits` và đánh **NOTE** (`Khác tham số`, `Khác HTTP status`, `HTTP 5xx`, `HTTP 401/403`, `Ngoài Excel`, `Nâng cấp bản Excel`).
+   - Gom chung toàn bộ API phát sinh khi bấm nút/chức năng vào một **Nhóm Chức Năng** giữ nguyên hoa/thường theo đúng vùng UI & tiêu đề card/popup (ví dụ `toppage > Tin khuyến mãi > Happy Day... > Nút '334'`, `toppage > Đầu trang > Nút 'Đăng Nhập'`), khử trùng theo `Hits` và đánh **NOTE** (`Khác tham số`, `Khác HTTP status`, `HTTP 5xx`, `HTTP 401/403`, `Ngoài Excel`, `Nâng cấp bản Excel`, `Chuyển hướng ngoài`, `Tạm NOTE chuyển hướng`).
 
-6. **Bao phủ đa công nghệ, Tự điền Form (`TEXT`) & Checklist Excel:**
+6. **Duyệt từ Trên xuống Dưới & Chống kẹt Redirect Ngoài Host (`crawler-agent.js` + `ControlPlaneHandler` + `HtmlAgentInjector` + `CrawlState`):**
+   - Sắp xếp mọi control theo tọa độ hình ảnh **(Popup/Modal trước -> Trên xuống Dưới theo hàng ngang -> Trái sang Phải)**, lọc bỏ container gộp nhiều nút để tránh dính chuỗi header dài.
+   - Chặn triệt để link ngoài host (`App Store`, `Google Play`, mạng xã hội, `mailto:`, `window.open`, HTTP `3xx Location` ngoài host, chuyển hướng top-level `Sec-Fetch-Dest: document`), ghi **NOTE tạm** và dùng cơ chế **Multi-Level Trail Stack** tự động lùi `1..N` cấp về trang an toàn gần nhất để tiếp tục crawl.
+
+7. **Bao phủ đa công nghệ, Tự điền Form (`TEXT`) & Checklist Excel:**
    - Hỗ trợ REST JSON lồng nhau, GraphQL (`operationName`), XML/SOAP, Multipart, URLEncoded, `sendBeacon`, same-origin `iframe`, open Shadow DOM, SPA routing và tự điền Form mặc định `TEXT` có thể tùy biến quy tắc.
 
 ## Cấu trúc thư mục
@@ -35,7 +39,7 @@ Burp Suite Montoya API extension (Java `--release 17`, không phụ thuộc thư
 - `lib/montoya-api.jar` — PortSwigger Burp Montoya API (`2025.12`) phục vụ biên dịch.
 - `src/main/java/com/mythofcrawl/crawler/` — Mã nguồn Java (`CrawlerExtension`, `excel/`, `model/`, `proxy/`, `ui/`).
 - `src/main/resources/crawler-agent.js` — Browser Agent chạy qua Burp Proxy.
-- `src/test/java/com/mythofcrawl/crawler/CrawlerUnitTests.java` — Bộ unit test thuần Java (11 nhóm kiểm thử).
+- `src/test/java/com/mythofcrawl/crawler/CrawlerUnitTests.java` — Bộ unit test thuần Java (15 nhóm kiểm thử).
 - `build.ps1` — Script biên dịch (`--release 17`), đóng gói `.jar` và chạy kiểm thử.
 
 ## Build từ mã nguồn (Windows PowerShell)

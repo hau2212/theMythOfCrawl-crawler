@@ -12,6 +12,8 @@ import com.mythofcrawl.crawler.model.CrawlConfig;
 import com.mythofcrawl.crawler.model.CrawlState;
 
 import java.io.ByteArrayOutputStream;
+import java.net.URI;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -51,7 +53,7 @@ public final class ControlPlaneHandler implements ProxyRequestHandler {
         String path = interceptedRequest.path();
         if (path != null && path.startsWith("/__myth_crawl/")) {
             HttpService localService = HttpService.httpService("127.0.0.1", localControlPort, false);
-            HttpRequest localReq = buildHttp11ControlRequest(interceptedRequest, localService, path);
+            HttpRequest localReq = buildHttp11ControlRequest(interceptedRequest, localService, path, false);
             return ProxyRequestReceivedAction.doNotIntercept(localReq);
         }
 
@@ -85,8 +87,64 @@ public final class ControlPlaneHandler implements ProxyRequestHandler {
             if (modified != interceptedRequest) {
                 return ProxyRequestReceivedAction.continueWith(modified);
             }
+        } else if (svc != null && shouldInterceptExternalRedirect(interceptedRequest, svc.host())) {
+            String destUrl = interceptedRequest.url() != null ? interceptedRequest.url() : "";
+            String referer = interceptedRequest.headerValue("Referer");
+            String fromUrl = isRefererHostAllowed(referer) ? referer : state.getCurrentPageUrl();
+            String bouncePath = "/__myth_crawl/bounce_back?dest=" + urlEncode(destUrl)
+                + "&from=" + urlEncode(fromUrl);
+            HttpService localService = HttpService.httpService("127.0.0.1", localControlPort, false);
+            HttpRequest localReq = buildHttp11ControlRequest(interceptedRequest, localService, bouncePath, true);
+            return ProxyRequestReceivedAction.doNotIntercept(localReq);
         }
         return ProxyRequestReceivedAction.continueWith(interceptedRequest);
+    }
+
+    private boolean shouldInterceptExternalRedirect(InterceptedRequest req, String host) {
+        if (state.getStatus() != CrawlState.Status.RUNNING || !config.isAllowAutoRequests()) {
+            return false;
+        }
+        if (host == null || host.isEmpty()) {
+            return false;
+        }
+        String hostLower = host.toLowerCase();
+        if ("127.0.0.1".equals(hostLower) || "localhost".equals(hostLower) || "::1".equals(hostLower)) {
+            return false;
+        }
+        String fetchDest = req.headerValue("Sec-Fetch-Dest");
+        if (fetchDest == null || !"document".equalsIgnoreCase(fetchDest.trim())) {
+            return false;
+        }
+        String fetchMode = req.headerValue("Sec-Fetch-Mode");
+        if (fetchMode != null && !fetchMode.trim().isEmpty() && !"navigate".equalsIgnoreCase(fetchMode.trim())) {
+            return false;
+        }
+        String referer = req.headerValue("Referer");
+        if (isRefererHostAllowed(referer)) {
+            return true;
+        }
+        long elapsed = System.currentTimeMillis() - state.getLastContextActionAtMs();
+        return state.getLastContextActionAtMs() > 0 && elapsed >= 0 && elapsed <= 8000L;
+    }
+
+    private boolean isRefererHostAllowed(String referer) {
+        if (referer == null || referer.trim().isEmpty()) {
+            return false;
+        }
+        try {
+            URI u = URI.create(referer.trim());
+            String refHost = u.getHost();
+            return refHost != null && config.isHostAllowed(refHost);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static String urlEncode(String s) {
+        if (s == null || s.isEmpty()) {
+            return "";
+        }
+        return URLEncoder.encode(s, StandardCharsets.UTF_8);
     }
 
     @Override
@@ -114,9 +172,14 @@ public final class ControlPlaneHandler implements ProxyRequestHandler {
             || path.endsWith(".php") || path.endsWith(".jsp") || path.endsWith(".aspx"));
     }
 
-    private HttpRequest buildHttp11ControlRequest(InterceptedRequest req, HttpService localService, String path) {
-        String method = req.method() != null ? req.method().toUpperCase() : "GET";
-        byte[] body = req.body() != null ? req.body().getBytes() : new byte[0];
+    private HttpRequest buildHttp11ControlRequest(
+        InterceptedRequest req,
+        HttpService localService,
+        String path,
+        boolean forceGet
+    ) {
+        String method = forceGet ? "GET" : (req.method() != null ? req.method().toUpperCase() : "GET");
+        byte[] body = forceGet ? new byte[0] : (req.body() != null ? req.body().getBytes() : new byte[0]);
 
         StringBuilder sb = new StringBuilder();
         sb.append(method).append(' ').append(path).append(" HTTP/1.1\r\n");

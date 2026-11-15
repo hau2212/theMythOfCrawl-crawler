@@ -25,7 +25,9 @@ public final class AuditNote {
         HTTP_CLIENT_ERROR("HTTP 4xx"),
         AUTH("401/403 Quyền/Phiên"),
         NOT_IN_EXCEL("Ngoài Excel"),
-        EXCEL_UPGRADE("Nâng cấp bản Excel");
+        EXCEL_UPGRADE("Nâng cấp bản Excel"),
+        EXTERNAL_REDIRECT("Chuyển hướng ngoài"),
+        REDIRECT_DEFERRED("Tạm NOTE chuyển hướng");
 
         public final String label;
 

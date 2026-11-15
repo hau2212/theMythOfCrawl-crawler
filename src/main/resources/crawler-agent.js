@@ -108,6 +108,52 @@
   var origPrint = window.print;
   var origWindowOpen = window.open;
 
+  function isAllowedUrl(rawUrl, stateObj) {
+    if (!rawUrl || typeof rawUrl !== "string") return false;
+    var lower = rawUrl.trim().toLowerCase();
+    if (!lower || lower.startsWith("javascript:") || lower.startsWith("data:") || lower.startsWith("blob:")
+      || lower.startsWith("mailto:") || lower.startsWith("tel:") || lower.startsWith("sms:")
+      || lower.startsWith("itms-apps:") || lower.startsWith("market:")) {
+      return false;
+    }
+    try {
+      var u = new URL(rawUrl, location.href);
+      if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+      if (u.origin === location.origin) return true;
+      var hosts = (stateObj && Array.isArray(stateObj.allowedHosts)) ? stateObj.allowedHosts : [];
+      var h = (u.hostname || "").toLowerCase();
+      for (var i = 0; i < hosts.length; i++) {
+        var r = String(hosts[i] || "").trim().toLowerCase();
+        if (!r) continue;
+        if (r === "*") return true;
+        if (r.indexOf("*.") === 0) {
+          var suffix = r.slice(2);
+          if (h === suffix || h.endsWith("." + suffix)) return true;
+        } else if (h === r) {
+          return true;
+        }
+      }
+      return false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function postExternalRedirectNote(actionPath, endpointUrl, msg, kind, label) {
+    return apiCall(CONTROL + "/note", "POST", {
+      actionPath: actionPath || "",
+      kind: kind || "",
+      label: label || "",
+      pageUrl: location.href,
+      noteType: "EXTERNAL_REDIRECT",
+      severity: "WARN",
+      method: "NAV",
+      endpoint: endpointUrl || "",
+      deferUrl: endpointUrl || "",
+      message: msg || ("Chặn điều hướng ngoài host: " + (endpointUrl || ""))
+    }).catch(function () {});
+  }
+
   function installCrawlGuards() {
     window.alert = function () {};
     window.confirm = function () { return true; };
@@ -120,8 +166,11 @@
       if (url && typeof url === "string") {
         try {
           var abs = new URL(url, location.href).href;
-          if (abs.indexOf(location.origin) === 0) {
+          if (isAllowedUrl(abs, currentConfig)) {
             apiCall(CONTROL + "/discovered", "POST", { pageUrl: location.href, urls: [abs], skipped: [] }).catch(function () {});
+          } else {
+            var curPath = formatActionPath(location.href, "window.open", sanitizeLabel(abs), currentConfig);
+            postExternalRedirectNote(curPath, abs, "Đã chặn window.open ngoài host: " + abs, "window.open", sanitizeLabel(abs));
           }
         } catch (e) {}
       }
@@ -178,7 +227,7 @@
   }
 
   // Hierarchy Action Path formatter keeping original UI casing
-  function sanitizeLabel(raw) {
+  function sanitizeLabel(raw, maxLen) {
     if (!raw) return "";
     return String(raw)
       .replace(/[\r\n\t]+/g, " ")
@@ -186,7 +235,21 @@
       .replace(/'/g, "’")
       .replace(/\s+/g, " ")
       .trim()
-      .slice(0, 56);
+      .slice(0, maxLen || 52);
+  }
+
+  function kindDisplayLabel(kind) {
+    var k = String(kind || "").toLowerCase();
+    if (k === "button") return "Nút";
+    if (k === "link") return "Link";
+    if (k === "tab") return "Tab";
+    if (k === "menu") return "Menu";
+    if (k === "select") return "Danh sách";
+    if (k === "toggle") return "Công tắc";
+    if (k === "search") return "Ô tìm kiếm";
+    if (k === "form") return "Form";
+    if (k === "input") return "Ô nhập";
+    return kind || "Nút";
   }
 
   function routeSegments(urlStr, normalizeIds) {
@@ -214,17 +277,25 @@
     return segs;
   }
 
-  function formatActionPath(urlStr, kind, label, stateObj) {
+  function formatActionPath(urlStr, kind, label, stateObj, regionSegments) {
     var normalizeIds = !stateObj || !!stateObj.normalizeRouteIds;
     var rootLabel = (stateObj && stateObj.routeRootLabel) ? String(stateObj.routeRootLabel).trim() : "toppage";
     if (!rootLabel) rootLabel = "toppage";
     var parts = [rootLabel].concat(routeSegments(urlStr, normalizeIds));
+    if (Array.isArray(regionSegments)) {
+      for (var i = 0; i < regionSegments.length; i++) {
+        var seg = sanitizeLabel(regionSegments[i], 38);
+        if (seg && parts.indexOf(seg) < 0) {
+          parts.push(seg);
+        }
+      }
+    }
     if (!kind || kind === "page load") {
       parts.push("page load");
     } else if (label) {
-      parts.push(kind + " '" + label + "'");
+      parts.push(kindDisplayLabel(kind) + " '" + sanitizeLabel(label, 52) + "'");
     } else {
-      parts.push(kind);
+      parts.push(kindDisplayLabel(kind));
     }
     return parts.join(" > ");
   }
@@ -252,10 +323,219 @@
     }
   }
 
-  function extractElementInfo(el, idx, framePrefix) {
+  function findModalContainer(el) {
+    if (!el || !el.closest) return null;
+    try {
+      var m = el.closest("[role='dialog'], [aria-modal='true'], .modal.show, .modal[style*='block'], dialog[open]");
+      return (m && isVisible(m)) ? m : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  var ATOMIC_INTERACTIVE_SEL = [
+    "button",
+    "input[type='submit']",
+    "input[type='button']",
+    "input[type='image']",
+    "input[type='reset']",
+    "select",
+    "a[href]",
+    "[role='button']",
+    "[role='link']",
+    "[role='menuitem']",
+    "[role='menuitemcheckbox']",
+    "[role='menuitemradio']",
+    "[role='tab']",
+    "[role='switch']",
+    "[role='option']",
+    "[role='treeitem']",
+    "summary"
+  ].join(",");
+
+  function isCompositeInteractiveContainer(node) {
+    if (!node || !node.querySelectorAll) return false;
+    try {
+      var tag = (node.tagName || "").toUpperCase();
+      var role = (node.getAttribute("role") || "").toLowerCase();
+      if (tag === "SELECT" || tag === "INPUT" || tag === "TEXTAREA" || tag === "SUMMARY") {
+        return false;
+      }
+      var isGenericWrapper = (
+        tag === "DIV" || tag === "SPAN" || tag === "NAV" || tag === "HEADER" || tag === "FOOTER"
+        || tag === "SECTION" || tag === "ARTICLE" || tag === "ASIDE" || tag === "MAIN"
+        || tag === "UL" || tag === "OL" || tag === "LI" || tag === "FORM"
+        || tag === "TABLE" || tag === "TBODY" || tag === "TR" || tag === "TD" || tag === "TH"
+      ) && role !== "button" && role !== "tab" && role !== "menuitem" && role !== "link";
+
+      var inner = node.querySelectorAll(ATOMIC_INTERACTIVE_SEL);
+      var visibleInnerCount = 0;
+      for (var i = 0; i < inner.length; i++) {
+        var ch = inner[i];
+        if (ch !== node && isVisible(ch)) {
+          visibleInnerCount++;
+          if (isGenericWrapper && visibleInnerCount >= 1) {
+            return true;
+          }
+          if (visibleInnerCount >= 2) {
+            return true;
+          }
+        }
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  function extractDirectVisibleText(el) {
+    if (!el) return "";
+    var view = getDocView(el);
+    var chunks = [];
+    var SKIP_CHILD_TAGS = { SCRIPT: 1, STYLE: 1, NOSCRIPT: 1, SVG: 1, UL: 1, OL: 1, MENU: 1, SELECT: 1 };
+
+    function walk(node, depth) {
+      if (!node || depth > 5 || chunks.join(" ").length > 72) return;
+      if (node.nodeType === 3) {
+        var t = (node.nodeValue || "").replace(/\s+/g, " ").trim();
+        if (t) chunks.push(t);
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      if (node !== el) {
+        var nt = (node.tagName || "").toUpperCase();
+        if (SKIP_CHILD_TAGS[nt]) return;
+        if (node.getAttribute && (node.getAttribute("aria-hidden") === "true" || node.getAttribute("role") === "menu" || node.getAttribute("role") === "listbox")) {
+          return;
+        }
+        try {
+          var cls = typeof node.className === "string" ? node.className.toLowerCase() : "";
+          if (cls.indexOf("dropdown-menu") >= 0 || cls.indexOf("submenu") >= 0) return;
+          var cs = view.getComputedStyle(node);
+          if (!cs || cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") return;
+          if ((cs.position === "absolute" || cs.position === "fixed") && cs.pointerEvents === "none") return;
+        } catch (e) {}
+      }
+      var childNodes = node.childNodes;
+      for (var i = 0; i < childNodes.length; i++) {
+        walk(childNodes[i], depth + 1);
+      }
+    }
+
+    walk(el, 0);
+    return sanitizeLabel(chunks.join(" "), 52);
+  }
+
+  function inferIconLabel(el, tag, rawHref) {
+    var clueParts = [
+      el.getAttribute("data-testid") || "",
+      el.getAttribute("data-icon") || "",
+      typeof el.className === "string" ? el.className : "",
+      el.getAttribute("name") || "",
+      el.id || ""
+    ];
+    try {
+      var iconNode = el.querySelector && el.querySelector("svg, i, span[class*='icon'], use");
+      if (iconNode) {
+        clueParts.push(iconNode.getAttribute("data-icon") || "");
+        clueParts.push(iconNode.getAttribute("aria-label") || "");
+        clueParts.push(iconNode.getAttribute("href") || iconNode.getAttribute("xlink:href") || "");
+        if (typeof iconNode.className === "string") clueParts.push(iconNode.className);
+        else if (iconNode.className && iconNode.className.baseVal) clueParts.push(iconNode.className.baseVal);
+      }
+    } catch (e) {}
+    var clue = clueParts.join(" ").toLowerCase();
+    var ICON_MAP = [
+      [/search|magnif|find/, "Tìm kiếm"],
+      [/close|dismiss|cancel|times/, "Đóng"],
+      [/menu|hamburger|bars/, "Menu"],
+      [/user|profile|account|avatar/, "Tài khoản"],
+      [/heart|like|fav/, "Thích"],
+      [/share/, "Chia sẻ"],
+      [/cart|bag|basket/, "Giỏ hàng"],
+      [/prev|arrow[-_]?left|chevron[-_]?left/, "Trước"],
+      [/next|arrow[-_]?right|chevron[-_]?right/, "Tiếp"],
+      [/play/, "Phát"],
+      [/bell|notif/, "Thông báo"],
+      [/filter/, "Lọc"],
+      [/calendar|date/, "Lịch"],
+      [/edit|pencil/, "Sửa"],
+      [/trash|delete|remove/, "Xóa"],
+      [/plus|add/, "Thêm"],
+      [/download/, "Tải xuống"],
+      [/app[-_]?store/, "App Store"],
+      [/google[-_]?play/, "Google Play"]
+    ];
+    for (var i = 0; i < ICON_MAP.length; i++) {
+      if (ICON_MAP[i][0].test(clue)) return ICON_MAP[i][1];
+    }
+    if (rawHref && !rawHref.startsWith("#") && !rawHref.startsWith("javascript:")) {
+      try {
+        var u = new URL(rawHref, location.href);
+        var pathParts = (u.pathname || "").split("/").filter(Boolean);
+        if (pathParts.length > 0) return sanitizeLabel(pathParts[pathParts.length - 1], 36);
+        if (u.hostname) return sanitizeLabel(u.hostname, 36);
+      } catch (e) {}
+    }
+    return "Biểu tượng " + (tag || "nút");
+  }
+
+  function extractUiRegionSegments(el, ownLabel) {
+    var segs = [];
+    var ownLower = (ownLabel || "").toLowerCase();
+    function pushUnique(raw) {
+      var s = sanitizeLabel(raw, 36);
+      if (!s || s.toLowerCase() === ownLower) return;
+      for (var i = 0; i < segs.length; i++) {
+        if (segs[i].toLowerCase() === s.toLowerCase()) return;
+      }
+      segs.push(s);
+    }
+    try {
+      var modal = findModalContainer(el);
+      if (modal) {
+        var mTitle = modal.getAttribute("aria-label") || "";
+        if (!mTitle && modal.querySelector) {
+          var mt = modal.querySelector("h1, h2, h3, h4, [role='heading'], .modal-title, [class*='title']");
+          if (mt) mTitle = extractDirectVisibleText(mt);
+        }
+        pushUnique(mTitle ? ("Popup '" + sanitizeLabel(mTitle, 28) + "'") : "Popup");
+      }
+
+      if (el.closest) {
+        if (el.closest("header, [role='banner'], [class*='header']")) {
+          pushUnique("Đầu trang");
+        } else if (el.closest("footer, [role='contentinfo'], [class*='footer']")) {
+          pushUnique("Chân trang");
+        } else if (el.closest("aside, [role='complementary'], [class*='sidebar']")) {
+          pushUnique("Thanh bên");
+        }
+
+        // Nearest section heading
+        var section = el.closest("section, [role='region']");
+        if (section && section.querySelector) {
+          var sh = section.querySelector("h1, h2, h3");
+          if (sh && sh !== el && (!sh.contains || !sh.contains(el))) {
+            pushUnique(extractDirectVisibleText(sh));
+          }
+        }
+
+        // Nearest card / form title
+        var card = el.closest("article, form, [class*='card'], [class*='Card'], [class*='item'], [class*='Item'], li");
+        if (card && card !== section && card.querySelector) {
+          var ch = card.querySelector("h1, h2, h3, h4, h5, legend, [class*='title'], [class*='Title'], [class*='name'], [class*='Name']");
+          if (ch && ch !== el && (!ch.contains || !ch.contains(el))) {
+            pushUnique(extractDirectVisibleText(ch));
+          }
+        }
+      }
+    } catch (e) {}
+    return segs.slice(0, 2);
+  }
+
+  function extractElementInfo(el, idx, framePrefix, docPosKey) {
     var tag = (el.tagName || "").toLowerCase();
     var role = (el.getAttribute("role") || "").toLowerCase();
     var type = (el.getAttribute("type") || "").toLowerCase();
+    var rawHref = el.getAttribute("href") || "";
 
     var kind = "button";
     if (tag === "a" || role === "link") kind = "link";
@@ -265,21 +545,33 @@
     else if (role === "switch" || (tag === "input" && (type === "checkbox" || type === "radio"))) kind = "toggle";
     else if (tag === "input" && (type === "search" || type === "text")) kind = "search";
 
-    var text = sanitizeLabel(el.innerText || el.textContent);
-    if (!text) text = sanitizeLabel(el.getAttribute("aria-label"));
-    if (!text) text = sanitizeLabel(el.value);
-    if (!text) text = sanitizeLabel(el.getAttribute("title"));
-    if (!text && el.querySelector) {
-      var img = el.querySelector("img[alt], svg[aria-label]");
-      if (img) text = sanitizeLabel(img.getAttribute("alt") || img.getAttribute("aria-label"));
+    var text = extractDirectVisibleText(el);
+    if (!text) text = sanitizeLabel(el.getAttribute("aria-label"), 52);
+    if (!text && tag === "input" && (type === "submit" || type === "button" || type === "reset")) {
+      text = sanitizeLabel(el.value, 52);
     }
-    if (!text) text = sanitizeLabel(el.getAttribute("placeholder"));
-    if (!text) text = sanitizeLabel(el.getAttribute("name"));
-    if (!text) text = sanitizeLabel(el.id);
-    if (!text) text = "#" + (idx + 1);
+    if (!text) text = sanitizeLabel(el.getAttribute("title"), 52);
+    if (!text && el.querySelector) {
+      var img = el.querySelector("img[alt], svg[aria-label], svg title");
+      if (img) {
+        text = sanitizeLabel(img.getAttribute("alt") || img.getAttribute("aria-label") || img.textContent, 52);
+      }
+    }
+    if (!text) text = sanitizeLabel(el.getAttribute("placeholder"), 52);
+    if (!text) text = sanitizeLabel(el.getAttribute("name"), 44);
+    if (!text) text = inferIconLabel(el, tag, rawHref);
 
-    var sig = [framePrefix || "", tag, role, type, el.id || "", el.getAttribute("name") || "", el.getAttribute("href") || "", text].join("|");
-    return { kind: kind, label: text, signature: sig, tag: tag };
+    var regionSegments = extractUiRegionSegments(el, text);
+    var regionKey = regionSegments.join("|");
+    var sig = [framePrefix || "", regionKey, tag, role, type, el.id || "", el.getAttribute("name") || "", rawHref, text, docPosKey || ""].join("|");
+    return {
+      kind: kind,
+      kindLabel: kindDisplayLabel(kind),
+      label: text,
+      signature: sig,
+      tag: tag,
+      regionSegments: regionSegments
+    };
   }
 
   function isDangerousElement(el, info, dangerKeywords) {
@@ -305,18 +597,20 @@
   function isReasonablePointerWidget(node, view) {
     try {
       var tag = node.tagName;
-      if (tag === "HTML" || tag === "BODY" || tag === "MAIN" || tag === "SECTION" || tag === "HEADER" || tag === "FOOTER") {
+      if (tag === "HTML" || tag === "BODY" || tag === "MAIN" || tag === "SECTION"
+        || tag === "HEADER" || tag === "FOOTER" || tag === "NAV" || tag === "ASIDE") {
         return false;
       }
       var rect = node.getBoundingClientRect();
-      // Skip gigantic layout wrappers that happen to inherit cursor:pointer
-      if (rect.width > view.innerWidth * 0.85 && rect.height > view.innerHeight * 0.65) {
+      if (rect.width > view.innerWidth * 0.90 && rect.height > view.innerHeight * 0.65) {
+        return false;
+      }
+      if (isCompositeInteractiveContainer(node)) {
         return false;
       }
       if (clickableNodes.has(node)) return true;
       var cs = view.getComputedStyle(node);
       if (cs && cs.cursor === "pointer") {
-        // Avoid duplicate clicks on nested <span> inside an already queued <button>/<a>
         if (node.closest && node.closest("button, a[href], [role='button'], [role='menuitem'], [role='tab']")) {
           return false;
         }
@@ -326,8 +620,59 @@
     return false;
   }
 
-  function collectAllInteractive(root, out, seenEls, frameDepth, framePrefix) {
+  function measureDocCoords(el, frameOffsetX, frameOffsetY) {
+    var rect = el.getBoundingClientRect();
+    var view = getDocView(el);
+    var style = null;
+    try { style = view.getComputedStyle(el); } catch (e) {}
+    var scrollX = (window.scrollX || document.documentElement.scrollLeft || 0);
+    var scrollY = (window.scrollY || document.documentElement.scrollTop || 0);
+    var docHeight = Math.max(
+      document.body ? document.body.scrollHeight : 0,
+      document.documentElement ? document.documentElement.scrollHeight : 0,
+      view.innerHeight || 0
+    );
+    var isFixed = style && style.position === "fixed";
+    var fixedAncestor = false;
+    if (!isFixed && el.closest) {
+      try {
+        var cur = el.parentElement;
+        for (var k = 0; k < 5 && cur && cur !== document.body; k++) {
+          var pcs = view.getComputedStyle(cur);
+          if (pcs && pcs.position === "fixed") {
+            fixedAncestor = true;
+            var frect = cur.getBoundingClientRect();
+            if (frect.top >= (view.innerHeight || 800) * 0.65) {
+              return {
+                docTop: docHeight + rect.top + (frameOffsetY || 0),
+                docLeft: rect.left + (frameOffsetX || 0)
+              };
+            }
+            return {
+              docTop: Math.max(0, rect.top) + (frameOffsetY || 0),
+              docLeft: rect.left + (frameOffsetX || 0)
+            };
+          }
+          cur = cur.parentElement;
+        }
+      } catch (e) {}
+    }
+    if (isFixed && !fixedAncestor) {
+      if (rect.top >= (view.innerHeight || 800) * 0.65) {
+        return { docTop: docHeight + rect.top + (frameOffsetY || 0), docLeft: rect.left + (frameOffsetX || 0) };
+      }
+      return { docTop: Math.max(0, rect.top) + (frameOffsetY || 0), docLeft: rect.left + (frameOffsetX || 0) };
+    }
+    return {
+      docTop: rect.top + (frameOffsetY || 0) + scrollY,
+      docLeft: rect.left + (frameOffsetX || 0) + scrollX
+    };
+  }
+
+  function collectAllInteractive(root, out, seenEls, frameDepth, framePrefix, frameOffsetX, frameOffsetY) {
     if (!root || !root.querySelectorAll || frameDepth > 4) return;
+    var offX = frameOffsetX || 0;
+    var offY = frameOffsetY || 0;
     var selector = [
       "button",
       "input[type='submit']",
@@ -358,13 +703,26 @@
       "[data-myth-clickable='1']"
     ].join(",");
 
+    function pushCandidate(el) {
+      if (!el || seenEls.has(el) || !isVisible(el)) return;
+      if (isCompositeInteractiveContainer(el)) return;
+      seenEls.add(el);
+      var coords = measureDocCoords(el, offX, offY);
+      var inModal = findModalContainer(el) ? 0 : 1;
+      out.push({
+        el: el,
+        framePrefix: framePrefix || "",
+        inModal: inModal,
+        docTop: coords.docTop,
+        docLeft: coords.docLeft,
+        rowBand: Math.round(coords.docTop / 16),
+        domOrder: out.length
+      });
+    }
+
     var nodes = root.querySelectorAll(selector);
     for (var i = 0; i < nodes.length; i++) {
-      var el = nodes[i];
-      if (!seenEls.has(el) && isVisible(el)) {
-        seenEls.add(el);
-        out.push({ el: el, framePrefix: framePrefix || "" });
-      }
+      pushCandidate(nodes[i]);
     }
 
     var view = (root.defaultView) || (root.ownerDocument && root.ownerDocument.defaultView) || window;
@@ -373,21 +731,31 @@
     for (var j = 0; j < limit; j++) {
       var node = all[j];
       if (!seenEls.has(node) && isVisible(node) && isReasonablePointerWidget(node, view)) {
-        seenEls.add(node);
-        out.push({ el: node, framePrefix: framePrefix || "" });
+        pushCandidate(node);
       }
       if (node.shadowRoot) {
-        collectAllInteractive(node.shadowRoot, out, seenEls, frameDepth + 1, framePrefix);
+        collectAllInteractive(node.shadowRoot, out, seenEls, frameDepth + 1, framePrefix, offX, offY);
       }
       if (node.tagName === "IFRAME" || node.tagName === "FRAME") {
         try {
           if (node.contentWindow) hookWindowRuntime(node.contentWindow);
           if (node.contentDocument) {
+            var fr = node.getBoundingClientRect();
             var fn = node.getAttribute("name") || node.id || ("frame" + frameDepth);
-            collectAllInteractive(node.contentDocument, out, seenEls, frameDepth + 1, fn);
+            collectAllInteractive(node.contentDocument, out, seenEls, frameDepth + 1, fn, offX + fr.left, offY + fr.top);
           }
         } catch (e) {}
       }
+    }
+
+    if (frameDepth === 0) {
+      out.sort(function (a, b) {
+        if (a.inModal !== b.inModal) return a.inModal - b.inModal;
+        if (a.rowBand !== b.rowBand) return a.rowBand - b.rowBand;
+        if (a.docLeft !== b.docLeft) return a.docLeft - b.docLeft;
+        if (a.docTop !== b.docTop) return a.docTop - b.docTop;
+        return a.domOrder - b.domOrder;
+      });
     }
   }
 
@@ -722,22 +1090,24 @@
         }
 
         var items = [];
-        collectAllInteractive(document, items, new WeakSet(), 0, "");
+        collectAllInteractive(document, items, new WeakSet(), 0, "", 0, 0);
         var skippedBatch = [];
         var targetItem = null;
         var targetInfo = null;
 
         for (var i = 0; i < items.length; i++) {
-          var el = items[i].el;
-          var fp = items[i].framePrefix;
-          var info = extractElementInfo(el, i, fp);
+          var item = items[i];
+          var el = item.el;
+          var fp = item.framePrefix;
+          var posKey = Math.round((item.docTop || 0) / 32) + "x" + Math.round((item.docLeft || 0) / 32);
+          var info = extractElementInfo(el, i, fp, posKey);
           if (clickedSet.has(info.signature)) continue;
 
           if (freshState.dangerGuardEnabled) {
             var badKw = isDangerousElement(el, info, freshState.dangerKeywords);
             if (badKw) {
               clickedSet.add(info.signature);
-              var skippedPath = formatActionPath(location.href, info.kind, info.label, freshState);
+              var skippedPath = formatActionPath(location.href, info.kindLabel, info.label, freshState, info.regionSegments);
               skippedBatch.push({
                 actionPath: skippedPath,
                 reason: "Danger Guard: " + badKw,
@@ -747,7 +1117,7 @@
               continue;
             }
           }
-          targetItem = items[i];
+          targetItem = item;
           targetInfo = info;
           break;
         }
@@ -770,24 +1140,54 @@
         clickedSet.add(targetInfo.signature);
         var beforeUrl = location.href;
         var actionLabel = targetItem.framePrefix ? ("[" + targetItem.framePrefix + "] " + targetInfo.label) : targetInfo.label;
-        var actionPath = formatActionPath(beforeUrl, targetInfo.kind, actionLabel, freshState);
+        var actionPath = formatActionPath(beforeUrl, targetInfo.kindLabel, actionLabel, freshState, targetInfo.regionSegments);
 
-        // Queue external same-origin <a href> navigation for BFS without aborting current page's buttons
-        if (targetInfo.kind === "link" && targetEl.getAttribute("href")) {
-          var href = targetEl.getAttribute("href");
-          if (href && !href.startsWith("#") && !href.startsWith("javascript:")) {
-            try {
-              var dest = new URL(href, beforeUrl).href;
-              if (dest.indexOf(location.origin) === 0 && dest !== beforeUrl) {
-                await apiCall(CONTROL + "/discovered", "POST", { pageUrl: beforeUrl, urls: [dest], skipped: [] });
-                if (!targetEl.hasAttribute("data-myth-clickable") && !targetEl.hasAttribute("onclick")) {
-                  await apiCall(CONTROL + "/done_action", "POST", { pageUrl: beforeUrl, signature: targetInfo.signature });
-                  actionsDone++;
-                  continue;
-                }
-              }
-            } catch (e) {}
+        // Guard against external / non-HTTP links BEFORE clicking them (e.g., App Store / Google Play / social / mailto)
+        var linkEl = (targetEl.tagName === "A" || (targetEl.getAttribute && targetEl.getAttribute("href")))
+          ? targetEl : (targetEl.closest ? targetEl.closest("a[href]") : null);
+        var rawHref = linkEl && linkEl.getAttribute ? (linkEl.getAttribute("href") || "") : "";
+        if (!rawHref && targetEl.tagName === "FORM" && targetEl.getAttribute) {
+          rawHref = targetEl.getAttribute("action") || "";
+        }
+        var trimmedHref = rawHref.trim();
+        if (trimmedHref && !trimmedHref.startsWith("#") && !trimmedHref.toLowerCase().startsWith("javascript:")) {
+          var hrefLower = trimmedHref.toLowerCase();
+          if (hrefLower.startsWith("mailto:") || hrefLower.startsWith("tel:") || hrefLower.startsWith("sms:")
+            || hrefLower.startsWith("itms-apps:") || hrefLower.startsWith("market:")) {
+            await apiCall(CONTROL + "/context", "POST", {
+              actionPath: actionPath,
+              kind: targetInfo.kindLabel,
+              label: actionLabel,
+              pageUrl: beforeUrl
+            });
+            await postExternalRedirectNote(actionPath, trimmedHref, "Bỏ qua liên kết giao thức ngoài: " + trimmedHref, targetInfo.kindLabel, actionLabel);
+            await apiCall(CONTROL + "/done_action", "POST", { pageUrl: beforeUrl, signature: targetInfo.signature });
+            actionsDone++;
+            continue;
           }
+          try {
+            var dest = new URL(trimmedHref, beforeUrl).href;
+            if (!isAllowedUrl(dest, freshState)) {
+              await apiCall(CONTROL + "/context", "POST", {
+                actionPath: actionPath,
+                kind: targetInfo.kindLabel,
+                label: actionLabel,
+                pageUrl: beforeUrl
+              });
+              await postExternalRedirectNote(actionPath, dest, "Đã chặn link trỏ ra ngoài host: " + dest, targetInfo.kindLabel, actionLabel);
+              await apiCall(CONTROL + "/done_action", "POST", { pageUrl: beforeUrl, signature: targetInfo.signature });
+              actionsDone++;
+              continue;
+            }
+            if (dest !== beforeUrl) {
+              await apiCall(CONTROL + "/discovered", "POST", { pageUrl: beforeUrl, urls: [dest], skipped: [] });
+              if (targetInfo.kind === "link" && !targetEl.hasAttribute("data-myth-clickable") && !targetEl.hasAttribute("onclick")) {
+                await apiCall(CONTROL + "/done_action", "POST", { pageUrl: beforeUrl, signature: targetInfo.signature });
+                actionsDone++;
+                continue;
+              }
+            }
+          } catch (e) {}
         }
 
         if (targetEl.getAttribute("target") === "_blank") {
@@ -797,10 +1197,14 @@
         updateBadge(actionPath, "#1d4ed8");
         await apiCall(CONTROL + "/context", "POST", {
           actionPath: actionPath,
-          kind: targetInfo.kind,
+          kind: targetInfo.kindLabel,
           label: actionLabel,
           pageUrl: beforeUrl
         });
+
+        // Mark clicked BEFORE firing action so synchronous full-page redirects never replay the same button on return
+        await apiCall(CONTROL + "/done_action", "POST", { pageUrl: beforeUrl, signature: targetInfo.signature });
+        actionsDone++;
 
         if (freshState.autoFillForms) {
           autoFillNearestForm(targetEl, freshState.formFill);
@@ -822,11 +1226,16 @@
           await apiCall(CONTROL + "/discovered", "POST", { pageUrl: beforeUrl, urls: newLinks, skipped: [] });
         }
 
-        await apiCall(CONTROL + "/done_action", "POST", { pageUrl: beforeUrl, signature: targetInfo.signature });
-        actionsDone++;
-
         if (location.href !== beforeUrl) {
-          await apiCall(CONTROL + "/discovered", "POST", { pageUrl: beforeUrl, urls: [location.href], skipped: [] });
+          var jumpedUrl = location.href;
+          if (!isAllowedUrl(jumpedUrl, freshState)) {
+            await postExternalRedirectNote(actionPath, jumpedUrl, "Chặn nhảy ra ngoài host: " + jumpedUrl, targetInfo.kindLabel, actionLabel);
+            var btExt = await apiCall(CONTROL + "/backtrack", "POST", { url: jumpedUrl, defer: "1", dest: jumpedUrl });
+            var retExt = (btExt && btExt.targetUrl) ? btExt.targetUrl : beforeUrl;
+            location.replace(retExt);
+            return;
+          }
+          await apiCall(CONTROL + "/discovered", "POST", { pageUrl: beforeUrl, urls: [jumpedUrl], skipped: [] });
           try {
             history.back();
             await sleep(480);
@@ -861,8 +1270,10 @@
     if (!node || node.nodeType !== 1) return null;
     if (node.closest) {
       if (node.closest("[data-myth-ui='1']")) return null;
-      var match = node.closest("button, a[href], a, select, input[type='submit'], input[type='button'], input[type='checkbox'], input[type='radio'], [role='button'], [role='tab'], [role='menuitem'], [role='link'], [data-myth-clickable='1'], form");
+      var match = node.closest("button, a[href], a, select, input[type='submit'], input[type='button'], input[type='checkbox'], input[type='radio'], [role='button'], [role='tab'], [role='menuitem'], [role='link']");
       if (match) return match;
+      var clickable = node.closest("[data-myth-clickable='1'], form");
+      if (clickable && !isCompositeInteractiveContainer(clickable)) return clickable;
     }
     return node;
   }
@@ -877,14 +1288,15 @@
 
       var targetEl = findInteractiveAncestor(el);
       if (!targetEl) return;
-      var info = extractElementInfo(targetEl, 0, framePrefix || "");
+      var info = extractElementInfo(targetEl, 0, framePrefix || "", "");
       var label = framePrefix ? ("[" + framePrefix + "] " + info.label) : info.label;
       var kind = evType === "submit" ? "form" : (evType === "change" && info.tag === "select" ? "select" : info.kind);
-      var ap = formatActionPath(location.href, kind, label, currentConfig);
+      var kindLbl = kindDisplayLabel(kind);
+      var ap = formatActionPath(location.href, kindLbl, label, currentConfig, info.regionSegments);
       updateBadge("Thủ công: " + ap, "#0f766e");
       var bodyStr = JSON.stringify({
         actionPath: ap,
-        kind: kind,
+        kind: kindLbl,
         label: label,
         pageUrl: location.href
       });
