@@ -27,6 +27,7 @@ import java.awt.Font;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
 
@@ -55,8 +56,8 @@ public final class HeaderFilterPanel extends JPanel {
     private final JTextField tfValue = new JTextField(22);
     private final JTextField tfScope = new JTextField(16);
 
-    private final RulesTableModel model = new RulesTableModel();
-    private final JTable tblRules = new JTable(model);
+    private final RulesTableModel model;
+    private final JTable tblRules;
 
     public HeaderFilterPanel(
         MontoyaApi api,
@@ -69,6 +70,8 @@ public final class HeaderFilterPanel extends JPanel {
         this.profile = config.getHeaderFilterProfile();
         this.logger = logger;
         this.onChanged = onChanged;
+        this.model = new RulesTableModel();
+        this.tblRules = new JTable(this.model);
 
         boolean dark = AuditTheme.isDark(api, this);
         setLayout(new BorderLayout(8, 8));
@@ -200,7 +203,9 @@ public final class HeaderFilterPanel extends JPanel {
             }
         });
 
-        p.add(new JScrollPane(tblRules), BorderLayout.CENTER);
+        JScrollPane sp = new JScrollPane(tblRules);
+        sp.getViewport().setBackground(AuditTheme.tableSurface(dark));
+        p.add(sp, BorderLayout.CENTER);
         return p;
     }
 
@@ -292,10 +297,10 @@ public final class HeaderFilterPanel extends JPanel {
 
     private final class RulesTableModel extends AbstractTableModel {
         private final String[] COLS = {"Bật", "Hành động", "Tên Header", "Giá trị", "Phạm vi Host / Path"};
-        private List<HeaderFilterProfile.Rule> rows = profile.getRulesSnapshot();
+        private List<HeaderFilterProfile.Rule> rows = new ArrayList<>();
 
         void refresh() {
-            this.rows = profile.getRulesSnapshot();
+            this.rows = profile != null ? profile.getRulesSnapshot() : new ArrayList<>();
             fireTableDataChanged();
         }
 

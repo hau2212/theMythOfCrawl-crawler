@@ -19,6 +19,9 @@ import com.mythofcrawl.crawler.model.MiniJson;
 import com.mythofcrawl.crawler.model.PathNamer;
 import com.mythofcrawl.crawler.proxy.ExtenderPushManager;
 import com.mythofcrawl.crawler.proxy.LocalControlServer;
+import com.mythofcrawl.crawler.ui.CrawlerTabPanel;
+
+import javax.swing.SwingUtilities;
 
 import java.io.File;
 import java.io.InputStream;
@@ -63,6 +66,7 @@ public final class CrawlerUnitTests {
             testActionGroupStoreNotesAndExport(tmpDir);
             testHeaderFilterProfileAndSafeRequestGate();
             testExtenderPushLedgerWithoutWireModification(tmpDir);
+            testUiPanelsInitializeWithoutNpe();
             System.out.println("ALL TESTS PASSED (" + passed + " test groups verified).");
         } finally {
             deleteRecursive(tmpDir.toFile());
@@ -488,6 +492,35 @@ public final class CrawlerUnitTests {
         String csvText = Files.readString(ledgerCsv.toPath(), StandardCharsets.UTF_8);
         assertTrue(csvText.contains("toppage > contact > button 'Send'"), "Push ledger CSV contains group path");
         assertTrue(csvText.contains("/api/contact"), "Push ledger CSV contains endpoint");
+        passed++;
+    }
+
+    private static void testUiPanelsInitializeWithoutNpe() throws Exception {
+        CrawlConfig cfg = new CrawlConfig();
+        cfg.setAllowedHostsCsv("target.local");
+        cfg.getHeaderFilterProfile().setEnabled(true);
+        cfg.getHeaderFilterProfile().addRule(
+            new HeaderFilterProfile.Rule(true, HeaderFilterProfile.Action.SET, "X-Account", "a", "*"));
+
+        CrawlState st = new CrawlState();
+        ActionGroup g = st.getActionGroups().openGroup("toppage > login", "button", "Login", "https://target.local/login");
+        byte[] rawReq = "POST /api/login HTTP/1.1\r\nHost: target.local\r\n\r\n".getBytes(StandardCharsets.UTF_8);
+        byte[] rawResp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".getBytes(StandardCharsets.UTF_8);
+        CapturedApiEntry cap = new CapturedApiEntry(
+            "", "POST", "https://target.local/api/login", "/api/login",
+            "target.local", 443, true, g.actionPath, rawReq, rawResp, 200, rawResp.length, Set.of(), System.currentTimeMillis());
+        st.getActionGroups().recordCall(g, cap, "POST /api/login", "", "", "/api/login", false, false);
+
+        ExtenderPushManager pushMgr = new ExtenderPushManager(null, cfg, null, null);
+        pushMgr.enqueueGroup(g);
+
+        SwingUtilities.invokeAndWait(() -> {
+            CrawlerTabPanel panel = new CrawlerTabPanel(
+                null, cfg, st, null, pushMgr, ExcelSpecMatcher.empty(), null);
+            assertTrue(panel.getComponentCount() >= 2, "CrawlerTabPanel mounted header and workspace");
+            panel.onPushLedgerUpdated();
+            panel.dispose();
+        });
         passed++;
     }
 
