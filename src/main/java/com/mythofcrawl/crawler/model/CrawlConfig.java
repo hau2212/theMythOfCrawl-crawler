@@ -112,6 +112,15 @@ public final class CrawlConfig {
                 if (h.endsWith(suffix) || h.equals(pattern.substring(2))) {
                     return true;
                 }
+            } else if (pattern.startsWith("*") && pattern.length() > 1) {
+                // Support "*example.com" shorthand the same as "*.example.com"
+                String root = pattern.substring(1);
+                if (root.startsWith(".")) {
+                    root = root.substring(1);
+                }
+                if (h.equals(root) || h.endsWith("." + root)) {
+                    return true;
+                }
             } else if (h.equals(pattern)) {
                 return true;
             }

@@ -700,11 +700,15 @@ public final class CrawlerUnitTests {
         gm.setFilter("WITH_APIS", "");
         assertEquals(4, gm.getRowCount(), "Tree mode merges toppage prefix folder (1 folder + 2 children + 1 singleton)");
         assertTrue(gm.isFolderRow(0), "Row 0 is merged folder toppage");
+        assertEquals("▼ 1", String.valueOf(gm.getValueAt(0, 0)), "Folder shows hierarchical tree number 1");
+        assertEquals("1.1", String.valueOf(gm.getValueAt(1, 0)), "First child shows hierarchical number 1.1");
+        assertEquals("1.2", String.valueOf(gm.getValueAt(2, 0)), "Second child shows hierarchical number 1.2");
+        assertEquals("2", String.valueOf(gm.getValueAt(3, 0)), "Second top branch shows hierarchical number 2");
         assertEquals(Integer.valueOf(5), gm.getValueAt(0, 2), "Folder rolls up 5 APIs under toppage");
         assertEquals(2, gm.getGroupsAt(0).size(), "Folder exposes both child groups");
         String childLabel = String.valueOf(gm.getValueAt(1, 1));
-        assertTrue(childLabel.startsWith("    ↳ ") && childLabel.contains("Đăng nhập"),
-            "Child group indented and keeps action name: " + childLabel);
+        assertTrue((childLabel.startsWith("├─ ") || childLabel.startsWith("└─ ")) && childLabel.contains("Đăng nhập"),
+            "Child group uses clear tree branch prefix and keeps action name: " + childLabel);
 
         gm.toggleFolderExpanded(0);
         assertEquals(2, gm.getRowCount(), "Collapsing toppage hides its 2 child groups");
@@ -795,6 +799,29 @@ public final class CrawlerUnitTests {
         assertEquals("/api/users/{id}", am2.getRowAt(0).pathKey, "Route template preserved as group pathKey");
         assertTrue(!am2.getRowAt(0).diffParamVariant, "Identical isajax param marks same-param group");
         assertEquals("Cùng param: 1 (isajax)", String.valueOf(am2.getValueAt(0, 5)), "Same non-empty param label formatted clearly");
+
+        // 4) Shorthand *domain host pattern, global header/footer dedup state & overlap diff summary
+        CrawlConfig wc = new CrawlConfig();
+        wc.setAllowedHostsCsv("*shopee.vn");
+        assertTrue(wc.isHostAllowed("shopee.vn"), "*shopee.vn matches root domain");
+        assertTrue(wc.isHostAllowed("mall.shopee.vn"), "*shopee.vn matches subdomain");
+        assertTrue(!wc.isHostAllowed("notshopee.vn"), "*shopee.vn rejects unrelated domain");
+
+        CrawlState gs = new CrawlState();
+        gs.markGlobalActionClicked("header|link|hotline|/contact");
+        assertEquals(1, gs.getGlobalClickedSignatures().size(), "Global nav click remembered across pages");
+        gs.resetAll("");
+        assertEquals(0, gs.getGlobalClickedSignatures().size(), "Global nav clicks cleared on reset");
+
+        GroupTableModel.PathOverlapSummary sameOv = GroupTableModel.summarizePathOverlap(store2, store2.snapshotGroups().get(0).getCalls().get(0));
+        assertEquals(2, sameOv.totalCalls, "Overlap summary finds 2 calls");
+        assertTrue(sameOv.allIdentical, "Identical method/status/params/size marked 100% identical");
+        assertTrue(sameOv.diffSummary.contains("Giống hệt 100%"), "Identical diff summary text");
+
+        GroupTableModel.PathOverlapSummary diffOv = GroupTableModel.summarizePathOverlap(store, store.snapshotGroups().get(0).getCalls().get(0));
+        assertTrue(!diffOv.allIdentical, "/api/v2/promotions has param/method differences");
+        assertTrue(diffOv.diffSummary.contains("Method") && diffOv.diffSummary.contains("Params"),
+            "Diff summary reports Method & Params differences: " + diffOv.diffSummary);
         passed++;
     }
 

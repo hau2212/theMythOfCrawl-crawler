@@ -12,6 +12,10 @@
   var runningLoop = false;
   var currentConfig = null;
   var lastContextErrorAt = 0;
+  var domMutationEpoch = 0;
+  var lastObservedSpaUrl = location.href;
+  var spaRouteDirty = false;
+  var domObserverStarted = false;
 
   var INTERACTIVE_TYPES = {
     click: 1, mousedown: 1, mouseup: 1, pointerdown: 1, pointerup: 1,
@@ -83,6 +87,70 @@
           return origBeacon.apply(win.navigator, arguments);
         };
       }
+
+      // 3. Track SPA client-side route transitions (pushState / replaceState / popstate / hashchange)
+      if (win === window && win.history && !win.history.__mythHooked) {
+        win.history.__mythHooked = true;
+        var notifySpaNav = function () {
+          try {
+            var nowHref = win.location.href;
+            if (nowHref && nowHref !== lastObservedSpaUrl) {
+              lastObservedSpaUrl = nowHref;
+              spaRouteDirty = true;
+              if (currentConfig && currentConfig.status === "RUNNING") {
+                topFetch(CONTROL + "/discovered", {
+                  method: "POST",
+                  credentials: "same-origin",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ pageUrl: nowHref, urls: [nowHref], skipped: [] })
+                }).catch(function () {});
+              }
+            }
+          } catch (e) {}
+        };
+        var origPush = win.history.pushState;
+        var origReplace = win.history.replaceState;
+        if (typeof origPush === "function") {
+          win.history.pushState = function () {
+            var r = origPush.apply(this, arguments);
+            notifySpaNav();
+            return r;
+          };
+        }
+        if (typeof origReplace === "function") {
+          win.history.replaceState = function () {
+            var r = origReplace.apply(this, arguments);
+            notifySpaNav();
+            return r;
+          };
+        }
+        win.addEventListener("popstate", notifySpaNav);
+        win.addEventListener("hashchange", notifySpaNav);
+      }
+    } catch (e) {}
+  }
+
+  function installDomMutationObserver() {
+    if (domObserverStarted || typeof MutationObserver === "undefined") return;
+    var root = document.documentElement || document.body;
+    if (!root) return;
+    domObserverStarted = true;
+    try {
+      var timer = null;
+      var obs = new MutationObserver(function (mutations) {
+        for (var i = 0; i < mutations.length; i++) {
+          if (mutations[i].addedNodes && mutations[i].addedNodes.length > 0) {
+            if (!timer) {
+              timer = setTimeout(function () {
+                timer = null;
+                domMutationEpoch++;
+              }, 120);
+            }
+            break;
+          }
+        }
+      });
+      obs.observe(root, { childList: true, subtree: true });
     } catch (e) {}
   }
 
@@ -129,6 +197,10 @@
         if (r.indexOf("*.") === 0) {
           var suffix = r.slice(2);
           if (h === suffix || h.endsWith("." + suffix)) return true;
+        } else if (r.charAt(0) === "*" && r.length > 1) {
+          var root = r.slice(1);
+          if (root.charAt(0) === ".") root = root.slice(1);
+          if (h === root || h.endsWith("." + root)) return true;
         } else if (h === r) {
           return true;
         }
@@ -842,6 +914,8 @@
       "input[type='button']",
       "input[type='image']",
       "input[type='reset']",
+      "input[type='search']",
+      "[role='searchbox']",
       "select",
       "a[href]",
       "[role='button']",
@@ -1178,6 +1252,42 @@
     } catch (e) {}
   }
 
+  function getGlobalChromeSignature(el, info) {
+    try {
+      if (!el || !el.closest) return "";
+      if (el.closest("[role='dialog'], [aria-modal='true'], .modal, .drawer, main")) return "";
+      var chromeEl = el.closest("header, footer, nav, [role='banner'], [role='contentinfo'], [role='navigation']");
+      if (!chromeEl) return "";
+      var scope = chromeEl.tagName === "FOOTER" || chromeEl.getAttribute("role") === "contentinfo"
+        ? "footer"
+        : (chromeEl.tagName === "HEADER" || chromeEl.getAttribute("role") === "banner" ? "header" : "nav");
+      var hrefPath = "";
+      var a = el.tagName === "A" ? el : (el.closest ? el.closest("a[href]") : null);
+      if (a) {
+        var raw = (a.getAttribute("href") || "").trim();
+        if (raw) {
+          try { hrefPath = new URL(raw, location.href).pathname; } catch (e) { hrefPath = raw; }
+        }
+      }
+      return [scope, info.kind || "", (info.label || "").toLowerCase(), hrefPath].join("|");
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function detectCaptchaOrChallenge() {
+    try {
+      var u = (location.href || "").toLowerCase();
+      if (u.indexOf("/verify/captcha") >= 0 || u.indexOf("/cdn-cgi/challenge") >= 0) {
+        return "URL challenge/captcha";
+      }
+      if (document.querySelector("iframe[src*='captcha'], iframe[src*='recaptcha'], iframe[src*='turnstile'], .g-recaptcha, #cf-challenge-running")) {
+        return "Widget CAPTCHA/Turnstile";
+      }
+    } catch (e) {}
+    return "";
+  }
+
   function triggerElementAction(targetEl, targetInfo) {
     var view = getDocView(targetEl);
     if (targetInfo.kind === "select" && targetEl.tagName === "SELECT" && targetEl.options && targetEl.options.length > 1) {
@@ -1195,6 +1305,24 @@
       return;
     }
 
+    if (targetEl.tagName === "INPUT" && ((targetEl.type || "").toLowerCase() === "search" || targetEl.getAttribute("role") === "searchbox")) {
+      try {
+        targetEl.focus();
+        var val = (currentConfig && currentConfig.formFill && currentConfig.formFill.search) ? currentConfig.formFill.search : "TEXT";
+        if (!targetEl.value) {
+          setNativeInputValue(targetEl, val);
+        }
+        var kev = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true };
+        targetEl.dispatchEvent(new view.KeyboardEvent("keydown", kev));
+        targetEl.dispatchEvent(new view.KeyboardEvent("keypress", kev));
+        targetEl.dispatchEvent(new view.KeyboardEvent("keyup", kev));
+        if (targetEl.form && typeof targetEl.form.requestSubmit === "function") {
+          targetEl.form.requestSubmit();
+        }
+        return;
+      } catch (e) {}
+    }
+
     var opts = { bubbles: true, cancelable: true, view: view };
     try {
       if (view.PointerEvent) targetEl.dispatchEvent(new view.PointerEvent("pointerdown", opts));
@@ -1209,11 +1337,29 @@
     if (runningLoop) return;
     runningLoop = true;
     installCrawlGuards();
+    installDomMutationObserver();
     try {
       var state = await apiCall(CONTROL + "/state?url=" + encodeURIComponent(location.href));
       currentConfig = state;
       if (state.status !== "RUNNING" || !state.allowAutoRequests) {
         updateBadge(state.status === "RUNNING" ? "CHỜ CHO PHÉP (Thủ công)" : state.status, "#475569");
+        return;
+      }
+
+      var captchaReason = detectCaptchaOrChallenge();
+      if (captchaReason) {
+        updateBadge("Phát hiện CAPTCHA/Xác minh - chờ xử lý tay", "#b91c1c");
+        await apiCall(CONTROL + "/note", "POST", {
+          actionPath: formatActionPath(location.href, "page load", "", state),
+          kind: "page load",
+          label: "",
+          pageUrl: location.href,
+          noteType: "REDIRECT_DEFERRED",
+          severity: "WARN",
+          method: "NAV",
+          endpoint: location.href,
+          message: "Tạm dừng tự click do phát hiện " + captchaReason + " tại " + location.href
+        }).catch(function () {});
         return;
       }
 
@@ -1240,16 +1386,34 @@
       await apiCall(CONTROL + "/discovered", "POST", { pageUrl: location.href, urls: links, skipped: [] });
 
       var clickedSet = new Set(state.clickedSignatures || []);
+      var globalClickedSet = new Set(state.globalClickedSignatures || []);
       var actionsDone = 0;
       var maxActions = state.maxActionsPerPage || 300;
       var lazySweepDone = false;
+      var passRouteUrl = location.href;
 
       while (actionsDone < maxActions) {
+        if (spaRouteDirty && location.href !== passRouteUrl) {
+          spaRouteDirty = false;
+          passRouteUrl = location.href;
+          var spaLoadPath = formatActionPath(passRouteUrl, "page load", "", currentConfig);
+          await apiCall(CONTROL + "/context", "POST", {
+            actionPath: spaLoadPath,
+            kind: "page load",
+            label: "",
+            pageUrl: passRouteUrl
+          }).catch(function () {});
+        }
         var freshState = await apiCall(CONTROL + "/state?url=" + encodeURIComponent(location.href));
         currentConfig = freshState;
         if (freshState.status !== "RUNNING" || !freshState.allowAutoRequests) {
           updateBadge(!freshState.allowAutoRequests ? "ĐÃ KHÓA TỰ GỬI" : freshState.status, "#b45309");
           return;
+        }
+        if (Array.isArray(freshState.globalClickedSignatures)) {
+          for (var gIdx = 0; gIdx < freshState.globalClickedSignatures.length; gIdx++) {
+            globalClickedSet.add(freshState.globalClickedSignatures[gIdx]);
+          }
         }
 
         var items = [];
@@ -1257,6 +1421,7 @@
         var skippedBatch = [];
         var targetItem = null;
         var targetInfo = null;
+        var targetGlobalSig = "";
 
         for (var i = 0; i < items.length; i++) {
           var item = items[i];
@@ -1265,6 +1430,12 @@
           var posKey = Math.round((item.docTop || 0) / 32) + "x" + Math.round((item.docLeft || 0) / 32);
           var info = extractElementInfo(el, i, fp, posKey);
           if (clickedSet.has(info.signature)) continue;
+
+          var gSig = getGlobalChromeSignature(el, info);
+          if (gSig && globalClickedSet.has(gSig)) {
+            clickedSet.add(info.signature);
+            continue;
+          }
 
           if (freshState.dangerGuardEnabled) {
             var badKw = isDangerousElement(el, info, freshState.dangerKeywords);
@@ -1282,6 +1453,7 @@
           }
           targetItem = item;
           targetInfo = info;
+          targetGlobalSig = gSig;
           break;
         }
 
@@ -1366,7 +1538,14 @@
         });
 
         // Mark clicked BEFORE firing action so synchronous full-page redirects never replay the same button on return
-        await apiCall(CONTROL + "/done_action", "POST", { pageUrl: beforeUrl, signature: targetInfo.signature });
+        if (targetGlobalSig) {
+          globalClickedSet.add(targetGlobalSig);
+        }
+        await apiCall(CONTROL + "/done_action", "POST", {
+          pageUrl: beforeUrl,
+          signature: targetInfo.signature,
+          globalSignature: targetGlobalSig || ""
+        });
         actionsDone++;
 
         if (freshState.autoFillForms) {
@@ -1545,6 +1724,7 @@
   }
 
   function boot() {
+    installDomMutationObserver();
     pollStatusLoop();
     setTimeout(function () {
       apiCall(CONTROL + "/state?url=" + encodeURIComponent(location.href))

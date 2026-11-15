@@ -177,6 +177,7 @@ public final class LocalControlServer {
             resp.put("allowedHosts", new java.util.ArrayList<>(config.getAllowedHostsSet()));
             resp.put("formFill", config.getFormFillProfile().toAgentMap());
             resp.put("clickedSignatures", state.getClickedSignatures(routeKey));
+            resp.put("globalClickedSignatures", state.getGlobalClickedSignatures());
             resp.put("inFlight", state.getInFlightCount());
             resp.put("queueRemaining", state.getPendingQueueSize());
             resp.put("pagesVisited", state.getVisitedPagesCount());
@@ -210,8 +211,12 @@ public final class LocalControlServer {
             Map<String, Object> req = MiniJson.parseObject(bodyStr);
             String pageUrl = MiniJson.asString(req, "pageUrl", "");
             String sig = MiniJson.asString(req, "signature", "");
+            String globalSig = MiniJson.asString(req, "globalSignature", "");
             String routeKey = CrawlState.routeKeyForUrl(pageUrl, config.isNormalizeRouteIds());
             state.markActionClicked(routeKey, sig);
+            if (!globalSig.isEmpty()) {
+                state.markGlobalActionClicked(globalSig);
+            }
             Map<String, Object> resp = new LinkedHashMap<>();
             resp.put("ok", true);
             resp.put("inFlight", state.getInFlightCount());

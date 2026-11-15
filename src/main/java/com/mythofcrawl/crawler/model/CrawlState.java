@@ -61,6 +61,8 @@ public final class CrawlState {
 
     // routeKey -> set of UI action signatures already clicked
     private final Map<String, Set<String>> clickedSignaturesByRoute = new HashMap<>();
+    // Global header/footer/nav UI signatures already clicked once across the whole crawl session
+    private final Set<String> globalClickedSignatures = new LinkedHashSet<>();
 
     // Multi-level trail stack & redirect loop protection
     private volatile long lastContextActionAtMs = 0L;
@@ -206,6 +208,7 @@ public final class CrawlState {
         visitedUrls.clear();
         patternSampleCounts.clear();
         clickedSignaturesByRoute.clear();
+        globalClickedSignatures.clear();
         messageActionPathMap.clear();
         messageGroupMap.clear();
         actionGroups.clear();
@@ -315,6 +318,16 @@ public final class CrawlState {
                 pagesVisitedCount++;
             }
         }
+    }
+
+    public synchronized void markGlobalActionClicked(String signature) {
+        if (signature != null && !signature.trim().isEmpty()) {
+            globalClickedSignatures.add(signature.trim());
+        }
+    }
+
+    public synchronized List<String> getGlobalClickedSignatures() {
+        return new ArrayList<>(globalClickedSignatures);
     }
 
     public synchronized boolean isUrlDeferred(String rawUrl) {

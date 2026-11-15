@@ -204,10 +204,24 @@ public final class AuditTheme {
     }
 
     public static void styleTogglePill(AbstractButton btn, boolean active, Color accentFg, boolean dark) {
-        Color base = cardSurface(dark);
-        Color bg = active ? blend(base, accentFg, dark ? 0.28f : 0.16f) : panelSurface(dark);
-        Color fg = active ? accentFg : textPrimary(dark);
-        Color border = active ? accentFg : borderColor(dark);
+        Color bg;
+        Color fg;
+        Color border;
+        if (active) {
+            // High-contrast pastel surface in Light mode & luminous dark surface in Dark mode
+            // so FlatLaf / Burp Look & Feel never produces dark-text-on-dark-button.
+            bg = dark
+                ? blend(new Color(28, 34, 44), accentFg, 0.28f)
+                : blend(Color.WHITE, accentFg, 0.15f);
+            fg = dark
+                ? new Color(248, 250, 252)
+                : blend(accentFg, Color.BLACK, 0.28f);
+            border = accentFg;
+        } else {
+            bg = panelSurface(dark);
+            fg = textPrimary(dark);
+            border = borderColor(dark);
+        }
         btn.setOpaque(true);
         btn.setContentAreaFilled(true);
         btn.setFocusPainted(false);
@@ -215,8 +229,19 @@ public final class AuditTheme {
         btn.setBackground(bg);
         btn.setFont(btn.getFont().deriveFont(active ? Font.BOLD : Font.PLAIN));
         btn.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(border, 1, true),
-            BorderFactory.createEmptyBorder(3, 10, 3, 10)));
+            BorderFactory.createLineBorder(border, active ? 2 : 1, true),
+            BorderFactory.createEmptyBorder(active ? 2 : 3, 9, active ? 2 : 3, 9)));
+    }
+
+    public static void styleNeutralActionButton(AbstractButton btn, boolean dark) {
+        btn.setOpaque(true);
+        btn.setContentAreaFilled(true);
+        btn.setFocusPainted(false);
+        btn.setForeground(textPrimary(dark));
+        btn.setBackground(cardSurface(dark));
+        btn.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(borderColor(dark), 1, true),
+            BorderFactory.createEmptyBorder(3, 9, 3, 9)));
     }
 
     public static void styleActionCard(JComponent comp, boolean dark) {

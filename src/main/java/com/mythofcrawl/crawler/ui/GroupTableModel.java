@@ -168,6 +168,167 @@ public final class GroupTableModel {
         return sb.toString();
     }
 
+    private static String treeBranchPrefix(int depth, boolean isLast) {
+        if (depth <= 0) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(depth * 4 + 4);
+        for (int i = 0; i < depth - 1; i++) {
+            sb.append("│   ");
+        }
+        sb.append(isLast ? "└─ " : "├─ ");
+        return sb.toString();
+    }
+
+    public static final class PathOverlapSummary {
+        public final String pathKey;
+        public final int totalCalls;
+        public final int distinctLocations;
+        public final boolean allIdentical;
+        public final String diffSummary;
+        public final List<ApiCall> calls;
+
+        PathOverlapSummary(
+            String pathKey,
+            int totalCalls,
+            int distinctLocations,
+            boolean allIdentical,
+            String diffSummary,
+            List<ApiCall> calls
+        ) {
+            this.pathKey = pathKey;
+            this.totalCalls = totalCalls;
+            this.distinctLocations = distinctLocations;
+            this.allIdentical = allIdentical;
+            this.diffSummary = diffSummary;
+            this.calls = calls;
+        }
+    }
+
+    public static PathOverlapSummary summarizePathOverlap(ActionGroupStore store, ApiCall target) {
+        if (store == null || target == null) {
+            return new PathOverlapSummary("/", 0, 0, true, "", Collections.emptyList());
+        }
+        String key = normalizeApiGroupPath(target);
+        return summarizeCallsForPath(key, collectCallsForNormalizedPath(store, key));
+    }
+
+    public static List<ApiCall> collectCallsForNormalizedPath(ActionGroupStore store, String pathKey) {
+        if (store == null || pathKey == null) {
+            return Collections.emptyList();
+        }
+        List<ApiCall> matches = new ArrayList<>();
+        for (ActionGroup g : store.snapshotGroups()) {
+            for (ApiCall c : g.getCalls()) {
+                if (pathKey.equals(normalizeApiGroupPath(c))) {
+                    matches.add(c);
+                }
+            }
+        }
+        return matches;
+    }
+
+    public static PathOverlapSummary summarizeCallsForPath(String pathKey, List<ApiCall> calls) {
+        if (calls == null || calls.isEmpty()) {
+            return new PathOverlapSummary(pathKey, 0, 0, true, "", Collections.emptyList());
+        }
+        Set<String> locations = new LinkedHashSet<>();
+        Set<String> methods = new LinkedHashSet<>();
+        Set<Integer> statuses = new LinkedHashSet<>();
+        Set<String> paramSigs = new LinkedHashSet<>();
+        int minSize = Integer.MAX_VALUE;
+        int maxSize = Integer.MIN_VALUE;
+
+        for (ApiCall c : calls) {
+            locations.add(c.displayName());
+            if (!c.capture.method.isEmpty()) {
+                methods.add(c.capture.method);
+            }
+            statuses.add(c.capture.statusCode);
+            List<String> keys = new ArrayList<>(c.capture.paramKeys);
+            Collections.sort(keys);
+            paramSigs.add(String.join(",", keys));
+            int sz = c.capture.responseLength;
+            if (sz < minSize) {
+                minSize = sz;
+            }
+            if (sz > maxSize) {
+                maxSize = sz;
+            }
+        }
+
+        List<String> diffs = new ArrayList<>();
+        if (methods.size() > 1) {
+            diffs.add("Method (" + String.join("/", methods) + ")");
+        }
+        if (statuses.size() > 1) {
+            StringBuilder sb = new StringBuilder();
+            for (Integer st : statuses) {
+                if (sb.length() > 0) {
+                    sb.append("/");
+                }
+                sb.append(st);
+            }
+            diffs.add("HTTP (" + sb + ")");
+        }
+        if (paramSigs.size() > 1) {
+            diffs.add("Params (" + paramSigs.size() + " kiểu)");
+        }
+        if (calls.size() > 1 && maxSize > minSize) {
+            diffs.add("Size (" + minSize + "B.." + maxSize + "B)");
+        }
+
+        boolean identical = diffs.isEmpty();
+        String summary = identical
+            ? "Giống hệt 100% (chỉ khác vị trí bấm)"
+            : ("Khác: " + String.join(" | ", diffs));
+        return new PathOverlapSummary(
+            pathKey,
+            calls.size(),
+            locations.size(),
+            identical,
+            summary,
+            Collections.unmodifiableList(new ArrayList<>(calls))
+        );
+    }
+
+    public static String describeCallDiffAgainst(ApiCall candidate, ApiCall baseline) {
+        if (candidate == null || baseline == null) {
+            return "";
+        }
+        if (candidate.groupId == baseline.groupId && candidate.index == baseline.index) {
+            return "[Đang xem]";
+        }
+        List<String> diffs = new ArrayList<>();
+        if (!candidate.capture.method.equalsIgnoreCase(baseline.capture.method)) {
+            diffs.add("Method " + candidate.capture.method + " ≠ " + baseline.capture.method);
+        }
+        if (candidate.capture.statusCode != baseline.capture.statusCode) {
+            diffs.add("HTTP " + candidate.capture.statusCode + " ≠ " + baseline.capture.statusCode);
+        }
+        List<String> added = new ArrayList<>();
+        List<String> removed = new ArrayList<>();
+        for (String k : candidate.capture.paramKeys) {
+            if (!baseline.capture.paramKeys.contains(k)) {
+                added.add("+" + k);
+            }
+        }
+        for (String k : baseline.capture.paramKeys) {
+            if (!candidate.capture.paramKeys.contains(k)) {
+                removed.add("-" + k);
+            }
+        }
+        if (!added.isEmpty() || !removed.isEmpty()) {
+            List<String> pDiff = new ArrayList<>(added);
+            pDiff.addAll(removed);
+            diffs.add("Params (" + String.join(", ", pDiff) + ")");
+        }
+        if (candidate.capture.responseLength != baseline.capture.responseLength) {
+            diffs.add("Size " + candidate.capture.responseLength + "B ≠ " + baseline.capture.responseLength + "B");
+        }
+        return diffs.isEmpty() ? "Giống hệt 100% (khác vị trí)" : String.join(" | ", diffs);
+    }
+
     public static final class ActionGroupsModel extends AbstractTableModel {
         private static final String[] COLS = {
             "#", "Tên Nhóm Chức Năng (Action Path)", "Số API", "NOTE", "Excel", "Lượt"
@@ -176,6 +337,7 @@ public final class GroupTableModel {
         public static final class GroupRow {
             public final boolean isFolder;
             public final int depth;
+            public final String treeNumber;
             public final String folderKey;
             public final String displayLabel;
             public final ActionGroup directGroup;
@@ -190,6 +352,7 @@ public final class GroupTableModel {
             GroupRow(
                 boolean isFolder,
                 int depth,
+                String treeNumber,
                 String folderKey,
                 String displayLabel,
                 ActionGroup directGroup,
@@ -203,6 +366,7 @@ public final class GroupTableModel {
             ) {
                 this.isFolder = isFolder;
                 this.depth = depth;
+                this.treeNumber = treeNumber != null ? treeNumber : "";
                 this.folderKey = folderKey;
                 this.displayLabel = displayLabel;
                 this.directGroup = directGroup;
@@ -287,10 +451,13 @@ public final class GroupTableModel {
         private void rebuildVisibleRows() {
             List<GroupRow> rows = new ArrayList<>();
             if (!treeMode) {
+                int seq = 0;
                 for (ActionGroup g : filtered) {
+                    seq++;
                     rows.add(new GroupRow(
                         false,
                         0,
+                        String.valueOf(seq),
                         g.actionPath,
                         g.actionPath,
                         g,
@@ -323,8 +490,11 @@ public final class GroupTableModel {
                 cur.directGroup = g;
             }
             aggregatePrefixTree(root);
+            int topCount = root.children.size();
+            int topIdx = 0;
             for (PrefixNode top : root.children.values()) {
-                emitPrefixNode(top, top.segment, 0, rows);
+                topIdx++;
+                emitPrefixNode(top, top.segment, 0, String.valueOf(topIdx), topIdx == topCount, rows);
             }
             this.visible = rows;
         }
@@ -357,7 +527,14 @@ public final class GroupTableModel {
             }
         }
 
-        private void emitPrefixNode(PrefixNode node, String label, int depth, List<GroupRow> out) {
+        private void emitPrefixNode(
+            PrefixNode node,
+            String label,
+            int depth,
+            String numLabel,
+            boolean isLast,
+            List<GroupRow> out
+        ) {
             if (node.children.isEmpty()) {
                 ActionGroup g = node.directGroup;
                 if (g == null) {
@@ -365,10 +542,11 @@ public final class GroupTableModel {
                 }
                 String rendered = depth == 0
                     ? label
-                    : indentPrefix(depth) + "↳ " + label;
+                    : treeBranchPrefix(depth, isLast) + label;
                 out.add(new GroupRow(
                     false,
                     depth,
+                    numLabel,
                     node.fullPath,
                     rendered,
                     g,
@@ -386,18 +564,19 @@ public final class GroupTableModel {
             // Compress single-child intermediate paths when there is no direct group on the intermediate prefix.
             if (node.directGroup == null && node.children.size() == 1) {
                 PrefixNode onlyChild = node.children.values().iterator().next();
-                emitPrefixNode(onlyChild, label + " > " + onlyChild.segment, depth, out);
+                emitPrefixNode(onlyChild, label + " > " + onlyChild.segment, depth, numLabel, isLast, out);
                 return;
             }
 
             boolean collapsed = collapsedFolders.contains(node.fullPath);
-            String folderTitle = indentPrefix(depth)
+            String folderTitle = treeBranchPrefix(depth, isLast)
                 + (collapsed ? "📁 " : "📂 ")
                 + label
                 + " (" + node.subtreeGroups.size() + " nhóm)";
             out.add(new GroupRow(
                 true,
                 depth,
+                numLabel,
                 node.fullPath,
                 folderTitle,
                 null,
@@ -410,13 +589,18 @@ public final class GroupTableModel {
                 collapsed
             ));
             if (!collapsed) {
+                int childIdx = 0;
+                int totalChildren = node.children.size() + (node.directGroup != null ? 1 : 0);
                 if (node.directGroup != null) {
+                    childIdx++;
                     ActionGroup g = node.directGroup;
+                    boolean childLast = (childIdx == totalChildren);
                     out.add(new GroupRow(
                         false,
                         depth + 1,
+                        numLabel + "." + childIdx,
                         node.fullPath + "::self",
-                        indentPrefix(depth + 1) + "↳ " + g.actionPath,
+                        treeBranchPrefix(depth + 1, childLast) + g.actionPath,
                         g,
                         Collections.singletonList(g),
                         g.callCount(),
@@ -428,7 +612,9 @@ public final class GroupTableModel {
                     ));
                 }
                 for (PrefixNode child : node.children.values()) {
-                    emitPrefixNode(child, child.segment, depth + 1, out);
+                    childIdx++;
+                    boolean childLast = (childIdx == totalChildren);
+                    emitPrefixNode(child, child.segment, depth + 1, numLabel + "." + childIdx, childLast, out);
                 }
             }
         }
@@ -554,8 +740,11 @@ public final class GroupTableModel {
             GroupRow r = visible.get(row);
             switch (col) {
                 case 0:
-                    if (r.isFolder) {
-                        return r.collapsed ? "▶" : "▼";
+                    if (treeMode) {
+                        if (r.isFolder) {
+                            return (r.collapsed ? "▶ " : "▼ ") + r.treeNumber;
+                        }
+                        return r.treeNumber;
                     }
                     return r.directGroup != null ? Integer.valueOf(r.directGroup.id) : "";
                 case 1: return r.displayLabel;
@@ -1183,9 +1372,13 @@ public final class GroupTableModel {
                                 ? AuditTheme.blend(AuditTheme.cardSurface(dark), AuditTheme.severityRowTint(w, table.getBackground(), dark), 0.5f)
                                 : AuditTheme.severityRowTint(w, table.getBackground(), dark);
                         }
-                        if (column == 0 && meta.isFolder) {
-                            fg = AuditTheme.accentForeground(dark);
-                            c.setFont(table.getFont().deriveFont(Font.BOLD));
+                        if (column == 0) {
+                            if (meta.isFolder || meta.depth == 0) {
+                                fg = AuditTheme.accentForeground(dark);
+                                c.setFont(table.getFont().deriveFont(Font.BOLD));
+                            } else {
+                                fg = AuditTheme.mutedForeground(dark);
+                            }
                         } else if (column == 3 && meta.totalNotes > 0 && w != null) {
                             fg = AuditTheme.severityForeground(w, dark);
                             c.setFont(table.getFont().deriveFont(Font.BOLD));
@@ -1195,8 +1388,10 @@ public final class GroupTableModel {
                         } else if (column == 1) {
                             if (meta.isFolder) {
                                 fg = AuditTheme.accentForeground(dark);
+                                c.setFont(table.getFont().deriveFont(Font.BOLD));
+                            } else if (meta.depth == 0) {
+                                c.setFont(table.getFont().deriveFont(Font.BOLD));
                             }
-                            c.setFont(table.getFont().deriveFont(Font.BOLD));
                         }
                         c.setBackground(bg);
                         c.setForeground(fg);

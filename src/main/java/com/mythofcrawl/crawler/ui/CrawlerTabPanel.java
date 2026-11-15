@@ -100,13 +100,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class CrawlerTabPanel extends JPanel {
 
     private static final int TAB_GROUPS = 0;
-    private static final int TAB_NOTES = 1;
-    private static final int TAB_PUSH = 2;
-    private static final int TAB_HEADERS = 3;
-    private static final int TAB_COVERAGE = 4;
-    private static final int TAB_TREE = 5;
-    private static final int TAB_FORM_CONFIG = 6;
-    private static final int TAB_AUX = 7;
+    private static final int TAB_COMPACT_14 = 1;
+    private static final int TAB_NOTES = 2;
+    private static final int TAB_PUSH = 3;
+    private static final int TAB_HEADERS = 4;
+    private static final int TAB_COVERAGE = 5;
+    private static final int TAB_TREE = 6;
+    private static final int TAB_FORM_CONFIG = 7;
+    private static final int TAB_AUX = 8;
+
+    private Compact14ViewPanel compact14Panel;
 
     private final MontoyaApi api;
     private final CrawlConfig config;
@@ -714,8 +717,23 @@ public final class CrawlerTabPanel extends JPanel {
                 refreshPushAndHeaderTitles();
             });
 
+        this.compact14Panel = new Compact14ViewPanel(
+            api,
+            state.getActionGroups(),
+            call -> {
+                showApiCallInInspector(call);
+                setInspectorVisible(true);
+            },
+            calls -> enqueueCallsWithFeedback(calls, "Gọn 14\"", false),
+            cap -> {
+                if (cap != null) {
+                    sendToRepeater(cap, cap.method);
+                }
+            });
+
         mainTabs.setBackground(AuditTheme.panelSurface(dark));
         mainTabs.addTab("Nhóm & API", buildGroupsAndApisTab());
+        mainTabs.addTab("Gọn 14\" (Sổ dọc)", compact14Panel);
         mainTabs.addTab("Bảng NOTE (0)", buildNotesTab());
         mainTabs.addTab("Đẩy Logger++ (0)", pushLedgerPanel);
         mainTabs.addTab("Bộ lọc Header HTTP (0)", headerFilterPanel);
@@ -1015,13 +1033,15 @@ public final class CrawlerTabPanel extends JPanel {
             tblGroups.setRowSorter(null);
             tblGroupApis.setRowSorter(null);
         }
-        setColumnWidths(tblGroups.getColumnModel(), new int[]{42, 280, 56, 56, 56, 46});
+        setColumnWidths(tblGroups.getColumnModel(), new int[]{62, 280, 56, 56, 56, 46});
         setColumnWidths(tblGroupApis.getColumnModel(), new int[]{44, 300, 66, 230, 52, 210, 44, 64, 210});
 
         btnViewTree.setSelected(treeViewMode);
         btnViewFlat.setSelected(!treeViewMode);
         AuditTheme.styleTogglePill(btnViewTree, treeViewMode, AuditTheme.accentForeground(dark), dark);
         AuditTheme.styleTogglePill(btnViewFlat, !treeViewMode, AuditTheme.accentForeground(dark), dark);
+        AuditTheme.styleNeutralActionButton(btnTreeExpandTables, dark);
+        AuditTheme.styleNeutralActionButton(btnTreeCollapseTables, dark);
         btnTreeExpandTables.setVisible(treeViewMode);
         btnTreeCollapseTables.setVisible(treeViewMode);
     }
@@ -2070,6 +2090,9 @@ public final class CrawlerTabPanel extends JPanel {
                 reselectNote(prevNote);
             }
             rebuildHierarchyTreeIfChanged(curVer);
+            if (compact14Panel != null) {
+                compact14Panel.refreshData();
+            }
         }
 
         if (stats.matched != lastExcelMatched || storeChanged) {
@@ -2592,23 +2615,42 @@ public final class CrawlerTabPanel extends JPanel {
     }
 
     private void showSharedGroupsDialog(String endpointKey) {
-        List<String> paths = state.getActionGroups().sharedGroupPaths(endpointKey);
-        if (paths.isEmpty()) {
+        String normPath = GroupTableModel.normalizeRawPathKey(endpointKey);
+        int sp = endpointKey != null ? endpointKey.indexOf(' ') : -1;
+        if (sp > 0 && sp < 10) {
+            normPath = GroupTableModel.normalizeRawPathKey(endpointKey.substring(sp + 1).trim());
+        }
+        List<ApiCall> calls = GroupTableModel.collectCallsForNormalizedPath(state.getActionGroups(), normPath);
+        if (calls.isEmpty()) {
+            List<String> paths = state.getActionGroups().sharedGroupPaths(endpointKey);
             JOptionPane.showMessageDialog(this,
-                "Không có thông tin nhóm dùng chung cho endpoint: " + endpointKey,
+                paths.isEmpty()
+                    ? ("Không có thông tin nhóm dùng chung cho endpoint: " + endpointKey)
+                    : ("Endpoint: " + endpointKey + "\n" + String.join("\n", paths)),
                 "Nhóm dùng chung", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
+        GroupTableModel.PathOverlapSummary summary = GroupTableModel.summarizeCallsForPath(normPath, calls);
+        ApiCall baseline = calls.get(0);
         StringBuilder sb = new StringBuilder();
-        sb.append("Endpoint: ").append(endpointKey).append("\n");
-        sb.append("Được kích hoạt từ ").append(paths.size()).append(" nhóm chức năng:\n\n");
-        for (int i = 0; i < paths.size(); i++) {
-            sb.append(i + 1).append(". ").append(paths.get(i)).append('\n');
+        sb.append("Endpoint chuẩn hóa: ").append(normPath).append('\n');
+        sb.append("Trùng ").append(summary.totalCalls).append(" lần tại ")
+            .append(summary.distinctLocations).append(" vị trí khác nhau\n");
+        sb.append("Tổng hợp khác biệt: ").append(summary.diffSummary).append("\n\n");
+        for (int i = 0; i < calls.size(); i++) {
+            ApiCall c = calls.get(i);
+            String diff = GroupTableModel.describeCallDiffAgainst(c, baseline);
+            sb.append(i + 1).append(". [")
+                .append(c.capture.method).append(" | HTTP ").append(c.capture.statusCode)
+                .append(" | ").append(c.capture.paramCount()).append(" params")
+                .append(" | ").append(c.capture.responseLength).append(" B]  ")
+                .append(c.displayName()).append('\n')
+                .append("    -> ").append(diff).append('\n');
         }
-        JTextArea ta = new JTextArea(sb.toString(), Math.min(18, paths.size() + 5), 64);
+        JTextArea ta = new JTextArea(sb.toString(), Math.min(22, calls.size() * 2 + 6), 76);
         ta.setEditable(false);
         JOptionPane.showMessageDialog(this, new JScrollPane(ta),
-            "Các nhóm cùng gọi API này", JOptionPane.INFORMATION_MESSAGE);
+            "Chi tiết API trùng lặp & Khác biệt", JOptionPane.INFORMATION_MESSAGE);
     }
 
     // =========================================================================
