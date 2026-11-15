@@ -1,21 +1,27 @@
 package com.mythofcrawl.crawler.excel;
 
+import com.mythofcrawl.crawler.model.MiniJson;
+
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
  * Extracts normalized parameter key sets from Query String, Form URL-encoded body,
- * Multipart form fields, and JSON bodies (flattened key paths like json.filter.status)
- * using zero external dependencies.
+ * Multipart form fields, JSON / GraphQL bodies (flattened key paths like json.filter.status),
+ * and XML / SOAP payloads using zero external dependencies.
  */
 public final class ParamExtractor {
 
     private static final Pattern MULTIPART_NAME = Pattern.compile("name=\"([^\"]+)\"");
+    private static final Pattern XML_OPEN_TAG = Pattern.compile("<([a-zA-Z0-9_:-]+)(?:\\s[^>]*)?>");
+    private static final Pattern GRAPHQL_QUERY_OP = Pattern.compile(
+        "(?i)\\b(query|mutation|subscription)\\s+([A-Za-z_][A-Za-z0-9_]*)");
 
     private ParamExtractor() {
     }
@@ -42,19 +48,80 @@ public final class ParamExtractor {
             String bodyStr = new String(body, StandardCharsets.UTF_8);
             String trimmed = bodyStr.trim();
 
-            if (ct.contains("application/json")
+            if (ct.contains("application/json") || ct.contains("application/graphql")
                 || (ct.isEmpty() && (trimmed.startsWith("{") || trimmed.startsWith("[")))) {
                 extractJsonKeys(trimmed, "json", keys);
             } else if (ct.contains("application/x-www-form-urlencoded")) {
                 parseFormPairs(bodyStr, "body.", keys);
             } else if (ct.contains("multipart/form-data")) {
                 extractMultipartKeys(bodyStr, keys);
+            } else if (ct.contains("xml") || ct.contains("soap") || trimmed.startsWith("<")) {
+                extractXmlKeys(trimmed, keys);
             } else if (!trimmed.isEmpty() && !trimmed.startsWith("<") && trimmed.contains("=") && !trimmed.contains("\n")) {
                 // Heuristic fallback for unlabeled URL-encoded forms
                 parseFormPairs(trimmed, "body.", keys);
             }
         }
         return Collections.unmodifiableSet(keys);
+    }
+
+    /**
+     * Extracts GraphQL operation name when the payload contains a GraphQL JSON request
+     * (e.g. {"operationName":"GetUser","query":"..."}), returning "" otherwise.
+     */
+    public static String extractGraphqlOperation(String contentType, byte[] body) {
+        if (body == null || body.length == 0) {
+            return "";
+        }
+        String ct = contentType != null ? contentType.toLowerCase() : "";
+        String str = new String(body, StandardCharsets.UTF_8).trim();
+        if (!(ct.contains("json") || ct.contains("graphql") || str.startsWith("{"))) {
+            return "";
+        }
+        try {
+            Map<String, Object> obj = MiniJson.parseObject(str);
+            String op = MiniJson.asString(obj, "operationName", "").trim();
+            if (!op.isEmpty() && !"null".equalsIgnoreCase(op)) {
+                return op;
+            }
+            String q = MiniJson.asString(obj, "query", "");
+            if (!q.isEmpty()) {
+                Matcher m = GRAPHQL_QUERY_OP.matcher(q);
+                if (m.find()) {
+                    return m.group(1).toLowerCase() + " " + m.group(2);
+                }
+                String qTrim = q.trim().toLowerCase();
+                if (qTrim.startsWith("mutation")) {
+                    return "mutation";
+                }
+                if (qTrim.startsWith("subscription")) {
+                    return "subscription";
+                }
+                if (qTrim.startsWith("query") || qTrim.startsWith("{")) {
+                    return "query";
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return "";
+    }
+
+    private static void extractXmlKeys(String xml, Set<String> out) {
+        Matcher m = XML_OPEN_TAG.matcher(xml);
+        int count = 0;
+        while (m.find() && count < 200) {
+            String tag = m.group(1);
+            if (tag.startsWith("?") || tag.startsWith("!") || tag.equalsIgnoreCase("soap:Envelope")
+                || tag.equalsIgnoreCase("soapenv:Envelope") || tag.equalsIgnoreCase("Envelope")) {
+                continue;
+            }
+            int colon = tag.indexOf(':');
+            String local = colon >= 0 ? tag.substring(colon + 1) : tag;
+            if (!local.isEmpty()) {
+                out.add("xml." + local);
+                count++;
+            }
+        }
     }
 
     private static void parseFormPairs(String encoded, String prefix, Set<String> out) {

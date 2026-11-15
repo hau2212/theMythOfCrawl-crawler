@@ -48,8 +48,9 @@ public final class CrawlState {
         Pattern.CASE_INSENSITIVE);
 
     private volatile Status status = Status.IDLE;
-    private volatile String currentActionPath = "/ > page load";
+    private volatile String currentActionPath = "toppage > page load";
     private volatile String currentPageUrl = "";
+    private volatile ActionGroup currentGroup;
     private volatile int pagesVisitedCount = 0;
     private volatile int consecutiveAuthRejects = 0;
 
@@ -61,15 +62,21 @@ public final class CrawlState {
     // routeKey -> set of UI action signatures already clicked
     private final Map<String, Set<String>> clickedSignaturesByRoute = new HashMap<>();
 
-    // Correlation from Burp InterceptedRequest.messageId() -> exact actionPath at request time
+    // Correlation from Burp InterceptedRequest.messageId() -> exact actionPath + ActionGroup at request time
     private final ConcurrentHashMap<Integer, String> messageActionPathMap = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, ActionGroup> messageGroupMap = new ConcurrentHashMap<>();
     private final AtomicInteger inFlightTargetRequests = new AtomicInteger(0);
 
+    private final ActionGroupStore actionGroups = new ActionGroupStore();
     private final List<SkippedAction> skippedDangerActions = new ArrayList<>();
     private final Set<String> seenSkippedKeys = new LinkedHashSet<>();
 
     private final Set<String> discoveredJsEndpoints = new LinkedHashSet<>();
     private final List<CapturedApiEntry> extraCaptures = new ArrayList<>();
+
+    public ActionGroupStore getActionGroups() {
+        return actionGroups;
+    }
 
     public Status getStatus() {
         return status;
@@ -90,25 +97,48 @@ public final class CrawlState {
         return currentPageUrl;
     }
 
+    public ActionGroup getCurrentGroup() {
+        return currentGroup;
+    }
+
     public void setCurrentContext(String actionPath, String pageUrl) {
-        if (actionPath != null && !actionPath.trim().isEmpty()) {
-            this.currentActionPath = actionPath.trim();
-        }
+        setCurrentContext(actionPath, "", "", pageUrl);
+    }
+
+    public ActionGroup setCurrentContext(String actionPath, String kind, String label, String pageUrl) {
+        String resolvedPath = (actionPath != null && !actionPath.trim().isEmpty())
+            ? actionPath.trim() : this.currentActionPath;
+        this.currentActionPath = resolvedPath;
         if (pageUrl != null && !pageUrl.trim().isEmpty()) {
             this.currentPageUrl = pageUrl.trim();
         }
+        ActionGroup g = actionGroups.openGroup(resolvedPath, kind, label, this.currentPageUrl);
+        this.currentGroup = g;
+        return g;
     }
 
     public void bindMessageActionPath(int messageId, String actionPath) {
+        bindMessageContext(messageId, actionPath, this.currentGroup);
+    }
+
+    public void bindMessageContext(int messageId, String actionPath, ActionGroup group) {
         if (messageActionPathMap.size() > 8000) {
             messageActionPathMap.clear();
+            messageGroupMap.clear();
         }
         messageActionPathMap.put(messageId, actionPath != null ? actionPath : currentActionPath);
+        if (group != null) {
+            messageGroupMap.put(messageId, group);
+        }
     }
 
     public String consumeMessageActionPath(int messageId) {
         String p = messageActionPathMap.remove(messageId);
         return p != null ? p : currentActionPath;
+    }
+
+    public ActionGroup consumeMessageGroup(int messageId) {
+        return messageGroupMap.remove(messageId);
     }
 
     public void incrementInFlight() {
@@ -130,6 +160,8 @@ public final class CrawlState {
         patternSampleCounts.clear();
         clickedSignaturesByRoute.clear();
         messageActionPathMap.clear();
+        messageGroupMap.clear();
+        actionGroups.clear();
         inFlightTargetRequests.set(0);
         skippedDangerActions.clear();
         seenSkippedKeys.clear();
@@ -137,8 +169,9 @@ public final class CrawlState {
         extraCaptures.clear();
         pagesVisitedCount = 0;
         consecutiveAuthRejects = 0;
-        currentActionPath = "/ > page load";
+        currentActionPath = "toppage > page load";
         currentPageUrl = seedUrl != null ? seedUrl : "";
+        currentGroup = null;
         if (seedUrl != null && !seedUrl.trim().isEmpty()) {
             String norm = normalizeCrawlUrl(seedUrl);
             if (!norm.isEmpty()) {

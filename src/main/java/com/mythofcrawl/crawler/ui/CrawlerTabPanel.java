@@ -12,9 +12,14 @@ import com.mythofcrawl.crawler.excel.ApiSpecEntry;
 import com.mythofcrawl.crawler.excel.ExcelSpecMatcher;
 import com.mythofcrawl.crawler.excel.ReportExporter;
 import com.mythofcrawl.crawler.excel.SimpleXlsxReader;
+import com.mythofcrawl.crawler.model.ActionGroup;
+import com.mythofcrawl.crawler.model.ActionGroupStore;
+import com.mythofcrawl.crawler.model.ApiCall;
+import com.mythofcrawl.crawler.model.AuditNote;
 import com.mythofcrawl.crawler.model.CapturedApiEntry;
 import com.mythofcrawl.crawler.model.CrawlConfig;
 import com.mythofcrawl.crawler.model.CrawlState;
+import com.mythofcrawl.crawler.model.FormFillProfile;
 import com.mythofcrawl.crawler.proxy.HtmlAgentInjector;
 import com.mythofcrawl.crawler.proxy.SeedDiscoveryHelper;
 
@@ -24,7 +29,6 @@ import javax.swing.DefaultListModel;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
 import javax.swing.JComboBox;
-import javax.swing.JDialog;
 import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JList;
@@ -34,7 +38,6 @@ import javax.swing.JPanel;
 import javax.swing.JPopupMenu;
 import javax.swing.JProgressBar;
 import javax.swing.JScrollPane;
-import javax.swing.JSpinner;
 import javax.swing.JSplitPane;
 import javax.swing.JTabbedPane;
 import javax.swing.JTable;
@@ -42,43 +45,50 @@ import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.JTree;
 import javax.swing.ListSelectionModel;
-import javax.swing.SpinnerNumberModel;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import javax.swing.filechooser.FileNameExtensionFilter;
+import javax.swing.table.TableColumnModel;
 import javax.swing.tree.DefaultMutableTreeNode;
+import javax.swing.tree.DefaultTreeCellRenderer;
 import javax.swing.tree.DefaultTreeModel;
+import javax.swing.tree.TreeNode;
 import javax.swing.tree.TreePath;
 import java.awt.BorderLayout;
 import java.awt.Color;
+import java.awt.Component;
 import java.awt.Desktop;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
-import java.awt.Frame;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
 import java.awt.Toolkit;
-import java.awt.Window;
 import java.awt.datatransfer.StringSelection;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.io.File;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
+import java.util.Enumeration;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Main Burp Suite Tab UI for theMythOfCrawl Firefox + Excel Auto-Crawler.
- * Designed to stay clean and uncluttered: primary actions sit at the top bar,
- * secondary crawl tunables open via Settings modal, and tables support right-click context actions.
+ * Eye-friendly Burp Suite Audit UI for "theMythOfCrawl Crawler":
+ * - Groups every triggered API under its UI action group ("toppage > contact > button 'Send'"),
+ *   preserving the group name on every API inside it and highlighting anomalies via Audit NOTEs.
+ * - Dedicated tabs for Groups & APIs, Consolidated NOTE Table, Excel STT Coverage,
+ *   Hierarchy Tree, Configurable Form Auto-Fill ("TEXT") & Engine Settings, and Aux/Logs.
  */
 public final class CrawlerTabPanel extends JPanel {
 
@@ -86,65 +96,105 @@ public final class CrawlerTabPanel extends JPanel {
     private final CrawlConfig config;
     private final CrawlState state;
     private final HtmlAgentInjector injector;
+    private final Runnable onPersistConfig;
     private volatile ExcelSpecMatcher matcher;
 
     private final AtomicBoolean refreshPending = new AtomicBoolean(false);
     private final Timer refreshTimer;
     private File lastDirectory;
 
-    // Top controls
-    private final JLabel lblExcelStatus = new JLabel("Chưa nạp file Excel (.xlsx)");
-    private final JTextField txtHosts = new JTextField(20);
-    private final JTextField txtSeedUrl = new JTextField(22);
+    // Top Row 1: Primary Workflow Controls
+    private final JLabel lblExcelStatus = new JLabel("Chưa nạp Excel");
+    private final JTextField txtHosts = new JTextField(16);
+    private final JTextField txtSeedUrl = new JTextField(18);
     private final JButton btnStart = new JButton("Bắt đầu Crawl");
     private final JButton btnPause = new JButton("Tạm dừng");
     private final JButton btnStop = new JButton("Dừng");
-    private final JCheckBox chkArmAgent = new JCheckBox("Bơm Agent vào trình duyệt", true);
+
+    // Top Row 2: Quick Toggles & Calm Stat Chips
+    private final JCheckBox chkArmAgent = new JCheckBox("Bơm Agent", true);
     private final JCheckBox chkPassive = new JCheckBox("Bắt thụ động", false);
-
-    // Status strip
+    private final JCheckBox chkStrictQuick = new JCheckBox("Chỉ giữ Excel", true);
     private final JProgressBar progressBar = new JProgressBar(0, 100);
-    private final JLabel lblStats = new JLabel("Matched: 0/0 | Missing: 0 | Diff Notes: 0 | Pages: 0 | Queue: 0");
-    private final JLabel lblCurrentAction = new JLabel("Sẵn sàng - Nhập Host(s), mở Chrome/Firefox (qua Burp Proxy) tới trang đích rồi bấm Bắt đầu Crawl.");
+    private final JLabel chipGroups = new JLabel("Nhóm: 0");
+    private final JLabel chipApis = new JLabel("API: 0");
+    private final JLabel chipNotes = new JLabel("NOTE: 0");
+    private final JLabel chipExcel = new JLabel("Excel: 0/0");
+    private final JLabel chipPages = new JLabel("Trang: 0 | Q: 0");
 
-    // Tab 1: Excel Checklist
+    // Top Row 3: Live Crawl & Form Profile Strip
+    private final JLabel lblCurrentAction = new JLabel(
+        "Sẵn sàng - Nhập Host(s), mở Firefox/Chrome qua Burp Proxy rồi bấm Bắt đầu Crawl.");
+    private final JLabel lblFormSummary = new JLabel();
+
+    // Main Tabs
+    private final JTabbedPane mainTabs = new JTabbedPane();
+    private final JTabbedPane auxTabs = new JTabbedPane();
+
+    // Tab 0: Action Groups + APIs inside Group
+    private final GroupTableModel.ActionGroupsModel groupsModel;
+    private final JTable tblGroups;
+    private final JComboBox<String> cbGroupFilter = new JComboBox<>(
+        new String[]{"Có API (>0)", "Tất cả nhóm", "Có NOTE (!)"});
+    private final JTextField txtGroupSearch = new JTextField(14);
+
+    private final GroupTableModel.GroupApisModel groupApisModel;
+    private final JTable tblGroupApis;
+    private final JLabel lblGroupHeader = new JLabel("Tất cả API đã nhóm");
+    private final JCheckBox chkAllApisWhenUnselected = new JCheckBox("Hiện tất cả khi chưa chọn nhóm", true);
+    private final JCheckBox chkOnlyApiNotes = new JCheckBox("Chỉ hiện NOTE", false);
+    private final JTextField txtApiSearch = new JTextField(16);
+
+    // Tab 1: Consolidated Audit NOTEs Table
+    private final GroupTableModel.AuditNotesTableModel notesModel;
+    private final JTable tblNotes;
+    private final JComboBox<String> cbNoteSeverity = new JComboBox<>(
+        new String[]{"Tất cả (ALL)", "Lỗi (ERROR)", "Cảnh báo (WARN)", "Thông tin (INFO)"});
+    private final JTextField txtNoteSearch = new JTextField(20);
+
+    // Tab 2: Excel Checklist Coverage
     private final CoverageTableModel coverageModel = new CoverageTableModel();
     private final JTable tblCoverage = new JTable(coverageModel);
     private final JComboBox<String> cbStatusFilter = new JComboBox<>(
-        new String[]{"Tất cả (ALL)", "Đã lấy (MATCHED)", "Còn thiếu (MISSING)", "Khác tham số (!)"});
-    private final JTextField txtSearch = new JTextField(22);
+        new String[]{"Tất cả (ALL)", "Đã lấy (MATCHED)", "Còn thiếu (MISSING)", "Có NOTE (!)"});
+    private final JTextField txtSearch = new JTextField(20);
 
-    // Tab 2: Hierarchy Tree
-    private final DefaultMutableTreeNode treeRoot = new DefaultMutableTreeNode("/");
-    private final DefaultTreeModel treeModel = new DefaultTreeModel(treeRoot);
-    private final JTree actionTree = new JTree(treeModel);
+    // Tab 3: Hierarchy Tree
+    private final DefaultMutableTreeNode treeRoot;
+    private final DefaultTreeModel treeModel;
+    private final JTree actionTree;
 
-    // Tab 3: Skipped Danger & JS Hints
+    // Tab 4: Form Auto-Fill & Config
+    private FormAndConfigPanel formConfigPanel;
+
+    // Tab 5: Skipped, JS Hints, Extras, Log
+    private final CoverageTableModel.ExtraCaptureTableModel extraModel =
+        new CoverageTableModel.ExtraCaptureTableModel();
+    private final JTable tblExtras = new JTable(extraModel);
     private final CoverageTableModel.SkippedActionTableModel skippedModel =
         new CoverageTableModel.SkippedActionTableModel();
     private final JTable tblSkipped = new JTable(skippedModel);
     private final DefaultListModel<String> jsListModel = new DefaultListModel<>();
     private final JList<String> lstJsEndpoints = new JList<>(jsListModel);
-
-    // Tab 4: Extra Captures
-    private final CoverageTableModel.ExtraCaptureTableModel extraModel =
-        new CoverageTableModel.ExtraCaptureTableModel();
-    private final JTable tblExtras = new JTable(extraModel);
-
-    // Tab 5: Log
     private final JTextArea txtLog = new JTextArea();
 
     // Bottom Inspector
-    private final JLabel lblSelectedSummary = new JLabel("Chọn một dòng API để xem chi tiết Request / Response và Action Path");
+    private final JLabel lblSelectedSummary = new JLabel(
+        "Chọn một API, NOTE hoặc lá cây để xem chi tiết Request / Response và Tên Nhóm");
     private final JComboBox<VariantItem> cbVariant = new JComboBox<>();
+    private final JButton btnShowShared = new JButton("Nhóm dùng chung");
     private final JButton btnSendRepeater = new JButton("Send to Repeater");
     private final JTextArea txtNotesBanner = new JTextArea(2, 40);
     private final HttpRequestEditor requestEditor;
     private final HttpResponseEditor responseEditor;
 
-    private final JTabbedPane mainTabs = new JTabbedPane();
     private boolean updatingVariants = false;
-    private int lastTreeCaptureCount = -1;
+    private boolean syncingQuickControls = false;
+    private long lastStoreVersion = -1L;
+    private int lastNoteCount = -1;
+    private int lastExcelMatched = -1;
+    private int lastTreeVersion = -1;
+    private String currentInspectEndpointKey = "";
 
     public CrawlerTabPanel(
         MontoyaApi api,
@@ -153,11 +203,35 @@ public final class CrawlerTabPanel extends JPanel {
         HtmlAgentInjector injector,
         ExcelSpecMatcher initialMatcher
     ) {
+        this(api, config, state, injector, initialMatcher, null);
+    }
+
+    public CrawlerTabPanel(
+        MontoyaApi api,
+        CrawlConfig config,
+        CrawlState state,
+        HtmlAgentInjector injector,
+        ExcelSpecMatcher initialMatcher,
+        Runnable onPersistConfig
+    ) {
         this.api = api;
         this.config = config;
         this.state = state;
         this.injector = injector;
+        this.onPersistConfig = onPersistConfig;
         this.matcher = initialMatcher != null ? initialMatcher : ExcelSpecMatcher.empty();
+
+        ActionGroupStore store = state.getActionGroups();
+        this.groupsModel = new GroupTableModel.ActionGroupsModel(store);
+        this.tblGroups = new JTable(groupsModel);
+        this.groupApisModel = new GroupTableModel.GroupApisModel(store);
+        this.tblGroupApis = new JTable(groupApisModel);
+        this.notesModel = new GroupTableModel.AuditNotesTableModel(store);
+        this.tblNotes = new JTable(notesModel);
+
+        this.treeRoot = new DefaultMutableTreeNode(config.getRouteRootLabel());
+        this.treeModel = new DefaultTreeModel(treeRoot);
+        this.actionTree = new JTree(treeModel);
 
         this.requestEditor = api != null
             ? api.userInterface().createHttpRequestEditor(EditorOptions.READ_ONLY) : null;
@@ -167,19 +241,24 @@ public final class CrawlerTabPanel extends JPanel {
         setLayout(new BorderLayout(6, 6));
         setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
 
+        syncQuickCheckboxesFromConfig();
         add(buildHeaderPanel(), BorderLayout.NORTH);
         add(buildMainSplitPane(), BorderLayout.CENTER);
 
-        // Debounced UI refresh + live Firefox status ticker
         this.refreshTimer = new Timer(400, e -> {
-            if (refreshPending.getAndSet(false) || state.getStatus() == CrawlState.Status.RUNNING) {
+            if (refreshPending.getAndSet(false)
+                || state.getStatus() == CrawlState.Status.RUNNING
+                || state.getActionGroups().version() != lastStoreVersion) {
                 refreshAllViewsNow();
             }
         });
         this.refreshTimer.start();
 
         refreshButtonsState();
-        appendLog("theMythOfCrawl Firefox + Excel Crawler sẵn sàng. Hãy nạp file Excel (.xlsx) trước khi Crawl.");
+        refreshAllViewsNow();
+        appendLog("theMythOfCrawl Audit Crawler sẵn sàng. Mặc định điền form: \""
+            + config.getFormFillProfile().get(FormFillProfile.Field.TEXT)
+            + "\" | Gốc cây: \"" + config.getRouteRootLabel() + "\".");
     }
 
     public void dispose() {
@@ -215,399 +294,694 @@ public final class CrawlerTabPanel extends JPanel {
         }
     }
 
+    private void syncQuickCheckboxesFromConfig() {
+        syncingQuickControls = true;
+        try {
+            chkPassive.setSelected(injector != null && injector.isPassiveCapture());
+            chkStrictQuick.setSelected(config.isStrictExcelOnly());
+            if (formConfigPanel != null) {
+                formConfigPanel.syncFromConfig();
+            }
+            refreshFormSummaryLabel();
+        } finally {
+            syncingQuickControls = false;
+        }
+    }
+
+    private void persistConfigQuietly() {
+        if (onPersistConfig != null) {
+            try {
+                onPersistConfig.run();
+            } catch (Exception ex) {
+                appendLog("Không lưu được cấu hình vào Burp Preferences: " + ex.getMessage());
+            }
+        }
+    }
+
+    private void refreshFormSummaryLabel() {
+        boolean dark = AuditTheme.isDark(api, this);
+        String txtVal = config.getFormFillProfile().get(FormFillProfile.Field.TEXT);
+        lblFormSummary.setText("Form Text: \"" + txtVal + "\" | Gốc: " + config.getRouteRootLabel());
+        lblFormSummary.setForeground(AuditTheme.accentForeground(dark));
+    }
+
+    // =========================================================================
+    // Header / Toolbar
+    // =========================================================================
+
     private JPanel buildHeaderPanel() {
+        boolean dark = AuditTheme.isDark(api, this);
         JPanel container = new JPanel(new BorderLayout(4, 4));
 
-        // Row 1: Primary Workflow Controls
+        // Row 1: Primary workflow controls
         JPanel row1 = new JPanel(new GridBagLayout());
         row1.setBorder(BorderFactory.createCompoundBorder(
             BorderFactory.createEtchedBorder(),
             BorderFactory.createEmptyBorder(6, 8, 6, 8)));
-
-        GridBagConstraints gc = new GridBagConstraints();
-        gc.insets = new Insets(2, 4, 2, 4);
-        gc.anchor = GridBagConstraints.WEST;
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(2, 4, 2, 4);
+        gbc.anchor = GridBagConstraints.WEST;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
 
         JButton btnImport = new JButton("Import Excel (.xlsx/.csv)");
+        btnImport.setToolTipText("Nạp danh sách API chuẩn gồm cột STT, Method, Path API");
         btnImport.addActionListener(e -> onImportExcel());
 
-        JButton btnSettings = new JButton("Cài đặt...");
-        btnSettings.addActionListener(e -> onOpenSettings());
+        lblExcelStatus.setForeground(AuditTheme.mutedForeground(dark));
+        lblExcelStatus.setToolTipText("Trạng thái file Excel checklist");
 
-        JButton btnExport = new JButton("Xuất báo cáo ▼");
-        btnExport.addActionListener(e -> showExportMenu(btnExport));
+        txtHosts.setToolTipText("Ví dụ: app.example.com,api.example.com (hoặc * để bắt mọi host)");
+        txtHosts.setText(config.getAllowedHostsCsv());
 
-        JButton btnReset = new JButton("Reset kết quả");
-        btnReset.addActionListener(e -> onResetCaptures());
+        txtSeedUrl.setToolTipText("URL trang chủ để pre-crawl & quét JS (không bắt buộc)");
 
-        txtHosts.setToolTipText("Ví dụ: app.example.com, *.example.com hoặc * để bắt mọi host qua Burp Proxy (Chrome/Firefox)");
-        txtHosts.getDocument().addDocumentListener(new DocumentListener() {
-            private void sync() { config.setAllowedHostsCsv(txtHosts.getText()); }
-            @Override public void insertUpdate(DocumentEvent e) { sync(); }
-            @Override public void removeUpdate(DocumentEvent e) { sync(); }
-            @Override public void changedUpdate(DocumentEvent e) { sync(); }
-        });
-        txtSeedUrl.setToolTipText("Tùy chọn: URL trang bắt đầu (ví dụ https://app.example.com/dashboard). Nếu bỏ trống, trình duyệt (Chrome/Firefox) sẽ tự crawl ngay trang bạn đang mở.");
-
+        btnStart.setFont(btnStart.getFont().deriveFont(Font.BOLD));
         btnStart.addActionListener(e -> onStartCrawl());
         btnPause.addActionListener(e -> onTogglePause());
         btnStop.addActionListener(e -> onStopCrawl());
 
-        chkArmAgent.setToolTipText("Bơm /__myth_crawl/agent.js vào trang HTML của Target Host qua Burp Proxy (hỗ trợ Chrome, Burp Browser, Edge, Firefox).");
+        JButton btnReset = new JButton("Reset");
+        btnReset.setToolTipText("Xóa kết quả crawl hiện tại (giữ lại danh sách Excel & cài đặt)");
+        btnReset.addActionListener(e -> onResetCaptures());
+
+        JButton btnExport = new JButton("Xuất báo cáo ▼");
+        btnExport.addActionListener(e -> showExportMenu(btnExport));
+
+        int x = 0;
+        gbc.gridx = x++; gbc.gridy = 0; gbc.weightx = 0; row1.add(btnImport, gbc);
+        gbc.gridx = x++; gbc.weightx = 0; row1.add(lblExcelStatus, gbc);
+        gbc.gridx = x++; gbc.weightx = 0; row1.add(new JLabel("Host(s):"), gbc);
+        gbc.gridx = x++; gbc.weightx = 0.45; row1.add(txtHosts, gbc);
+        gbc.gridx = x++; gbc.weightx = 0; row1.add(new JLabel("Seed URL:"), gbc);
+        gbc.gridx = x++; gbc.weightx = 0.55; row1.add(txtSeedUrl, gbc);
+        gbc.gridx = x++; gbc.weightx = 0; row1.add(btnStart, gbc);
+        gbc.gridx = x++; gbc.weightx = 0; row1.add(btnPause, gbc);
+        gbc.gridx = x++; gbc.weightx = 0; row1.add(btnStop, gbc);
+        gbc.gridx = x++; gbc.weightx = 0; row1.add(btnReset, gbc);
+        gbc.gridx = x;   gbc.weightx = 0; row1.add(btnExport, gbc);
+
+        // Row 2: Quick toggles & Stat Chips
+        JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 3));
         chkArmAgent.addActionListener(e -> {
             if (injector != null) {
                 injector.setAgentArmed(chkArmAgent.isSelected());
                 appendLog(chkArmAgent.isSelected()
-                    ? "Đã bật bơm Browser Crawler Agent (Reload tab Chrome/Firefox để hiện badge góc phải dưới)."
-                    : "Đã tắt bơm Browser Agent.");
+                    ? "Đã BẬT bơm Agent auto-crawl vào trình duyệt."
+                    : "Đã TẮT bơm Agent (chỉ nghe traffic).");
             }
         });
-
-        chkPassive.setToolTipText("Ngay cả khi chưa bấm Start Crawl, vẫn tự động match traffic lướt tay trên trình duyệt theo file Excel.");
         chkPassive.addActionListener(e -> {
-            if (injector != null) {
-                injector.setPassiveCapture(chkPassive.isSelected());
-                if (chkPassive.isSelected() && config.getAllowedHostsSet().isEmpty()) {
-                    appendLog("Lưu ý: Ô Host(s) đang trống - hãy nhập domain đích (hoặc * để test) thì Bắt thụ động mới chạy!");
+            if (!syncingQuickControls) {
+                boolean passive = chkPassive.isSelected();
+                if (injector != null) {
+                    injector.setPassiveCapture(passive);
                 }
+                appendLog(passive
+                    ? "Chế độ BẮT THỤ ĐỘNG: chỉ ghi nhận traffic, tạm tắt bơm Agent."
+                    : "Chế độ CHỦ ĐỘNG: Agent tự duyệt toàn bộ trang & form.");
+            }
+        });
+        chkStrictQuick.setToolTipText("Khi tắt: lưu mọi API vào Nhóm & đánh NOTE 'Ngoài Excel'. Khi bật: chỉ giữ API khớp Excel.");
+        chkStrictQuick.addActionListener(e -> {
+            if (!syncingQuickControls) {
+                config.setStrictExcelOnly(chkStrictQuick.isSelected());
+                if (formConfigPanel != null) {
+                    formConfigPanel.syncFromConfig();
+                }
+                persistConfigQuietly();
             }
         });
 
-        // Sub-row A: File + Target + Seed
-        int col = 0;
-        gc.gridx = col++; gc.gridy = 0; gc.weightx = 0; gc.fill = GridBagConstraints.NONE;
-        row1.add(btnImport, gc);
+        JButton btnFormConfig = new JButton("Form (TEXT) & Cài đặt ↗");
+        btnFormConfig.addActionListener(e -> mainTabs.setSelectedIndex(4));
 
-        gc.gridx = col++; gc.weightx = 0.25; gc.fill = GridBagConstraints.HORIZONTAL;
-        lblExcelStatus.setFont(lblExcelStatus.getFont().deriveFont(Font.BOLD));
-        row1.add(lblExcelStatus, gc);
+        progressBar.setPreferredSize(new Dimension(110, 20));
+        progressBar.setStringPainted(true);
+        progressBar.setString("0%");
 
-        gc.gridx = col++; gc.weightx = 0; gc.fill = GridBagConstraints.NONE;
-        row1.add(new JLabel("Host(s):"), gc);
+        row2.add(chkArmAgent);
+        row2.add(chkPassive);
+        row2.add(chkStrictQuick);
+        row2.add(btnFormConfig);
+        row2.add(Box.createHorizontalStrut(4));
+        row2.add(progressBar);
+        row2.add(chipGroups);
+        row2.add(chipApis);
+        row2.add(chipNotes);
+        row2.add(chipExcel);
+        row2.add(chipPages);
 
-        gc.gridx = col++; gc.weightx = 0.35; gc.fill = GridBagConstraints.HORIZONTAL;
-        row1.add(txtHosts, gc);
+        // Row 3: Live status strip
+        JPanel row3 = new JPanel(new BorderLayout(8, 0));
+        row3.setBorder(BorderFactory.createEmptyBorder(0, 6, 2, 6));
+        lblCurrentAction.setForeground(AuditTheme.accentForeground(dark));
+        lblCurrentAction.setFont(lblCurrentAction.getFont().deriveFont(Font.BOLD));
+        row3.add(lblCurrentAction, BorderLayout.CENTER);
+        row3.add(lblFormSummary, BorderLayout.EAST);
 
-        gc.gridx = col++; gc.weightx = 0; gc.fill = GridBagConstraints.NONE;
-        row1.add(new JLabel("Seed URL:"), gc);
-
-        gc.gridx = col++; gc.weightx = 0.4; gc.fill = GridBagConstraints.HORIZONTAL;
-        row1.add(txtSeedUrl, gc);
-
-        // Sub-row B: Crawl Controls & Tools
-        JPanel actionsBar = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
-        actionsBar.add(btnStart);
-        actionsBar.add(btnPause);
-        actionsBar.add(btnStop);
-        actionsBar.add(btnReset);
-        actionsBar.add(Box.createHorizontalStrut(8));
-        actionsBar.add(chkArmAgent);
-        actionsBar.add(chkPassive);
-        actionsBar.add(Box.createHorizontalStrut(8));
-        actionsBar.add(btnSettings);
-        actionsBar.add(btnExport);
-
-        gc.gridx = 0; gc.gridy = 1; gc.gridwidth = col; gc.weightx = 1.0; gc.fill = GridBagConstraints.HORIZONTAL;
-        row1.add(actionsBar, gc);
+        JPanel centerWrap = new JPanel(new BorderLayout(2, 2));
+        centerWrap.add(row2, BorderLayout.NORTH);
+        centerWrap.add(row3, BorderLayout.SOUTH);
 
         container.add(row1, BorderLayout.NORTH);
-
-        // Row 2: Live Progress & Current Action Strip
-        JPanel row2 = new JPanel(new BorderLayout(8, 4));
-        row2.setBorder(BorderFactory.createEmptyBorder(2, 4, 2, 4));
-
-        progressBar.setStringPainted(true);
-        progressBar.setPreferredSize(new Dimension(200, 18));
-
-        JPanel leftStats = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
-        leftStats.add(progressBar);
-        lblStats.setFont(lblStats.getFont().deriveFont(Font.BOLD));
-        leftStats.add(lblStats);
-
-        lblCurrentAction.setForeground(new Color(40, 110, 175));
-        row2.add(leftStats, BorderLayout.WEST);
-        row2.add(lblCurrentAction, BorderLayout.CENTER);
-
-        container.add(row2, BorderLayout.SOUTH);
+        container.add(centerWrap, BorderLayout.CENTER);
         return container;
     }
 
+    // =========================================================================
+    // Main Split Pane & Tabs
+    // =========================================================================
+
     private JSplitPane buildMainSplitPane() {
-        mainTabs.addTab("Tiến độ Excel (STT)", buildExcelCoverageTab());
-        mainTabs.addTab("Cây Phân cấp (/ > Page > Button)", buildHierarchyTreeTab());
-        mainTabs.addTab("Nút bị né & Gợi ý JS", buildSkippedAndJsTab());
-        mainTabs.addTab("Ngoài Excel", buildExtraCapturesTab());
-        mainTabs.addTab("Log", buildLogTab());
+        mainTabs.addTab("Nhóm & API", buildGroupsAndApisTab());
+        mainTabs.addTab("Bảng NOTE (0)", buildNotesTab());
+        mainTabs.addTab("Tiến độ Excel (0/0)", buildCoverageTab());
+        mainTabs.addTab("Cây Phân cấp (0)", buildHierarchyTreeTab());
+        mainTabs.addTab("Điền Form & Cài Đặt", buildFormAndConfigTab());
+        mainTabs.addTab("Bị né, JS & Log", buildAuxTab());
 
-        JPanel bottomInspector = buildInspectorPanel();
-
-        JSplitPane mainSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT, mainTabs, bottomInspector);
-        mainSplit.setResizeWeight(0.56);
-        mainSplit.setOneTouchExpandable(true);
-        return mainSplit;
+        JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, mainTabs, buildInspectorPanel());
+        split.setResizeWeight(0.60);
+        split.setOneTouchExpandable(true);
+        return split;
     }
 
-    private JPanel buildExcelCoverageTab() {
-        JPanel panel = new JPanel(new BorderLayout(4, 4));
-        JPanel filterBar = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
-        filterBar.add(new JLabel("Lọc:"));
-        filterBar.add(cbStatusFilter);
-        filterBar.add(new JLabel("Tìm kiếm:"));
-        filterBar.add(txtSearch);
+    // --- Tab 0: Action Groups + APIs inside Group ---
 
-        cbStatusFilter.addActionListener(e -> applyCoverageFilter());
-        txtSearch.getDocument().addDocumentListener(new DocumentListener() {
-            @Override public void insertUpdate(DocumentEvent e) { applyCoverageFilter(); }
-            @Override public void removeUpdate(DocumentEvent e) { applyCoverageFilter(); }
-            @Override public void changedUpdate(DocumentEvent e) { applyCoverageFilter(); }
+    private JSplitPane buildGroupsAndApisTab() {
+        // Left pane: Action Groups
+        JPanel leftPanel = new JPanel(new BorderLayout(4, 4));
+        leftPanel.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
+
+        JPanel leftFilter = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 2));
+        leftFilter.add(new JLabel("Nhóm:"));
+        cbGroupFilter.addActionListener(e -> applyGroupFilter());
+        leftFilter.add(cbGroupFilter);
+        leftFilter.add(new JLabel("Tìm:"));
+        attachDocListener(txtGroupSearch, this::applyGroupFilter);
+        leftFilter.add(txtGroupSearch);
+        JButton btnClearGroup = new JButton("Bỏ chọn");
+        btnClearGroup.setToolTipText("Bỏ chọn nhóm để xem toàn bộ API đã bắt");
+        btnClearGroup.addActionListener(e -> {
+            tblGroups.clearSelection();
+            applyGroupApisFilter();
+        });
+        leftFilter.add(btnClearGroup);
+
+        AuditTheme.configureAuditTable(tblGroups);
+        tblGroups.setAutoCreateRowSorter(true);
+        tblGroups.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        tblGroups.setDefaultRenderer(Object.class, new GroupTableModel.GroupCellRenderer(api));
+        tblGroups.setDefaultRenderer(Integer.class, new GroupTableModel.GroupCellRenderer(api));
+        setColumnWidths(tblGroups.getColumnModel(), new int[]{38, 280, 56, 56, 56, 46});
+
+        tblGroups.getSelectionModel().addListSelectionListener(e -> {
+            if (!e.getValueIsAdjusting()) {
+                applyGroupApisFilter();
+            }
+        });
+        installGroupPopupMenu();
+
+        leftPanel.add(leftFilter, BorderLayout.NORTH);
+        leftPanel.add(new JScrollPane(tblGroups), BorderLayout.CENTER);
+
+        // Right pane: APIs inside selected group (or all grouped APIs)
+        JPanel rightPanel = new JPanel(new BorderLayout(4, 4));
+        rightPanel.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
+
+        JPanel rightHeader = new JPanel(new BorderLayout(4, 2));
+        lblGroupHeader.setFont(lblGroupHeader.getFont().deriveFont(Font.BOLD));
+        lblGroupHeader.setBorder(BorderFactory.createEmptyBorder(2, 4, 2, 4));
+        JPanel rightFilter = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
+        chkAllApisWhenUnselected.addActionListener(e -> applyGroupApisFilter());
+        chkOnlyApiNotes.addActionListener(e -> applyGroupApisFilter());
+        attachDocListener(txtApiSearch, this::applyGroupApisFilter);
+        rightFilter.add(chkAllApisWhenUnselected);
+        rightFilter.add(chkOnlyApiNotes);
+        rightFilter.add(new JLabel("Tìm API:"));
+        rightFilter.add(txtApiSearch);
+
+        rightHeader.add(lblGroupHeader, BorderLayout.NORTH);
+        rightHeader.add(rightFilter, BorderLayout.SOUTH);
+
+        AuditTheme.configureAuditTable(tblGroupApis);
+        tblGroupApis.setAutoCreateRowSorter(true);
+        tblGroupApis.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        tblGroupApis.setDefaultRenderer(Object.class, new GroupTableModel.GroupApiCellRenderer(api));
+        tblGroupApis.setDefaultRenderer(Integer.class, new GroupTableModel.GroupApiCellRenderer(api));
+        setColumnWidths(tblGroupApis.getColumnModel(), new int[]{38, 230, 68, 240, 54, 150, 44, 68, 220});
+
+        tblGroupApis.getSelectionModel().addListSelectionListener(e -> {
+            if (!e.getValueIsAdjusting()) {
+                ApiCall call = getSelectedGroupApi();
+                if (call != null) {
+                    showApiCallInInspector(call);
+                }
+            }
+        });
+        installGroupApiPopupMenu();
+
+        rightPanel.add(rightHeader, BorderLayout.NORTH);
+        rightPanel.add(new JScrollPane(tblGroupApis), BorderLayout.CENTER);
+
+        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, leftPanel, rightPanel);
+        split.setResizeWeight(0.38);
+        split.setOneTouchExpandable(true);
+        return split;
+    }
+
+    private void installGroupPopupMenu() {
+        JPopupMenu popup = new JPopupMenu();
+        JMenuItem miSendAll = new JMenuItem("Send CẢ NHÓM API sang Repeater");
+        JMenuItem miCopyPath = new JMenuItem("Copy Tên Nhóm (Action Path)");
+        JMenuItem miCopyUrl = new JMenuItem("Copy Page URL");
+
+        miSendAll.addActionListener(e -> {
+            ActionGroup g = getSelectedGroup();
+            if (g != null) {
+                sendGroupToRepeater(g);
+            }
+        });
+        miCopyPath.addActionListener(e -> {
+            ActionGroup g = getSelectedGroup();
+            if (g != null) {
+                copyToClipboard(g.actionPath);
+            }
+        });
+        miCopyUrl.addActionListener(e -> {
+            ActionGroup g = getSelectedGroup();
+            if (g != null) {
+                copyToClipboard(g.pageUrl);
+            }
         });
 
+        popup.add(miSendAll);
+        popup.addSeparator();
+        popup.add(miCopyPath);
+        popup.add(miCopyUrl);
+        attachTablePopup(tblGroups, popup);
+    }
+
+    private void installGroupApiPopupMenu() {
+        JPopupMenu popup = new JPopupMenu();
+        JMenuItem miSend = new JMenuItem("Send to Repeater");
+        JMenuItem miSendGroup = new JMenuItem("Send CẢ NHÓM chứa API này sang Repeater");
+        JMenuItem miShared = new JMenuItem("Xem các nhóm cùng gọi API này");
+        JMenuItem miCopyName = new JMenuItem("Copy Tên API (Tên Nhóm)");
+        JMenuItem miCopyUrl = new JMenuItem("Copy Full URL");
+
+        miSend.addActionListener(e -> {
+            ApiCall c = getSelectedGroupApi();
+            if (c != null) {
+                String tag = c.inExcel ? ("STT " + c.excelStt) : ("G" + c.groupId + "#" + c.index);
+                sendToRepeater(c.capture, tag + " " + c.capture.method);
+            }
+        });
+        miSendGroup.addActionListener(e -> {
+            ApiCall c = getSelectedGroupApi();
+            if (c != null) {
+                ActionGroup g = state.getActionGroups().getGroup(c.groupId);
+                if (g != null) {
+                    sendGroupToRepeater(g);
+                }
+            }
+        });
+        miShared.addActionListener(e -> {
+            ApiCall c = getSelectedGroupApi();
+            if (c != null) {
+                showSharedGroupsDialog(c.endpointKey);
+            }
+        });
+        miCopyName.addActionListener(e -> {
+            ApiCall c = getSelectedGroupApi();
+            if (c != null) {
+                copyToClipboard(c.displayName());
+            }
+        });
+        miCopyUrl.addActionListener(e -> {
+            ApiCall c = getSelectedGroupApi();
+            if (c != null) {
+                copyToClipboard(c.capture.fullUrl);
+            }
+        });
+
+        popup.add(miSend);
+        popup.add(miSendGroup);
+        popup.add(miShared);
+        popup.addSeparator();
+        popup.add(miCopyName);
+        popup.add(miCopyUrl);
+        attachTablePopup(tblGroupApis, popup);
+    }
+
+    // --- Tab 1: Consolidated Audit NOTEs Table ---
+
+    private JPanel buildNotesTab() {
+        JPanel p = new JPanel(new BorderLayout(4, 4));
+        p.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
+
+        JPanel bar = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
+        bar.add(new JLabel("Mức độ NOTE:"));
+        cbNoteSeverity.addActionListener(e -> applyNotesFilter());
+        bar.add(cbNoteSeverity);
+        bar.add(new JLabel("Tìm NOTE / Endpoint / Nhóm:"));
+        attachDocListener(txtNoteSearch, this::applyNotesFilter);
+        bar.add(txtNoteSearch);
+
+        AuditTheme.configureAuditTable(tblNotes);
+        tblNotes.setAutoCreateRowSorter(true);
+        tblNotes.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        tblNotes.setDefaultRenderer(Object.class, new GroupTableModel.AuditNoteCellRenderer(api));
+        setColumnWidths(tblNotes.getColumnModel(), new int[]{82, 130, 260, 74, 68, 220, 320});
+
+        tblNotes.getSelectionModel().addListSelectionListener(e -> {
+            if (!e.getValueIsAdjusting()) {
+                AuditNote note = getSelectedNote();
+                if (note != null) {
+                    ApiCall call = findApiCall(note.groupId, note.callIndex);
+                    if (call != null) {
+                        showApiCallInInspector(call);
+                    }
+                }
+            }
+        });
+
+        JPopupMenu popup = new JPopupMenu();
+        JMenuItem miJump = new JMenuItem("Đi tới Nhóm này (Tab Nhóm & API)");
+        JMenuItem miRepeater = new JMenuItem("Send to Repeater");
+        JMenuItem miCopy = new JMenuItem("Copy Chi tiết NOTE");
+
+        miJump.addActionListener(e -> {
+            AuditNote n = getSelectedNote();
+            if (n != null) {
+                jumpToGroupAndCall(n.groupId, n.callIndex);
+            }
+        });
+        miRepeater.addActionListener(e -> {
+            AuditNote n = getSelectedNote();
+            if (n != null) {
+                ApiCall call = findApiCall(n.groupId, n.callIndex);
+                if (call != null) {
+                    sendToRepeater(call.capture, "NOTE G" + n.groupId + "#" + n.callIndex + " " + call.capture.method);
+                }
+            }
+        });
+        miCopy.addActionListener(e -> {
+            AuditNote n = getSelectedNote();
+            if (n != null) {
+                copyToClipboard("[" + n.severity.label + " - " + n.type.label + "] "
+                    + n.groupPath + " | " + n.method + " " + n.endpoint + " -> " + n.message);
+            }
+        });
+
+        popup.add(miJump);
+        popup.add(miRepeater);
+        popup.add(miCopy);
+        attachTablePopup(tblNotes, popup);
+
+        p.add(bar, BorderLayout.NORTH);
+        p.add(new JScrollPane(tblNotes), BorderLayout.CENTER);
+        return p;
+    }
+
+    // --- Tab 2: Excel Checklist Coverage ---
+
+    private JPanel buildCoverageTab() {
+        JPanel p = new JPanel(new BorderLayout(4, 4));
+        p.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
+
+        JPanel filterBar = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
+        filterBar.add(new JLabel("Lọc trạng thái:"));
+        cbStatusFilter.addActionListener(e -> applyCoverageFilter());
+        filterBar.add(cbStatusFilter);
+        filterBar.add(new JLabel("Tìm kiếm:"));
+        attachDocListener(txtSearch, this::applyCoverageFilter);
+        filterBar.add(txtSearch);
+
+        AuditTheme.configureAuditTable(tblCoverage);
         tblCoverage.setAutoCreateRowSorter(true);
         tblCoverage.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        tblCoverage.setRowHeight(22);
-        tblCoverage.setDefaultRenderer(Object.class, new CoverageTableModel.CoverageCellRenderer());
-
-        // Reasonable column widths
-        int[] widths = {55, 95, 70, 260, 280, 75, 55, 280};
-        for (int i = 0; i < widths.length; i++) {
-            tblCoverage.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
-        }
+        tblCoverage.setDefaultRenderer(Object.class, new CoverageTableModel.CoverageCellRenderer(api));
+        setColumnWidths(tblCoverage.getColumnModel(), new int[]{56, 108, 72, 240, 260, 82, 54, 240});
 
         tblCoverage.getSelectionModel().addListSelectionListener(e -> {
             if (!e.getValueIsAdjusting()) {
-                onCoverageSelectionChanged();
-            }
-        });
-
-        tblCoverage.addMouseListener(new MouseAdapter() {
-            @Override public void mousePressed(MouseEvent e) { maybeShowPopup(e); }
-            @Override public void mouseReleased(MouseEvent e) { maybeShowPopup(e); }
-            private void maybeShowPopup(MouseEvent e) {
-                if (!e.isPopupTrigger()) {
-                    return;
-                }
-                int row = tblCoverage.rowAtPoint(e.getPoint());
-                if (row >= 0) {
-                    tblCoverage.setRowSelectionInterval(row, row);
-                }
                 ApiSpecEntry entry = getSelectedSpecEntry();
                 if (entry != null) {
-                    buildCoveragePopup(entry).show(e.getComponent(), e.getX(), e.getY());
+                    showSpecEntryInInspector(entry);
                 }
             }
         });
 
-        panel.add(filterBar, BorderLayout.NORTH);
-        panel.add(new JScrollPane(tblCoverage), BorderLayout.CENTER);
-        return panel;
-    }
-
-    private JPopupMenu buildCoveragePopup(ApiSpecEntry entry) {
-        JPopupMenu menu = new JPopupMenu();
-        CapturedApiEntry cap = getSelectedOrPrimaryCapture(entry);
-
-        JMenuItem miRepeater = new JMenuItem("Send selected to Repeater");
-        miRepeater.setEnabled(cap != null);
-        miRepeater.addActionListener(e -> sendToRepeater(cap, "STT " + entry.stt + " " + entry.displayMethod));
-        menu.add(miRepeater);
-
-        if (!entry.getAlternateVariants().isEmpty()) {
-            JMenuItem miAllVars = new JMenuItem("Send ALL variants (" + entry.getAllStoredCaptures().size() + ") to Repeater");
-            miAllVars.addActionListener(e -> {
-                int idx = 1;
-                for (CapturedApiEntry v : entry.getAllStoredCaptures()) {
-                    sendToRepeater(v, "STT " + entry.stt + " #" + idx++);
-                }
-            });
-            menu.add(miAllVars);
-        }
-
+        JPopupMenu popup = new JPopupMenu();
+        JMenuItem miRepeater = new JMenuItem("Send to Repeater");
         JMenuItem miCopyAction = new JMenuItem("Copy Action Path");
-        miCopyAction.setEnabled(cap != null);
-        miCopyAction.addActionListener(e -> copyToClipboard(cap != null ? cap.actionPath : ""));
-        menu.add(miCopyAction);
+        JMenuItem miCopyUrl = new JMenuItem("Copy Full URL");
+        miRepeater.addActionListener(e -> {
+            ApiSpecEntry entry = getSelectedSpecEntry();
+            CapturedApiEntry cap = getSelectedOrPrimaryCapture(entry);
+            if (cap != null) {
+                sendToRepeater(cap, "STT " + entry.stt + " " + cap.method);
+            }
+        });
+        miCopyAction.addActionListener(e -> {
+            ApiSpecEntry entry = getSelectedSpecEntry();
+            CapturedApiEntry cap = getSelectedOrPrimaryCapture(entry);
+            if (cap != null) {
+                copyToClipboard(cap.actionPath);
+            }
+        });
+        miCopyUrl.addActionListener(e -> {
+            ApiSpecEntry entry = getSelectedSpecEntry();
+            CapturedApiEntry cap = getSelectedOrPrimaryCapture(entry);
+            if (cap != null) {
+                copyToClipboard(cap.fullUrl);
+            }
+        });
+        popup.add(miRepeater);
+        popup.add(miCopyAction);
+        popup.add(miCopyUrl);
+        attachTablePopup(tblCoverage, popup);
 
-        JMenuItem miCopyUrl = new JMenuItem("Copy Matched URL");
-        miCopyUrl.setEnabled(cap != null);
-        miCopyUrl.addActionListener(e -> copyToClipboard(cap != null ? cap.fullUrl : ""));
-        menu.add(miCopyUrl);
-
-        JMenuItem miCopyPath = new JMenuItem("Copy Excel Path");
-        miCopyPath.addActionListener(e -> copyToClipboard(entry.rawSpecPath));
-        menu.add(miCopyPath);
-
-        return menu;
+        p.add(filterBar, BorderLayout.NORTH);
+        p.add(new JScrollPane(tblCoverage), BorderLayout.CENTER);
+        return p;
     }
+
+    // --- Tab 3: Hierarchy Tree ---
 
     private JPanel buildHierarchyTreeTab() {
-        JPanel panel = new JPanel(new BorderLayout(4, 4));
-        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
-        JButton btnExpand = new JButton("Mở rộng hết");
-        JButton btnCollapse = new JButton("Thu gọn");
-        JButton btnRefresh = new JButton("Làm mới cây");
+        JPanel p = new JPanel(new BorderLayout(4, 4));
+        p.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
+
+        JPanel bar = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
+        JButton btnExpand = new JButton("Mở rộng tất cả");
+        JButton btnCollapse = new JButton("Thu gọn tất cả");
+        JButton btnRefreshTree = new JButton("Làm mới cây");
         btnExpand.addActionListener(e -> expandAllTreeNodes(true));
         btnCollapse.addActionListener(e -> expandAllTreeNodes(false));
-        btnRefresh.addActionListener(e -> {
-            lastTreeCaptureCount = -1;
-            rebuildHierarchyTree();
-        });
-        top.add(btnExpand);
-        top.add(btnCollapse);
-        top.add(btnRefresh);
-        top.add(new JLabel("(Đặt tên chuẩn UI gốc, ví dụ: / > contact > button 'Send')"));
+        btnRefreshTree.addActionListener(e -> rebuildHierarchyTree());
+        bar.add(new JLabel("Cây hành động & nhóm API (root > trang > nút -> API):"));
+        bar.add(btnExpand);
+        bar.add(btnCollapse);
+        bar.add(btnRefreshTree);
 
+        actionTree.setCellRenderer(new AuditTreeRenderer());
         actionTree.addTreeSelectionListener(e -> {
-            Object comp = actionTree.getLastSelectedPathComponent();
-            if (comp instanceof DefaultMutableTreeNode) {
-                Object userObj = ((DefaultMutableTreeNode) comp).getUserObject();
-                if (userObj instanceof TreeCaptureNode) {
-                    showCaptureInInspector(((TreeCaptureNode) userObj).specEntry, ((TreeCaptureNode) userObj).capture);
-                }
+            DefaultMutableTreeNode node = (DefaultMutableTreeNode) actionTree.getLastSelectedPathComponent();
+            if (node != null && node.getUserObject() instanceof TreeCallNode) {
+                TreeCallNode tcn = (TreeCallNode) node.getUserObject();
+                showApiCallInInspector(tcn.call);
             }
         });
 
-        actionTree.addMouseListener(new MouseAdapter() {
-            @Override public void mousePressed(MouseEvent e) { maybePopup(e); }
-            @Override public void mouseReleased(MouseEvent e) { maybePopup(e); }
-            private void maybePopup(MouseEvent e) {
-                if (!e.isPopupTrigger()) {
-                    return;
-                }
-                TreePath path = actionTree.getPathForLocation(e.getX(), e.getY());
-                if (path != null) {
-                    actionTree.setSelectionPath(path);
-                    Object obj = ((DefaultMutableTreeNode) path.getLastPathComponent()).getUserObject();
-                    if (obj instanceof TreeCaptureNode) {
-                        TreeCaptureNode leaf = (TreeCaptureNode) obj;
-                        JPopupMenu m = new JPopupMenu();
-                        JMenuItem miRep = new JMenuItem("Send to Repeater");
-                        miRep.addActionListener(ae -> sendToRepeater(leaf.capture, leaf.capture.stt.isEmpty()
-                            ? leaf.capture.method : ("STT " + leaf.capture.stt)));
-                        JMenuItem miCopy = new JMenuItem("Copy Full Action Path");
-                        miCopy.addActionListener(ae -> copyToClipboard(leaf.capture.actionPath));
-                        m.add(miRep);
-                        m.add(miCopy);
-                        m.show(e.getComponent(), e.getX(), e.getY());
-                    }
+        JPopupMenu treePopup = new JPopupMenu();
+        JMenuItem miTreeRep = new JMenuItem("Send to Repeater");
+        JMenuItem miTreeRepGroup = new JMenuItem("Send CẢ NHÓM chứa API này sang Repeater");
+        miTreeRep.addActionListener(e -> {
+            DefaultMutableTreeNode node = (DefaultMutableTreeNode) actionTree.getLastSelectedPathComponent();
+            if (node != null && node.getUserObject() instanceof TreeCallNode) {
+                TreeCallNode tcn = (TreeCallNode) node.getUserObject();
+                sendToRepeater(tcn.call.capture,
+                    "G" + tcn.call.groupId + "#" + tcn.call.index + " " + tcn.call.capture.method);
+            }
+        });
+        miTreeRepGroup.addActionListener(e -> {
+            DefaultMutableTreeNode node = (DefaultMutableTreeNode) actionTree.getLastSelectedPathComponent();
+            if (node != null && node.getUserObject() instanceof TreeCallNode) {
+                TreeCallNode tcn = (TreeCallNode) node.getUserObject();
+                ActionGroup g = state.getActionGroups().getGroup(tcn.call.groupId);
+                if (g != null) {
+                    sendGroupToRepeater(g);
                 }
             }
         });
+        treePopup.add(miTreeRep);
+        treePopup.add(miTreeRepGroup);
+        actionTree.setComponentPopupMenu(treePopup);
 
-        panel.add(top, BorderLayout.NORTH);
-        panel.add(new JScrollPane(actionTree), BorderLayout.CENTER);
-        return panel;
-    }
-
-    private JPanel buildSkippedAndJsTab() {
-        JPanel left = new JPanel(new BorderLayout(4, 4));
-        left.setBorder(BorderFactory.createTitledBorder("Nút bị Danger Guard né (bảo vệ session & dữ liệu)"));
-        tblSkipped.setRowHeight(21);
-        left.add(new JScrollPane(tblSkipped), BorderLayout.CENTER);
-
-        JPanel right = new JPanel(new BorderLayout(4, 4));
-        right.setBorder(BorderFactory.createTitledBorder("Routes & API gợi ý từ file JS (.js static scan)"));
-        right.add(new JScrollPane(lstJsEndpoints), BorderLayout.CENTER);
-
-        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, left, right);
-        split.setResizeWeight(0.5);
-        JPanel wrapper = new JPanel(new BorderLayout());
-        wrapper.add(split, BorderLayout.CENTER);
-        return wrapper;
-    }
-
-    private JPanel buildExtraCapturesTab() {
-        JPanel p = new JPanel(new BorderLayout(4, 4));
-        JLabel hint = new JLabel(" Chỉ lưu khi tắt 'Strict Excel' trong Cài đặt (hoặc chưa nạp file Excel). Right-click -> Send to Repeater.");
-        hint.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
-        tblExtras.setRowHeight(21);
-        tblExtras.getSelectionModel().addListSelectionListener(e -> {
-            if (!e.getValueIsAdjusting()) {
-                int r = tblExtras.getSelectedRow();
-                if (r >= 0) {
-                    CapturedApiEntry cap = extraModel.getRow(tblExtras.convertRowIndexToModel(r));
-                    if (cap != null) {
-                        showCaptureInInspector(null, cap);
-                    }
-                }
-            }
-        });
-        tblExtras.addMouseListener(new MouseAdapter() {
-            @Override public void mousePressed(MouseEvent e) { popup(e); }
-            @Override public void mouseReleased(MouseEvent e) { popup(e); }
-            private void popup(MouseEvent e) {
-                if (!e.isPopupTrigger()) {
-                    return;
-                }
-                int row = tblExtras.rowAtPoint(e.getPoint());
-                if (row >= 0) {
-                    tblExtras.setRowSelectionInterval(row, row);
-                    CapturedApiEntry cap = extraModel.getRow(tblExtras.convertRowIndexToModel(row));
-                    if (cap != null) {
-                        JPopupMenu m = new JPopupMenu();
-                        JMenuItem mi = new JMenuItem("Send to Repeater");
-                        mi.addActionListener(ae -> sendToRepeater(cap, cap.method));
-                        m.add(mi);
-                        m.show(e.getComponent(), e.getX(), e.getY());
-                    }
-                }
-            }
-        });
-        p.add(hint, BorderLayout.NORTH);
-        p.add(new JScrollPane(tblExtras), BorderLayout.CENTER);
+        p.add(bar, BorderLayout.NORTH);
+        p.add(new JScrollPane(actionTree), BorderLayout.CENTER);
         return p;
     }
 
-    private JPanel buildLogTab() {
-        JPanel p = new JPanel(new BorderLayout(4, 4));
+    // --- Tab 4: Configurable Form Auto-Fill ("TEXT") & Crawl Config ---
+
+    private JPanel buildFormAndConfigTab() {
+        this.formConfigPanel = new FormAndConfigPanel(
+            config,
+            this::appendLog,
+            () -> {
+                syncQuickCheckboxesFromConfig();
+                persistConfigQuietly();
+                lastTreeVersion = -1;
+                refreshAllViewsNow();
+            });
+        return formConfigPanel;
+    }
+
+    // --- Tab 5: Aux (Log, Extra Captures, Danger Guard & JS Hints) ---
+
+    private JPanel buildAuxTab() {
+        JPanel p = new JPanel(new BorderLayout());
+
+        // Sub-tab 0: Activity Log
+        JPanel logPanel = new JPanel(new BorderLayout(4, 4));
         txtLog.setEditable(false);
         txtLog.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        JButton btnClear = new JButton("Xóa Log");
-        btnClear.addActionListener(e -> txtLog.setText(""));
-        top.add(btnClear);
-        p.add(top, BorderLayout.NORTH);
-        p.add(new JScrollPane(txtLog), BorderLayout.CENTER);
+        JPanel logTop = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 2));
+        JButton btnClearLog = new JButton("Xóa Log");
+        btnClearLog.addActionListener(e -> txtLog.setText(""));
+        logTop.add(btnClearLog);
+        logPanel.add(logTop, BorderLayout.NORTH);
+        logPanel.add(new JScrollPane(txtLog), BorderLayout.CENTER);
+
+        // Sub-tab 1: Extras (outside Excel)
+        AuditTheme.configureAuditTable(tblExtras);
+        tblExtras.setAutoCreateRowSorter(true);
+        tblExtras.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        tblExtras.setDefaultRenderer(Object.class, new CoverageTableModel.SimpleAuditCellRenderer(api, 0, 4, 3));
+        tblExtras.getSelectionModel().addListSelectionListener(e -> {
+            if (!e.getValueIsAdjusting()) {
+                int vr = tblExtras.getSelectedRow();
+                if (vr >= 0) {
+                    CapturedApiEntry cap = extraModel.getRow(tblExtras.convertRowIndexToModel(vr));
+                    if (cap != null) {
+                        showStandaloneCaptureInInspector(cap);
+                    }
+                }
+            }
+        });
+        JPopupMenu extraPopup = new JPopupMenu();
+        JMenuItem miExtraRep = new JMenuItem("Send to Repeater");
+        JMenuItem miExtraCopy = new JMenuItem("Copy Full URL");
+        miExtraRep.addActionListener(e -> {
+            int vr = tblExtras.getSelectedRow();
+            if (vr >= 0) {
+                CapturedApiEntry cap = extraModel.getRow(tblExtras.convertRowIndexToModel(vr));
+                if (cap != null) {
+                    sendToRepeater(cap, cap.method);
+                }
+            }
+        });
+        miExtraCopy.addActionListener(e -> {
+            int vr = tblExtras.getSelectedRow();
+            if (vr >= 0) {
+                CapturedApiEntry cap = extraModel.getRow(tblExtras.convertRowIndexToModel(vr));
+                if (cap != null) {
+                    copyToClipboard(cap.fullUrl);
+                }
+            }
+        });
+        extraPopup.add(miExtraRep);
+        extraPopup.add(miExtraCopy);
+        attachTablePopup(tblExtras, extraPopup);
+
+        // Sub-tab 2: Skipped Danger Actions & JS Hints
+        AuditTheme.configureAuditTable(tblSkipped);
+        tblSkipped.setAutoCreateRowSorter(true);
+        tblSkipped.setDefaultRenderer(Object.class, new CoverageTableModel.SimpleAuditCellRenderer(api, -1, -1, 2));
+        JPanel skippedWrap = new JPanel(new BorderLayout(4, 4));
+        skippedWrap.setBorder(BorderFactory.createTitledBorder("Nút Danger Guard đã tự né"));
+        skippedWrap.add(new JScrollPane(tblSkipped), BorderLayout.CENTER);
+
+        JPanel jsWrap = new JPanel(new BorderLayout(4, 4));
+        jsWrap.setBorder(BorderFactory.createTitledBorder("Endpoint phát hiện thụ động từ file .js"));
+        JPopupMenu jsPopup = new JPopupMenu();
+        JMenuItem miCopyJs = new JMenuItem("Copy Endpoint JS");
+        miCopyJs.addActionListener(e -> {
+            String sel = lstJsEndpoints.getSelectedValue();
+            if (sel != null) {
+                copyToClipboard(sel);
+            }
+        });
+        jsPopup.add(miCopyJs);
+        lstJsEndpoints.setComponentPopupMenu(jsPopup);
+        jsWrap.add(new JScrollPane(lstJsEndpoints), BorderLayout.CENTER);
+
+        JSplitPane dangerJsSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, skippedWrap, jsWrap);
+        dangerJsSplit.setResizeWeight(0.5);
+
+        auxTabs.addTab("Log hoạt động", logPanel);
+        auxTabs.addTab("Ngoài Excel (0)", new JScrollPane(tblExtras));
+        auxTabs.addTab("Nút bị né & JS Hints (0/0)", dangerJsSplit);
+        p.add(auxTabs, BorderLayout.CENTER);
         return p;
     }
+
+    // =========================================================================
+    // Bottom Inspector Panel
+    // =========================================================================
 
     private JPanel buildInspectorPanel() {
         JPanel p = new JPanel(new BorderLayout(4, 4));
-        p.setBorder(BorderFactory.createTitledBorder("Chi tiết API & Biến thể Tham số"));
+        p.setBorder(BorderFactory.createTitledBorder("Chi tiết API, NOTE & HTTP Message"));
 
-        JPanel top = new JPanel(new BorderLayout(6, 4));
+        JPanel top = new JPanel(new BorderLayout(8, 2));
         lblSelectedSummary.setFont(lblSelectedSummary.getFont().deriveFont(Font.BOLD));
         top.add(lblSelectedSummary, BorderLayout.CENTER);
 
         JPanel right = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
         right.add(new JLabel("Phiên bản:"));
-        cbVariant.setPreferredSize(new Dimension(280, 24));
+        cbVariant.setPreferredSize(new Dimension(250, 24));
         cbVariant.addActionListener(e -> {
             if (!updatingVariants) {
                 VariantItem item = (VariantItem) cbVariant.getSelectedItem();
                 if (item != null && item.capture != null) {
-                    renderHttpMessages(item.specEntry, item.capture);
+                    renderHttpMessages(item.specEntry, item.call, item.capture);
                 }
             }
         });
+
+        btnShowShared.setEnabled(false);
+        btnShowShared.addActionListener(e -> {
+            if (!currentInspectEndpointKey.isEmpty()) {
+                showSharedGroupsDialog(currentInspectEndpointKey);
+            }
+        });
+
         btnSendRepeater.setEnabled(false);
         btnSendRepeater.addActionListener(e -> {
             VariantItem item = (VariantItem) cbVariant.getSelectedItem();
             if (item != null && item.capture != null) {
-                String title = item.specEntry != null
-                    ? ("STT " + item.specEntry.stt + " " + item.capture.method)
-                    : item.capture.method;
+                String title = item.call != null
+                    ? (item.call.inExcel ? ("STT " + item.call.excelStt + " " + item.capture.method)
+                                         : ("G" + item.call.groupId + "#" + item.call.index + " " + item.capture.method))
+                    : (item.specEntry != null ? ("STT " + item.specEntry.stt + " " + item.capture.method) : item.capture.method);
                 sendToRepeater(item.capture, title);
             }
         });
+
         right.add(cbVariant);
+        right.add(btnShowShared);
         right.add(btnSendRepeater);
         top.add(right, BorderLayout.EAST);
 
         txtNotesBanner.setEditable(false);
         txtNotesBanner.setLineWrap(true);
         txtNotesBanner.setWrapStyleWord(true);
-        txtNotesBanner.setBackground(p.getBackground());
-        txtNotesBanner.setBorder(BorderFactory.createEmptyBorder(2, 4, 2, 4));
+        txtNotesBanner.setOpaque(true);
+        txtNotesBanner.setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6));
 
         JPanel northWrap = new JPanel(new BorderLayout(2, 2));
         northWrap.add(top, BorderLayout.NORTH);
@@ -625,10 +999,15 @@ public final class CrawlerTabPanel extends JPanel {
         return p;
     }
 
+    // =========================================================================
+    // Workflow Handlers (Import, Crawl Lifecycle, Export)
+    // =========================================================================
+
     private void onImportExcel() {
         JFileChooser fc = new JFileChooser(lastDirectory);
         fc.setDialogTitle("Chọn file Excel (.xlsx) hoặc CSV danh sách API");
-        fc.setFileFilter(new FileNameExtensionFilter("Excel / CSV (*.xlsx, *.xlsm, *.csv, *.tsv)", "xlsx", "xlsm", "csv", "tsv"));
+        fc.setFileFilter(new FileNameExtensionFilter(
+            "Excel / CSV (*.xlsx, *.xlsm, *.csv, *.tsv)", "xlsx", "xlsm", "csv", "tsv"));
         if (fc.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) {
             return;
         }
@@ -638,7 +1017,8 @@ public final class CrawlerTabPanel extends JPanel {
         try {
             SimpleXlsxReader.WorkbookData wb = SimpleXlsxReader.readFile(file);
             if (wb.getSheetNames().isEmpty()) {
-                JOptionPane.showMessageDialog(this, "Không tìm thấy Sheet dữ liệu nào trong file.", "File rỗng", JOptionPane.WARNING_MESSAGE);
+                JOptionPane.showMessageDialog(this, "Không tìm thấy Sheet dữ liệu nào trong file.",
+                    "File rỗng", JOptionPane.WARNING_MESSAGE);
                 return;
             }
             ExcelColumnMapperDialog.MappingResult mapping =
@@ -669,14 +1049,17 @@ public final class CrawlerTabPanel extends JPanel {
                 injector.setMatcher(newMatcher);
             }
             coverageModel.setMatcher(newMatcher);
+            boolean dark = AuditTheme.isDark(api, this);
             lblExcelStatus.setText(file.getName() + " (" + newMatcher.getEntries().size() + " APIs)");
+            lblExcelStatus.setForeground(AuditTheme.okForeground(dark));
             appendLog("Đã nạp " + newMatcher.getEntries().size() + " API từ '" + file.getName()
                 + "' [Sheet: " + mapping.sheetName + "].");
-            mainTabs.setSelectedIndex(0);
+            lastExcelMatched = -1;
             refreshAllViewsNow();
         } catch (Exception ex) {
             appendLog("Lỗi đọc Excel: " + ex.getMessage());
-            JOptionPane.showMessageDialog(this, "Lỗi đọc file: " + ex.getMessage(), "Lỗi Import", JOptionPane.ERROR_MESSAGE);
+            JOptionPane.showMessageDialog(this, "Lỗi đọc file: " + ex.getMessage(),
+                "Lỗi Import", JOptionPane.ERROR_MESSAGE);
         }
     }
 
@@ -684,7 +1067,6 @@ public final class CrawlerTabPanel extends JPanel {
         String hostsInput = txtHosts.getText().trim();
         String seedInput = txtSeedUrl.getText().trim();
 
-        // Auto-infer host from Seed URL if user left Host(s) blank
         if (hostsInput.isEmpty() && !seedInput.isEmpty()) {
             try {
                 java.net.URI u = java.net.URI.create(seedInput);
@@ -699,19 +1081,20 @@ public final class CrawlerTabPanel extends JPanel {
         config.setAllowedHostsCsv(hostsInput);
         if (config.getAllowedHostsSet().isEmpty()) {
             JOptionPane.showMessageDialog(this,
-                "Vui lòng nhập Target Host (ví dụ: target.example.com) hoặc Seed URL đầy đủ.",
+                "Vui lòng nhập Target Host (ví dụ: target.example.com hoặc *) hoặc Seed URL đầy đủ.",
                 "Thiếu Target Host", JOptionPane.WARNING_MESSAGE);
             return;
         }
 
         if (config.isStrictExcelOnly() && !matcher.isLoaded()) {
             int choice = JOptionPane.showConfirmDialog(this,
-                "Bạn chưa Import file Excel API. Tiếp tục ở chế độ chỉ bắt ngoài Excel?",
+                "Bạn chưa Import file Excel API. Tiếp tục ở chế độ bắt & nhóm toàn bộ API?",
                 "Chưa có file Excel", JOptionPane.YES_NO_OPTION);
             if (choice != JOptionPane.YES_OPTION) {
                 return;
             }
             config.setStrictExcelOnly(false);
+            syncQuickCheckboxesFromConfig();
         }
 
         if (state.getStatus() == CrawlState.Status.PAUSED) {
@@ -733,25 +1116,25 @@ public final class CrawlerTabPanel extends JPanel {
             injector.setAgentArmed(true);
         }
         state.setStatus(CrawlState.Status.RUNNING);
+        lastStoreVersion = -1L;
+        lastNoteCount = -1;
+        lastTreeVersion = -1;
         refreshButtonsState();
 
         if (!seed.isEmpty() && api != null) {
             SeedDiscoveryHelper.fetchSeedsAsync(api, seed, config, state, this::appendLog);
         }
 
-        if (!matcher.isLoaded()) {
-            mainTabs.setSelectedIndex(3); // Switch to "Ngoài Excel" tab when testing without Excel
-        }
-
+        mainTabs.setSelectedIndex(0);
         appendLog("Crawl RUNNING trên Host(s): " + config.getAllowedHostsCsv()
-            + " | Mở Chrome/Firefox qua Burp Proxy (hoặc bấm Refresh trang đang mở).");
+            + " | Mở Firefox/Chrome qua Burp Proxy (hoặc bấm Refresh trang đang mở).");
         refreshAllViewsNow();
     }
 
     private void onTogglePause() {
         if (state.getStatus() == CrawlState.Status.RUNNING) {
             state.setStatus(CrawlState.Status.PAUSED);
-            appendLog("Đã tạm dừng Crawl (có thể tương tác tay trên Firefox rồi bấm Tiếp tục).");
+            appendLog("Đã tạm dừng Crawl (có thể tương tác tay trên trình duyệt rồi bấm Tiếp tục).");
         } else if (state.getStatus() == CrawlState.Status.PAUSED) {
             state.setStatus(CrawlState.Status.RUNNING);
             appendLog("Đã tiếp tục Crawl.");
@@ -770,109 +1153,24 @@ public final class CrawlerTabPanel extends JPanel {
         state.resetAll("");
         state.setStatus(CrawlState.Status.IDLE);
         matcher.clearRuntimeCaptures();
-        lastTreeCaptureCount = -1;
+        lastStoreVersion = -1L;
+        lastNoteCount = -1;
+        lastExcelMatched = -1;
+        lastTreeVersion = -1;
         extraModel.setRows(new ArrayList<>());
         skippedModel.setRows(new ArrayList<>());
         jsListModel.clear();
         clearInspector();
-        appendLog("Đã Reset kết quả crawl (giữ nguyên danh sách API Excel đã nạp).");
+        appendLog("Đã Reset kết quả crawl (giữ nguyên danh sách API Excel & cấu hình Form).");
         refreshButtonsState();
         refreshAllViewsNow();
     }
 
-    private void onOpenSettings() {
-        Window owner = SwingUtilities.getWindowAncestor(this);
-        JDialog dlg = new JDialog(owner != null ? owner : new Frame(), "Cài đặt Crawl & Bảo vệ", JDialog.ModalityType.APPLICATION_MODAL);
-        dlg.setLayout(new BorderLayout(8, 8));
-
-        JPanel form = new JPanel(new GridBagLayout());
-        form.setBorder(BorderFactory.createEmptyBorder(10, 12, 6, 12));
-        GridBagConstraints gc = new GridBagConstraints();
-        gc.insets = new Insets(4, 4, 4, 4);
-        gc.anchor = GridBagConstraints.WEST;
-        gc.fill = GridBagConstraints.HORIZONTAL;
-
-        JTextField tfPrefix = new JTextField(config.getApiBasePrefix(), 24);
-        JCheckBox cbStrict = new JCheckBox("Strict Excel Mode (chỉ lưu API khớp Excel)", config.isStrictExcelOnly());
-        JCheckBox cbTrailing = new JCheckBox("Bỏ qua dấu '/' cuối path khi so khớp Excel", config.isIgnoreTrailingSlash());
-        JCheckBox cbNormRoute = new JCheckBox("Gộp ID động trong Route URL (/users/123 -> /users/{id})", config.isNormalizeRouteIds());
-        JCheckBox cbAutoFill = new JCheckBox("Tự điền dữ liệu mẫu an toàn vào Form (Auto-fill)", config.isAutoFillForms());
-        JCheckBox cbDanger = new JCheckBox("Bật Danger Guard (né nút Logout, Delete, Payment...)", config.isDangerGuardEnabled());
-        JTextField tfDangerKw = new JTextField(config.getDangerKeywordsCsv(), 32);
-        JCheckBox cbRelaxCsp = new JCheckBox("Tự nới lỏng CSP header khi đang crawl để Firefox chạy Agent", config.isRelaxCspWhileCrawling());
-        JCheckBox cbJsScan = new JCheckBox("Quét thụ động file .js tìm Hidden API & JS Hints", config.isCaptureJsEndpoints());
-
-        JSpinner spWait = new JSpinner(new SpinnerNumberModel(config.getActionWaitMs(), 200, 5000, 50));
-        JSpinner spMaxActions = new JSpinner(new SpinnerNumberModel(config.getMaxActionsPerPage(), 10, 1000, 10));
-        JSpinner spMaxPages = new JSpinner(new SpinnerNumberModel(config.getMaxPages(), 10, 2000, 20));
-        JSpinner spMaxPag = new JSpinner(new SpinnerNumberModel(config.getMaxPaginationSamples(), 1, 20, 1));
-
-        int r = 0;
-        gc.gridx = 0; gc.gridy = r; gc.weightx = 0; form.add(new JLabel("API Base Prefix (nếu Excel thiếu):"), gc);
-        gc.gridx = 1; gc.weightx = 1; form.add(tfPrefix, gc); r++;
-
-        gc.gridx = 0; gc.gridy = r; gc.gridwidth = 2; form.add(cbStrict, gc); r++;
-        gc.gridx = 0; gc.gridy = r; form.add(cbTrailing, gc); r++;
-        gc.gridx = 0; gc.gridy = r; form.add(cbNormRoute, gc); r++;
-        gc.gridx = 0; gc.gridy = r; form.add(cbAutoFill, gc); r++;
-        gc.gridx = 0; gc.gridy = r; form.add(cbDanger, gc); r++;
-
-        gc.gridwidth = 1;
-        gc.gridx = 0; gc.gridy = r; gc.weightx = 0; form.add(new JLabel("Từ khóa Danger Guard:"), gc);
-        gc.gridx = 1; gc.weightx = 1; form.add(tfDangerKw, gc); r++;
-
-        gc.gridx = 0; gc.gridy = r; gc.gridwidth = 2; form.add(cbRelaxCsp, gc); r++;
-        gc.gridx = 0; gc.gridy = r; form.add(cbJsScan, gc); r++;
-
-        gc.gridwidth = 1;
-        gc.gridx = 0; gc.gridy = r; form.add(new JLabel("Thời gian chờ sau mỗi click (ms):"), gc);
-        gc.gridx = 1; form.add(spWait, gc); r++;
-
-        gc.gridx = 0; gc.gridy = r; form.add(new JLabel("Số nút tối đa mỗi trang:"), gc);
-        gc.gridx = 1; form.add(spMaxActions, gc); r++;
-
-        gc.gridx = 0; gc.gridy = r; form.add(new JLabel("Số trang tối đa toàn phiên:"), gc);
-        gc.gridx = 1; form.add(spMaxPages, gc); r++;
-
-        gc.gridx = 0; gc.gridy = r; form.add(new JLabel("Số mẫu tối đa mỗi pattern ?page= / ID:"), gc);
-        gc.gridx = 1; form.add(spMaxPag, gc); r++;
-
-        JPanel btns = new JPanel(new FlowLayout(FlowLayout.RIGHT));
-        JButton btnCancel = new JButton("Hủy");
-        JButton btnSave = new JButton("Lưu cài đặt");
-        btnCancel.addActionListener(e -> dlg.dispose());
-        btnSave.addActionListener(e -> {
-            config.setApiBasePrefix(tfPrefix.getText());
-            config.setStrictExcelOnly(cbStrict.isSelected());
-            config.setIgnoreTrailingSlash(cbTrailing.isSelected());
-            config.setNormalizeRouteIds(cbNormRoute.isSelected());
-            config.setAutoFillForms(cbAutoFill.isSelected());
-            config.setDangerGuardEnabled(cbDanger.isSelected());
-            config.setDangerKeywordsCsv(tfDangerKw.getText());
-            config.setRelaxCspWhileCrawling(cbRelaxCsp.isSelected());
-            config.setCaptureJsEndpoints(cbJsScan.isSelected());
-            config.setActionWaitMs(((Number) spWait.getValue()).intValue());
-            config.setMaxActionsPerPage(((Number) spMaxActions.getValue()).intValue());
-            config.setMaxPages(((Number) spMaxPages.getValue()).intValue());
-            config.setMaxPaginationSamples(((Number) spMaxPag.getValue()).intValue());
-            appendLog("Đã cập nhật cài đặt.");
-            dlg.dispose();
-        });
-        btns.add(btnCancel);
-        btns.add(btnSave);
-
-        dlg.add(new JScrollPane(form), BorderLayout.CENTER);
-        dlg.add(btns, BorderLayout.SOUTH);
-        dlg.pack();
-        dlg.setLocationRelativeTo(this);
-        dlg.setVisible(true);
-    }
-
     private void showExportMenu(JButton anchor) {
         JPopupMenu menu = new JPopupMenu();
-        JMenuItem miCsv = new JMenuItem("Xuất CSV (Excel UTF-8)...");
-        JMenuItem miJson = new JMenuItem("Xuất JSON...");
-        JMenuItem miMd = new JMenuItem("Xuất Markdown (Cây UI + Ghi chú)...");
+        JMenuItem miCsv = new JMenuItem("Xuất CSV (Nhóm + NOTE + Excel UTF-8)...");
+        JMenuItem miJson = new JMenuItem("Xuất JSON (Nhóm + NOTE + Excel)...");
+        JMenuItem miMd = new JMenuItem("Xuất Markdown (Cây Nhóm + Bảng NOTE)...");
 
         miCsv.addActionListener(e -> exportReport("csv"));
         miJson.addActionListener(e -> exportReport("json"));
@@ -894,12 +1192,13 @@ public final class CrawlerTabPanel extends JPanel {
         lastDirectory = out.getParentFile();
         try {
             List<CapturedApiEntry> extras = state.getExtraCaptures();
+            ActionGroupStore store = state.getActionGroups();
             if ("csv".equals(fmt)) {
-                ReportExporter.exportCsv(out, matcher, extras);
+                ReportExporter.exportCsv(out, matcher, extras, store);
             } else if ("json".equals(fmt)) {
-                ReportExporter.exportJson(out, matcher, extras);
+                ReportExporter.exportJson(out, matcher, extras, store);
             } else {
-                ReportExporter.exportMarkdown(out, matcher, extras);
+                ReportExporter.exportMarkdown(out, matcher, extras, store);
             }
             appendLog("Đã xuất báo cáo: " + out.getAbsolutePath());
             int open = JOptionPane.showConfirmDialog(this,
@@ -909,9 +1208,14 @@ public final class CrawlerTabPanel extends JPanel {
                 Desktop.getDesktop().open(out);
             }
         } catch (Exception ex) {
-            JOptionPane.showMessageDialog(this, "Lỗi xuất báo cáo: " + ex.getMessage(), "Lỗi Export", JOptionPane.ERROR_MESSAGE);
+            JOptionPane.showMessageDialog(this, "Lỗi xuất báo cáo: " + ex.getMessage(),
+                "Lỗi Export", JOptionPane.ERROR_MESSAGE);
         }
     }
+
+    // =========================================================================
+    // Refresh, Filter & Selection Synchronization
+    // =========================================================================
 
     private void refreshButtonsState() {
         CrawlState.Status st = state.getStatus();
@@ -922,99 +1226,214 @@ public final class CrawlerTabPanel extends JPanel {
         btnStop.setEnabled(st == CrawlState.Status.RUNNING || st == CrawlState.Status.PAUSED);
     }
 
-    private void applyCoverageFilter() {
-        int idx = cbStatusFilter.getSelectedIndex();
-        String mode = "ALL";
-        if (idx == 1) mode = "MATCHED";
-        else if (idx == 2) mode = "MISSING";
-        else if (idx == 3) mode = "NOTES";
-        coverageModel.setFilter(mode, txtSearch.getText());
-    }
-
     private void refreshAllViewsNow() {
         refreshButtonsState();
+        refreshFormSummaryLabel();
+        boolean dark = AuditTheme.isDark(api, this);
+        Color baseBg = getBackground();
 
+        ActionGroupStore store = state.getActionGroups();
         ExcelSpecMatcher.CoverageStats stats = matcher.getCoverageStats();
         int pct = stats.total > 0 ? (int) Math.round(stats.matched * 100.0 / stats.total) : 0;
         progressBar.setValue(pct);
-        progressBar.setString(pct + "%");
+        progressBar.setString(stats.total > 0 ? (pct + "%") : (store.totalCalls() + " API"));
 
-        List<CapturedApiEntry> extras = state.getExtraCaptures();
-        List<CrawlState.SkippedAction> skipped = state.getSkippedDangerActions();
-        List<String> jsItems = state.getDiscoveredJsEndpoints();
+        int errNotes = store.noteCount(AuditNote.Severity.ERROR);
+        int warnNotes = store.noteCount(AuditNote.Severity.WARN);
+        int infoNotes = store.noteCount(AuditNote.Severity.INFO);
+        int totalNotes = errNotes + warnNotes + infoNotes;
 
-        lblStats.setText(String.format(
-            "Matched: %d/%d | Missing: %d | Diff: %d | Ngoài Excel: %d | Pages: %d | Queue: %d",
-            stats.matched, stats.total, stats.missing, stats.withNotes,
-            extras.size(), state.getVisitedPagesCount(), state.getPendingQueueSize()));
+        // Calm semantic stat chips
+        chipGroups.setText("Nhóm: " + store.groupCount());
+        AuditTheme.styleStatChip(chipGroups, AuditTheme.accentForeground(dark), baseBg);
 
-        mainTabs.setTitleAt(0, String.format("Tiến độ Excel (%d/%d)", stats.matched, stats.total));
-        mainTabs.setTitleAt(2, String.format("Nút bị né & JS (%d/%d)", skipped.size(), jsItems.size()));
-        mainTabs.setTitleAt(3, String.format("Ngoài Excel (%d)", extras.size()));
+        chipApis.setText("API: " + store.totalCalls());
+        AuditTheme.styleStatChip(chipApis,
+            store.totalCalls() > 0 ? AuditTheme.okForeground(dark) : AuditTheme.mutedForeground(dark), baseBg);
+
+        chipNotes.setText(String.format("NOTE: %d (%dL/%dCB)", totalNotes, errNotes, warnNotes));
+        if (errNotes > 0) {
+            AuditTheme.styleStatChip(chipNotes, AuditTheme.severityForeground(AuditNote.Severity.ERROR, dark),
+                AuditTheme.severityRowTint(AuditNote.Severity.ERROR, baseBg, dark));
+        } else if (warnNotes > 0) {
+            AuditTheme.styleStatChip(chipNotes, AuditTheme.severityForeground(AuditNote.Severity.WARN, dark),
+                AuditTheme.severityRowTint(AuditNote.Severity.WARN, baseBg, dark));
+        } else {
+            AuditTheme.styleStatChip(chipNotes, AuditTheme.mutedForeground(dark), baseBg);
+        }
+
+        chipExcel.setText(String.format("Excel: %d/%d", stats.matched, stats.total));
+        AuditTheme.styleStatChip(chipExcel,
+            (stats.total > 0 && stats.matched == stats.total) ? AuditTheme.okForeground(dark) : getForeground(),
+            baseBg);
+
+        chipPages.setText(String.format("Trang: %d | Q: %d",
+            state.getVisitedPagesCount(), state.getPendingQueueSize()));
+        AuditTheme.styleStatChip(chipPages, AuditTheme.mutedForeground(dark), baseBg);
 
         CrawlState.Status st = state.getStatus();
         lblCurrentAction.setText("[" + st.name() + "] " + state.getCurrentActionPath()
             + (state.getCurrentPageUrl().isEmpty() ? "" : ("  (" + state.getCurrentPageUrl() + ")")));
 
-        // Preserve selected STT row while refreshing coverage model
-        ApiSpecEntry prevSelected = getSelectedSpecEntry();
-        coverageModel.refreshData();
-        if (prevSelected != null) {
-            reselectSpecEntry(prevSelected);
+        List<CapturedApiEntry> extras = state.getExtraCaptures();
+        List<CrawlState.SkippedAction> skipped = state.getSkippedDangerActions();
+        List<String> jsItems = state.getDiscoveredJsEndpoints();
+
+        mainTabs.setTitleAt(1, String.format("Bảng NOTE (%d)", totalNotes));
+        mainTabs.setTitleAt(2, String.format("Tiến độ Excel (%d/%d)", stats.matched, stats.total));
+        mainTabs.setTitleAt(3, String.format("Cây Phân cấp (%d)", store.totalCalls()));
+        auxTabs.setTitleAt(1, String.format("Ngoài Excel (%d)", extras.size()));
+        auxTabs.setTitleAt(2, String.format("Nút bị né & JS (%d/%d)", skipped.size(), jsItems.size()));
+
+        long curVer = store.version();
+        boolean storeChanged = curVer != lastStoreVersion || totalNotes != lastNoteCount;
+        if (storeChanged) {
+            lastStoreVersion = curVer;
+            lastNoteCount = totalNotes;
+
+            ActionGroup prevGroup = getSelectedGroup();
+            ApiCall prevCall = getSelectedGroupApi();
+            AuditNote prevNote = getSelectedNote();
+
+            groupsModel.refresh();
+            if (prevGroup != null) {
+                reselectGroup(prevGroup.id);
+            }
+            applyGroupApisFilter();
+            if (prevCall != null) {
+                reselectGroupApi(prevCall);
+            }
+            notesModel.refresh();
+            if (prevNote != null) {
+                reselectNote(prevNote);
+            }
+            rebuildHierarchyTreeIfChanged(curVer);
         }
 
-        skippedModel.setRows(skipped);
-        extraModel.setRows(extras);
+        if (stats.matched != lastExcelMatched || storeChanged) {
+            lastExcelMatched = stats.matched;
+            ApiSpecEntry prevSpec = getSelectedSpecEntry();
+            coverageModel.refreshData();
+            if (prevSpec != null) {
+                reselectSpecEntry(prevSpec);
+            }
+        }
 
+        if (extraModel.getRowCount() != extras.size()) {
+            extraModel.setRows(extras);
+        }
+        if (skippedModel.getRowCount() != skipped.size()) {
+            skippedModel.setRows(skipped);
+        }
         if (jsListModel.size() != jsItems.size()) {
             jsListModel.clear();
             for (String s : jsItems) {
                 jsListModel.addElement(s);
             }
         }
+    }
 
-        rebuildHierarchyTreeIfChanged(extras);
+    private void applyGroupFilter() {
+        ActionGroup prev = getSelectedGroup();
+        int idx = cbGroupFilter.getSelectedIndex();
+        String mode = "WITH_APIS";
+        if (idx == 1) {
+            mode = "ALL";
+        } else if (idx == 2) {
+            mode = "WITH_NOTES";
+        }
+        groupsModel.setFilter(mode, txtGroupSearch.getText());
+        if (prev != null) {
+            reselectGroup(prev.id);
+        }
+        applyGroupApisFilter();
+    }
+
+    private void applyGroupApisFilter() {
+        ActionGroup g = getSelectedGroup();
+        boolean showAllWhenNull = chkAllApisWhenUnselected.isSelected();
+        if (g != null) {
+            lblGroupHeader.setText("Nhóm: " + g.actionPath + "  (" + g.callCount() + " API, "
+                + g.noteCount() + " NOTE, " + g.getTriggerCount() + " lượt)");
+        } else if (showAllWhenNull) {
+            lblGroupHeader.setText("Toàn bộ API đã nhóm (" + state.getActionGroups().totalCalls() + " API)");
+        } else {
+            lblGroupHeader.setText("Chọn một nhóm ở bảng bên trái để xem các API bên trong");
+        }
+        groupApisModel.setGroupAndFilter(g, showAllWhenNull, chkOnlyApiNotes.isSelected(), txtApiSearch.getText());
+    }
+
+    private void applyNotesFilter() {
+        int idx = cbNoteSeverity.getSelectedIndex();
+        String sev = "ALL";
+        if (idx == 1) {
+            sev = "ERROR";
+        } else if (idx == 2) {
+            sev = "WARN";
+        } else if (idx == 3) {
+            sev = "INFO";
+        }
+        notesModel.setFilter(sev, txtNoteSearch.getText());
+    }
+
+    private void applyCoverageFilter() {
+        int idx = cbStatusFilter.getSelectedIndex();
+        String mode = "ALL";
+        if (idx == 1) {
+            mode = "MATCHED";
+        } else if (idx == 2) {
+            mode = "MISSING";
+        } else if (idx == 3) {
+            mode = "NOTES";
+        }
+        coverageModel.setFilter(mode, txtSearch.getText());
     }
 
     private void rebuildHierarchyTree() {
-        lastTreeCaptureCount = -1;
-        rebuildHierarchyTreeIfChanged(state.getExtraCaptures());
+        lastTreeVersion = -1;
+        rebuildHierarchyTreeIfChanged(state.getActionGroups().version());
     }
 
-    private void rebuildHierarchyTreeIfChanged(List<CapturedApiEntry> extras) {
-        int totalCaptures = extras.size();
-        for (ApiSpecEntry entry : matcher.getEntries()) {
-            totalCaptures += entry.getAllStoredCaptures().size();
-        }
-        mainTabs.setTitleAt(1, String.format("Cây Phân cấp (%d)", totalCaptures));
-        if (totalCaptures == lastTreeCaptureCount) {
+    private void rebuildHierarchyTreeIfChanged(long curVer) {
+        if ((int) curVer == lastTreeVersion && treeRoot.getUserObject().equals(config.getRouteRootLabel())) {
             return;
         }
-        lastTreeCaptureCount = totalCaptures;
+        lastTreeVersion = (int) curVer;
 
+        Set<String> expandedKeys = getExpandedDescendantKeys();
+        String rootLabel = config.getRouteRootLabel();
+        treeRoot.setUserObject(rootLabel);
         treeRoot.removeAllChildren();
-        Map<String, DefaultMutableTreeNode> folderNodes = new LinkedHashMap<>();
 
-        for (ApiSpecEntry entry : matcher.getEntries()) {
-            for (CapturedApiEntry cap : entry.getAllStoredCaptures()) {
-                addCaptureToTree(folderNodes, entry, cap);
+        Map<String, DefaultMutableTreeNode> folderNodes = new LinkedHashMap<>();
+        for (ActionGroup g : state.getActionGroups().snapshotGroups()) {
+            if (g.callCount() == 0) {
+                continue;
+            }
+            DefaultMutableTreeNode groupParent = resolveTreeFolder(folderNodes, g.actionPath, rootLabel);
+            for (ApiCall call : g.getCalls()) {
+                groupParent.add(new DefaultMutableTreeNode(new TreeCallNode(call)));
             }
         }
-        for (CapturedApiEntry ex : extras) {
-            addCaptureToTree(folderNodes, null, ex);
-        }
         treeModel.reload();
+        restoreExpandedKeys(expandedKeys);
     }
 
-    private void addCaptureToTree(
+    private DefaultMutableTreeNode resolveTreeFolder(
         Map<String, DefaultMutableTreeNode> folderNodes,
-        ApiSpecEntry specEntry,
-        CapturedApiEntry cap
+        String actionPath,
+        String rootLabel
     ) {
-        String[] parts = cap.actionPath.split("\\s*>\\s*");
+        String[] parts = actionPath.split("\\s*>\\s*");
         DefaultMutableTreeNode parent = treeRoot;
-        StringBuilder keyBuilder = new StringBuilder("/");
-        int start = (parts.length > 0 && parts[0].trim().equals("/")) ? 1 : 0;
+        StringBuilder keyBuilder = new StringBuilder(rootLabel);
+        int start = 0;
+        if (parts.length > 0) {
+            String first = parts[0].trim();
+            if (first.equals("/") || first.equalsIgnoreCase(rootLabel)) {
+                start = 1;
+            }
+        }
         for (int i = start; i < parts.length; i++) {
             String seg = parts[i].trim();
             if (seg.isEmpty()) {
@@ -1030,7 +1449,46 @@ public final class CrawlerTabPanel extends JPanel {
             }
             parent = node;
         }
-        parent.add(new DefaultMutableTreeNode(new TreeCaptureNode(specEntry, cap)));
+        return parent;
+    }
+
+    private Set<String> getExpandedDescendantKeys() {
+        Set<String> keys = new HashSet<>();
+        TreePath rootPath = new TreePath(treeRoot);
+        Enumeration<TreePath> en = actionTree.getExpandedDescendants(rootPath);
+        if (en != null) {
+            while (en.hasMoreElements()) {
+                keys.add(treePathKey(en.nextElement()));
+            }
+        }
+        return keys;
+    }
+
+    private void restoreExpandedKeys(Set<String> expandedKeys) {
+        if (expandedKeys.isEmpty()) {
+            return;
+        }
+        Enumeration<TreeNode> en = treeRoot.depthFirstEnumeration();
+        while (en.hasMoreElements()) {
+            TreeNode tn = en.nextElement();
+            if (tn instanceof DefaultMutableTreeNode && !((DefaultMutableTreeNode) tn).isLeaf()) {
+                TreePath path = new TreePath(((DefaultMutableTreeNode) tn).getPath());
+                if (expandedKeys.contains(treePathKey(path))) {
+                    actionTree.expandPath(path);
+                }
+            }
+        }
+    }
+
+    private static String treePathKey(TreePath tp) {
+        StringBuilder sb = new StringBuilder();
+        for (Object obj : tp.getPath()) {
+            if (sb.length() > 0) {
+                sb.append(" > ");
+            }
+            sb.append(obj);
+        }
+        return sb.toString();
     }
 
     private void expandAllTreeNodes(boolean expand) {
@@ -1043,26 +1501,143 @@ public final class CrawlerTabPanel extends JPanel {
         }
     }
 
-    private ApiSpecEntry getSelectedSpecEntry() {
-        int viewRow = tblCoverage.getSelectedRow();
-        if (viewRow < 0) {
+    // =========================================================================
+    // Selection Lookups & Jump Navigation
+    // =========================================================================
+
+    private ActionGroup getSelectedGroup() {
+        int vr = tblGroups.getSelectedRow();
+        if (vr < 0) {
             return null;
         }
-        int modelRow = tblCoverage.convertRowIndexToModel(viewRow);
-        return coverageModel.getEntryAt(modelRow);
+        return groupsModel.getGroupAt(tblGroups.convertRowIndexToModel(vr));
     }
 
-    private void reselectSpecEntry(ApiSpecEntry target) {
-        for (int r = 0; r < coverageModel.getRowCount(); r++) {
-            if (coverageModel.getEntryAt(r) == target) {
-                int viewRow = tblCoverage.convertRowIndexToView(r);
-                if (viewRow >= 0) {
-                    tblCoverage.setRowSelectionInterval(viewRow, viewRow);
+    private void reselectGroup(int groupId) {
+        for (int r = 0; r < groupsModel.getRowCount(); r++) {
+            ActionGroup g = groupsModel.getGroupAt(r);
+            if (g != null && g.id == groupId) {
+                int vr = tblGroups.convertRowIndexToView(r);
+                if (vr >= 0) {
+                    tblGroups.setRowSelectionInterval(vr, vr);
                 }
                 break;
             }
         }
     }
+
+    private ApiCall getSelectedGroupApi() {
+        int vr = tblGroupApis.getSelectedRow();
+        if (vr < 0) {
+            return null;
+        }
+        return groupApisModel.getCallAt(tblGroupApis.convertRowIndexToModel(vr));
+    }
+
+    private void reselectGroupApi(ApiCall target) {
+        for (int r = 0; r < groupApisModel.getRowCount(); r++) {
+            if (groupApisModel.getCallAt(r) == target) {
+                int vr = tblGroupApis.convertRowIndexToView(r);
+                if (vr >= 0) {
+                    tblGroupApis.setRowSelectionInterval(vr, vr);
+                }
+                break;
+            }
+        }
+    }
+
+    private AuditNote getSelectedNote() {
+        int vr = tblNotes.getSelectedRow();
+        if (vr < 0) {
+            return null;
+        }
+        return notesModel.getNoteAt(tblNotes.convertRowIndexToModel(vr));
+    }
+
+    private void reselectNote(AuditNote target) {
+        for (int r = 0; r < notesModel.getRowCount(); r++) {
+            if (notesModel.getNoteAt(r) == target) {
+                int vr = tblNotes.convertRowIndexToView(r);
+                if (vr >= 0) {
+                    tblNotes.setRowSelectionInterval(vr, vr);
+                }
+                break;
+            }
+        }
+    }
+
+    private ApiSpecEntry getSelectedSpecEntry() {
+        int vr = tblCoverage.getSelectedRow();
+        if (vr < 0) {
+            return null;
+        }
+        return coverageModel.getEntryAt(tblCoverage.convertRowIndexToModel(vr));
+    }
+
+    private void reselectSpecEntry(ApiSpecEntry target) {
+        for (int r = 0; r < coverageModel.getRowCount(); r++) {
+            if (coverageModel.getEntryAt(r) == target) {
+                int vr = tblCoverage.convertRowIndexToView(r);
+                if (vr >= 0) {
+                    tblCoverage.setRowSelectionInterval(vr, vr);
+                }
+                break;
+            }
+        }
+    }
+
+    private ApiCall findApiCall(int groupId, int callIndex) {
+        ActionGroup g = state.getActionGroups().getGroup(groupId);
+        if (g == null) {
+            return null;
+        }
+        for (ApiCall c : g.getCalls()) {
+            if (c.index == callIndex) {
+                return c;
+            }
+        }
+        return null;
+    }
+
+    private void jumpToGroupAndCall(int groupId, int callIndex) {
+        cbGroupFilter.setSelectedIndex(0);
+        txtGroupSearch.setText("");
+        txtApiSearch.setText("");
+        chkOnlyApiNotes.setSelected(false);
+        groupsModel.refresh();
+        mainTabs.setSelectedIndex(0);
+        reselectGroup(groupId);
+        applyGroupApisFilter();
+        ApiCall target = findApiCall(groupId, callIndex);
+        if (target != null) {
+            reselectGroupApi(target);
+            showApiCallInInspector(target);
+        }
+    }
+
+    private void showSharedGroupsDialog(String endpointKey) {
+        List<String> paths = state.getActionGroups().sharedGroupPaths(endpointKey);
+        if (paths.isEmpty()) {
+            JOptionPane.showMessageDialog(this,
+                "Không có thông tin nhóm dùng chung cho endpoint: " + endpointKey,
+                "Nhóm dùng chung", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("Endpoint: ").append(endpointKey).append("\n");
+        sb.append("Được kích hoạt từ ").append(paths.size()).append(" nhóm chức năng:\n\n");
+        for (int i = 0; i < paths.size(); i++) {
+            sb.append(i + 1).append(". ").append(paths.get(i)).append('\n');
+        }
+        JTextArea ta = new JTextArea(sb.toString(), Math.min(18, paths.size() + 5), 64);
+        ta.setEditable(false);
+        JOptionPane.showMessageDialog(this, new JScrollPane(ta),
+            "Các nhóm cùng gọi API này", JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    // =========================================================================
+    // Inspector Rendering
+    // =========================================================================
 
     private CapturedApiEntry getSelectedOrPrimaryCapture(ApiSpecEntry entry) {
         if (entry == null) {
@@ -1075,12 +1650,31 @@ public final class CrawlerTabPanel extends JPanel {
         return entry.getPrimaryCapture();
     }
 
-    private void onCoverageSelectionChanged() {
-        ApiSpecEntry entry = getSelectedSpecEntry();
-        if (entry == null) {
+    private void showApiCallInInspector(ApiCall call) {
+        if (call == null) {
+            clearInspector();
             return;
         }
-        showSpecEntryInInspector(entry);
+        updatingVariants = true;
+        cbVariant.removeAllItems();
+        cbVariant.addItem(new VariantItem(null, call, call.capture,
+            "[Nhóm #" + call.groupId + " API #" + call.index + "] " + call.displayName()));
+        cbVariant.setSelectedIndex(0);
+        updatingVariants = false;
+        renderHttpMessages(null, call, call.capture);
+    }
+
+    private void showStandaloneCaptureInInspector(CapturedApiEntry cap) {
+        if (cap == null) {
+            clearInspector();
+            return;
+        }
+        updatingVariants = true;
+        cbVariant.removeAllItems();
+        cbVariant.addItem(new VariantItem(null, null, cap, cap.actionPath));
+        cbVariant.setSelectedIndex(0);
+        updatingVariants = false;
+        renderHttpMessages(null, null, cap);
     }
 
     private void showSpecEntryInInspector(ApiSpecEntry entry) {
@@ -1088,46 +1682,67 @@ public final class CrawlerTabPanel extends JPanel {
         cbVariant.removeAllItems();
         CapturedApiEntry primary = entry.getPrimaryCapture();
         if (primary != null) {
-            cbVariant.addItem(new VariantItem(entry, primary,
+            cbVariant.addItem(new VariantItem(entry, null, primary,
                 "Bản chính (" + primary.paramCount() + " params) - " + primary.actionPath));
             int i = 1;
             for (CapturedApiEntry alt : entry.getAlternateVariants()) {
-                cbVariant.addItem(new VariantItem(entry, alt,
+                cbVariant.addItem(new VariantItem(entry, null, alt,
                     "Biến thể #" + (i++) + " (" + alt.paramCount() + " params) - " + alt.actionPath));
             }
             cbVariant.setSelectedIndex(0);
             updatingVariants = false;
-            renderHttpMessages(entry, primary);
+            renderHttpMessages(entry, null, primary);
         } else {
             updatingVariants = false;
             clearInspectorForMissing(entry);
         }
     }
 
-    private void showCaptureInInspector(ApiSpecEntry entry, CapturedApiEntry cap) {
-        updatingVariants = true;
-        cbVariant.removeAllItems();
-        cbVariant.addItem(new VariantItem(entry, cap, cap.actionPath));
-        cbVariant.setSelectedIndex(0);
-        updatingVariants = false;
-        renderHttpMessages(entry, cap);
-    }
-
-    private void renderHttpMessages(ApiSpecEntry entry, CapturedApiEntry cap) {
+    private void renderHttpMessages(ApiSpecEntry specEntry, ApiCall call, CapturedApiEntry cap) {
         if (cap == null) {
             clearInspector();
             return;
         }
-        String prefix = entry != null ? ("[STT " + entry.stt + "] ") : "[Ngoài Excel] ";
-        lblSelectedSummary.setText(prefix + cap.actionPath + "  ->  " + cap.method + " " + cap.fullUrl
+        boolean dark = AuditTheme.isDark(api, this);
+        Color baseBg = getBackground();
+
+        String tag;
+        if (call != null) {
+            tag = call.inExcel
+                ? ("[STT " + call.excelStt + " | G" + call.groupId + "#" + call.index + "] ")
+                : ("[G" + call.groupId + "#" + call.index + "] ");
+            currentInspectEndpointKey = call.endpointKey;
+            int shared = state.getActionGroups().sharedGroupCount(call.endpointKey);
+            btnShowShared.setEnabled(shared > 1);
+            btnShowShared.setText("Nhóm dùng chung (" + shared + ")");
+        } else if (specEntry != null) {
+            tag = "[STT " + specEntry.stt + "] ";
+            currentInspectEndpointKey = "";
+            btnShowShared.setEnabled(false);
+            btnShowShared.setText("Nhóm dùng chung");
+        } else {
+            tag = "[Ngoài Excel] ";
+            currentInspectEndpointKey = "";
+            btnShowShared.setEnabled(false);
+            btnShowShared.setText("Nhóm dùng chung");
+        }
+
+        lblSelectedSummary.setText(tag + cap.actionPath + "  ->  " + cap.method + " " + cap.fullUrl
             + "  (HTTP " + cap.statusCode + ", " + cap.paramCount() + " params: " + cap.paramSignature() + ")");
 
-        if (entry != null && !entry.getNotesSummary().isEmpty()) {
-            txtNotesBanner.setText("Ghi chú tham số: " + entry.getNotesSummary());
-            txtNotesBanner.setForeground(new Color(180, 110, 15));
+        if (call != null && call.hasNotes()) {
+            AuditNote.Severity worst = call.worstSeverity();
+            txtNotesBanner.setText("NOTE (" + call.getNotes().size() + "): " + call.notesSummary());
+            txtNotesBanner.setForeground(AuditTheme.severityForeground(worst, dark));
+            txtNotesBanner.setBackground(AuditTheme.severityRowTint(worst, baseBg, dark));
+        } else if (specEntry != null && !specEntry.getNotesSummary().isEmpty()) {
+            txtNotesBanner.setText("NOTE tham số: " + specEntry.getNotesSummary());
+            txtNotesBanner.setForeground(AuditTheme.severityForeground(AuditNote.Severity.WARN, dark));
+            txtNotesBanner.setBackground(AuditTheme.severityRowTint(AuditNote.Severity.WARN, baseBg, dark));
         } else {
-            txtNotesBanner.setText("Params: " + cap.paramSignature());
-            txtNotesBanner.setForeground(lblSelectedSummary.getForeground());
+            txtNotesBanner.setText("Params: " + (cap.paramCount() == 0 ? "(không có tham số)" : cap.paramSignature()));
+            txtNotesBanner.setForeground(AuditTheme.mutedForeground(dark));
+            txtNotesBanner.setBackground(baseBg);
         }
 
         btnSendRepeater.setEnabled(api != null);
@@ -1147,15 +1762,23 @@ public final class CrawlerTabPanel extends JPanel {
     }
 
     private void clearInspectorForMissing(ApiSpecEntry entry) {
+        boolean dark = AuditTheme.isDark(api, this);
+        Color baseBg = getBackground();
+        currentInspectEndpointKey = "";
+        btnShowShared.setEnabled(false);
+        btnShowShared.setText("Nhóm dùng chung");
+
         lblSelectedSummary.setText("[STT " + entry.stt + " - MISSING] " + entry.displayMethod + " " + entry.rawSpecPath);
         List<String> hints = entry.getJsHints();
         if (!hints.isEmpty()) {
             txtNotesBanner.setText("Chưa kích hoạt qua UI. Gợi ý xuất hiện trong file JS: " + String.join(", ", hints));
-            txtNotesBanner.setForeground(new Color(40, 110, 175));
+            txtNotesBanner.setForeground(AuditTheme.severityForeground(AuditNote.Severity.INFO, dark));
+            txtNotesBanner.setBackground(AuditTheme.severityRowTint(AuditNote.Severity.INFO, baseBg, dark));
         } else {
             txtNotesBanner.setText("Chưa có request nào khớp API này."
                 + (entry.extraInfo.isEmpty() ? "" : (" Thông tin thêm từ Excel: " + entry.extraInfo)));
-            txtNotesBanner.setForeground(lblSelectedSummary.getForeground());
+            txtNotesBanner.setForeground(AuditTheme.mutedForeground(dark));
+            txtNotesBanner.setBackground(baseBg);
         }
         btnSendRepeater.setEnabled(false);
         if (requestEditor != null && responseEditor != null) {
@@ -1165,17 +1788,25 @@ public final class CrawlerTabPanel extends JPanel {
     }
 
     private void clearInspector() {
-        lblSelectedSummary.setText("Chọn một dòng API để xem chi tiết Request / Response và Action Path");
+        currentInspectEndpointKey = "";
+        lblSelectedSummary.setText("Chọn một API, NOTE hoặc lá cây để xem chi tiết Request / Response và Tên Nhóm");
         txtNotesBanner.setText("");
+        txtNotesBanner.setBackground(getBackground());
         updatingVariants = true;
         cbVariant.removeAllItems();
         updatingVariants = false;
+        btnShowShared.setEnabled(false);
+        btnShowShared.setText("Nhóm dùng chung");
         btnSendRepeater.setEnabled(false);
         if (requestEditor != null && responseEditor != null) {
             requestEditor.setRequest(HttpRequest.httpRequest());
             responseEditor.setResponse(HttpResponse.httpResponse());
         }
     }
+
+    // =========================================================================
+    // Helpers (Repeater, Popups, Utilities)
+    // =========================================================================
 
     private void sendToRepeater(CapturedApiEntry cap, String caption) {
         if (api == null || cap == null) {
@@ -1190,20 +1821,97 @@ public final class CrawlerTabPanel extends JPanel {
         }
     }
 
-    private static void copyToClipboard(String text) {
-        if (text == null) {
+    private void sendGroupToRepeater(ActionGroup g) {
+        if (api == null || g == null) {
             return;
         }
-        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(text), null);
+        List<ApiCall> calls = g.getCalls();
+        if (calls.isEmpty()) {
+            return;
+        }
+        if (calls.size() > 25) {
+            int ok = JOptionPane.showConfirmDialog(this,
+                "Nhóm này chứa " + calls.size() + " API. Gửi toàn bộ sang Repeater?",
+                "Xác nhận gửi cả nhóm", JOptionPane.YES_NO_OPTION);
+            if (ok != JOptionPane.YES_OPTION) {
+                return;
+            }
+        }
+        for (ApiCall c : calls) {
+            sendToRepeater(c.capture, "G" + g.id + "#" + c.index + " " + c.capture.method);
+        }
+        appendLog("Đã gửi " + calls.size() + " API của nhóm [" + g.actionPath + "] sang Repeater.");
+    }
+
+    private static void attachDocListener(JTextField field, Runnable onChange) {
+        field.getDocument().addDocumentListener(new DocumentListener() {
+            @Override public void insertUpdate(DocumentEvent e) { onChange.run(); }
+            @Override public void removeUpdate(DocumentEvent e) { onChange.run(); }
+            @Override public void changedUpdate(DocumentEvent e) { onChange.run(); }
+        });
+    }
+
+    private static void attachTablePopup(JTable table, JPopupMenu popup) {
+        table.addMouseListener(new MouseAdapter() {
+            private void maybeShow(MouseEvent e) {
+                if (e.isPopupTrigger()) {
+                    int row = table.rowAtPoint(e.getPoint());
+                    if (row >= 0) {
+                        table.setRowSelectionInterval(row, row);
+                        popup.show(e.getComponent(), e.getX(), e.getY());
+                    }
+                }
+            }
+            @Override public void mousePressed(MouseEvent e) { maybeShow(e); }
+            @Override public void mouseReleased(MouseEvent e) { maybeShow(e); }
+        });
+    }
+
+    private static void setColumnWidths(TableColumnModel cm, int[] widths) {
+        for (int i = 0; i < widths.length && i < cm.getColumnCount(); i++) {
+            cm.getColumn(i).setPreferredWidth(widths[i]);
+        }
+    }
+
+    private static void copyToClipboard(String text) {
+        if (text != null) {
+            Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(text), null);
+        }
+    }
+
+    private final class AuditTreeRenderer extends DefaultTreeCellRenderer {
+        @Override
+        public Component getTreeCellRendererComponent(
+            JTree tree, Object value, boolean sel, boolean expanded, boolean leaf, int row, boolean hasFocus
+        ) {
+            Component c = super.getTreeCellRendererComponent(tree, value, sel, expanded, leaf, row, hasFocus);
+            if (!sel && value instanceof DefaultMutableTreeNode) {
+                Object uo = ((DefaultMutableTreeNode) value).getUserObject();
+                boolean dark = AuditTheme.isDark(api, tree);
+                if (uo instanceof TreeCallNode) {
+                    AuditNote.Severity sev = ((TreeCallNode) uo).call.worstSeverity();
+                    if (sev != null) {
+                        setForeground(AuditTheme.severityForeground(sev, dark));
+                    } else if (((TreeCallNode) uo).call.inExcel) {
+                        setForeground(AuditTheme.okForeground(dark));
+                    }
+                } else {
+                    setFont(tree.getFont().deriveFont(Font.BOLD));
+                }
+            }
+            return c;
+        }
     }
 
     private static final class VariantItem {
         final ApiSpecEntry specEntry;
+        final ApiCall call;
         final CapturedApiEntry capture;
         final String label;
 
-        VariantItem(ApiSpecEntry specEntry, CapturedApiEntry capture, String label) {
+        VariantItem(ApiSpecEntry specEntry, ApiCall call, CapturedApiEntry capture, String label) {
             this.specEntry = specEntry;
+            this.call = call;
             this.capture = capture;
             this.label = label;
         }
@@ -1214,20 +1922,22 @@ public final class CrawlerTabPanel extends JPanel {
         }
     }
 
-    private static final class TreeCaptureNode {
-        final ApiSpecEntry specEntry;
-        final CapturedApiEntry capture;
+    private static final class TreeCallNode {
+        final ApiCall call;
 
-        TreeCaptureNode(ApiSpecEntry specEntry, CapturedApiEntry capture) {
-            this.specEntry = specEntry;
-            this.capture = capture;
+        TreeCallNode(ApiCall call) {
+            this.call = call;
         }
 
         @Override
         public String toString() {
-            String tag = capture.stt.isEmpty() ? "[EXTRA]" : ("[STT " + capture.stt + "]");
-            return tag + " " + capture.method + " " + capture.requestPathWithQuery
-                + "  (" + capture.paramCount() + " params, HTTP " + capture.statusCode + ")";
+            String tag = call.inExcel
+                ? ("[STT " + call.excelStt + "]")
+                : ("[G" + call.groupId + "#" + call.index + "]");
+            String noteTag = call.hasNotes() ? ("  [NOTE: " + call.notesSummary() + "]") : "";
+            return tag + " " + call.capture.method + " " + call.displayPath()
+                + "  (" + call.capture.paramCount() + " params, HTTP " + call.capture.statusCode
+                + ", x" + call.getHits() + ")" + noteTag;
         }
     }
 }

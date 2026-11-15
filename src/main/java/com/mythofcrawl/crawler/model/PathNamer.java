@@ -25,8 +25,22 @@ public final class PathNamer {
     }
 
     public static String buildActionPath(String pageUrlOrRoute, String elementKind, String rawLabel, boolean normalizeRouteIds) {
+        return buildActionPath(pageUrlOrRoute, elementKind, rawLabel, normalizeRouteIds, "/");
+    }
+
+    public static String buildActionPath(
+        String pageUrlOrRoute,
+        String elementKind,
+        String rawLabel,
+        boolean normalizeRouteIds,
+        String rootLabel
+    ) {
+        String root = sanitizeSegment(rootLabel);
+        if (root.isEmpty()) {
+            root = "/";
+        }
         List<String> segments = new ArrayList<>();
-        segments.add("/");
+        segments.add(root);
         segments.addAll(extractRouteSegments(pageUrlOrRoute, normalizeRouteIds));
 
         String kind = sanitizeSegment(elementKind);
@@ -44,7 +58,11 @@ public final class PathNamer {
     }
 
     public static String formatPageLoadPath(String pageUrlOrRoute, boolean normalizeRouteIds) {
-        return buildActionPath(pageUrlOrRoute, "page load", "", normalizeRouteIds);
+        return formatPageLoadPath(pageUrlOrRoute, normalizeRouteIds, "/");
+    }
+
+    public static String formatPageLoadPath(String pageUrlOrRoute, boolean normalizeRouteIds, String rootLabel) {
+        return buildActionPath(pageUrlOrRoute, "page load", "", normalizeRouteIds, rootLabel);
     }
 
     public static List<String> extractRouteSegments(String pageUrlOrRoute, boolean normalizeRouteIds) {

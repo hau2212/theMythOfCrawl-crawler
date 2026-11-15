@@ -21,15 +21,29 @@ import javax.swing.SwingUtilities;
  */
 public final class CrawlerExtension implements BurpExtension, ExtensionUnloadingHandler {
 
+    private static final String PREF_CONFIG_KEY = "theMythOfCrawl.config.v2";
+
+    private MontoyaApi api;
+    private CrawlConfig config;
     private LocalControlServer controlServer;
     private StaticJsScanner jsScanner;
     private CrawlerTabPanel tabPanel;
 
     @Override
     public void initialize(MontoyaApi api) {
+        this.api = api;
         api.extension().setName("theMythOfCrawl Crawler");
 
-        CrawlConfig config = new CrawlConfig();
+        this.config = new CrawlConfig();
+        try {
+            String savedJson = api.persistence().preferences().getString(PREF_CONFIG_KEY);
+            if (savedJson != null && !savedJson.isEmpty()) {
+                this.config.loadFromPersistJson(savedJson);
+                api.logging().logToOutput("[theMythOfCrawl] Loaded saved form/crawl preferences.");
+            }
+        } catch (Exception ex) {
+            api.logging().logToError("[theMythOfCrawl] Could not load preferences: " + ex.getMessage());
+        }
         CrawlState state = new CrawlState();
         ExcelSpecMatcher matcher = ExcelSpecMatcher.empty();
 
@@ -81,8 +95,9 @@ public final class CrawlerExtension implements BurpExtension, ExtensionUnloading
             api.proxy().registerRequestHandler(reqHandler);
             api.proxy().registerResponseHandler(respHandler);
 
+            Runnable savePrefs = this::persistPreferences;
             Runnable initUi = () -> {
-                tabPanel = new CrawlerTabPanel(api, config, state, respHandler, matcher);
+                tabPanel = new CrawlerTabPanel(api, config, state, respHandler, matcher, savePrefs);
                 api.userInterface().applyThemeToComponent(tabPanel);
                 api.userInterface().registerSuiteTab("theMythOfCrawl Crawler", tabPanel);
             };
@@ -111,8 +126,19 @@ public final class CrawlerExtension implements BurpExtension, ExtensionUnloading
         }
     }
 
+    private void persistPreferences() {
+        if (api != null && config != null) {
+            try {
+                api.persistence().preferences().setString(PREF_CONFIG_KEY, config.toPersistJson());
+            } catch (Exception ex) {
+                api.logging().logToError("[theMythOfCrawl] Could not save preferences: " + ex.getMessage());
+            }
+        }
+    }
+
     @Override
     public void extensionUnloaded() {
+        persistPreferences();
         if (tabPanel != null) {
             tabPanel.dispose();
         }

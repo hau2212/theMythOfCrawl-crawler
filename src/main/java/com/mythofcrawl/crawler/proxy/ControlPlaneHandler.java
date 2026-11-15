@@ -59,7 +59,10 @@ public final class ControlPlaneHandler implements ProxyRequestHandler {
         if (svc != null && config.isHostAllowed(svc.host())) {
             CrawlState.Status st = state.getStatus();
             if (st == CrawlState.Status.RUNNING) {
-                state.bindMessageActionPath(interceptedRequest.messageId(), state.getCurrentActionPath());
+                state.bindMessageContext(
+                    interceptedRequest.messageId(),
+                    state.getCurrentActionPath(),
+                    state.getCurrentGroup());
                 if (trackedInFlightIds.size() < 4096) {
                     trackedInFlightIds.add(interceptedRequest.messageId());
                     state.incrementInFlight();

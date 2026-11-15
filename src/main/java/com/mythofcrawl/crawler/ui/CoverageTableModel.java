@@ -1,15 +1,20 @@
 package com.mythofcrawl.crawler.ui;
 
+import burp.api.montoya.MontoyaApi;
 import com.mythofcrawl.crawler.excel.ApiSpecEntry;
 import com.mythofcrawl.crawler.excel.ExcelSpecMatcher;
+import com.mythofcrawl.crawler.model.AuditNote;
 import com.mythofcrawl.crawler.model.CapturedApiEntry;
 import com.mythofcrawl.crawler.model.CrawlState;
 
+import javax.swing.JLabel;
 import javax.swing.JTable;
+import javax.swing.SwingConstants;
 import javax.swing.table.AbstractTableModel;
 import javax.swing.table.DefaultTableCellRenderer;
 import java.awt.Color;
 import java.awt.Component;
+import java.awt.Font;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -146,30 +151,121 @@ public final class CoverageTableModel extends AbstractTableModel {
     }
 
     /**
-     * Highlights MATCHED, PARAM DIFF NOTE, and MISSING rows cleanly on both Light & Dark Burp themes.
+     * Highlights MATCHED, PARAM DIFF NOTE, and MISSING rows with calm semantic colors on Light & Dark Burp themes.
      */
     public static final class CoverageCellRenderer extends DefaultTableCellRenderer {
-        private static final Color MATCHED_GREEN = new Color(36, 128, 72);
-        private static final Color DIFF_AMBER = new Color(180, 120, 20);
-        private static final Color MISSING_GRAY = new Color(145, 145, 150);
+        private final MontoyaApi api;
+
+        public CoverageCellRenderer() {
+            this(null);
+        }
+
+        public CoverageCellRenderer(MontoyaApi api) {
+            this.api = api;
+        }
 
         @Override
         public Component getTableCellRendererComponent(
             JTable table, Object value, boolean isSelected, boolean hasFocus, int row, int column
         ) {
             Component c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);
+            boolean dark = AuditTheme.isDark(api, table);
+            setBorder(AuditTheme.cellPaddingBorder());
+            setHorizontalAlignment((column == 0 || column == 1 || column == 2 || column == 5 || column == 6)
+                ? SwingConstants.CENTER : SwingConstants.LEFT);
+            c.setFont(table.getFont());
+
             if (!isSelected && table.getModel() instanceof CoverageTableModel) {
                 int modelRow = table.convertRowIndexToModel(row);
                 ApiSpecEntry entry = ((CoverageTableModel) table.getModel()).getEntryAt(modelRow);
+                Color bg = AuditTheme.zebraRowBackground(table.getBackground(), row, dark);
+                Color fg = table.getForeground();
                 if (entry != null) {
+                    CapturedApiEntry cap = entry.getPrimaryCapture();
                     if (!entry.isMatched()) {
-                        c.setForeground(column == 1 ? MISSING_GRAY : table.getForeground());
+                        if (column == 1 || column == 3) {
+                            fg = AuditTheme.mutedForeground(dark);
+                        } else if (column == 7 && !entry.getJsHints().isEmpty()) {
+                            fg = AuditTheme.severityForeground(AuditNote.Severity.INFO, dark);
+                        }
                     } else if (entry.hasParamDiffNote()) {
-                        c.setForeground(column == 1 || column == 7 ? DIFF_AMBER : table.getForeground());
-                    } else {
-                        c.setForeground(column == 1 ? MATCHED_GREEN : table.getForeground());
+                        bg = AuditTheme.severityRowTint(AuditNote.Severity.WARN, table.getBackground(), dark);
+                        if (column == 1 || column == 7) {
+                            fg = AuditTheme.severityForeground(AuditNote.Severity.WARN, dark);
+                            c.setFont(table.getFont().deriveFont(Font.BOLD));
+                        }
+                    } else if (column == 1) {
+                        fg = AuditTheme.okForeground(dark);
+                        c.setFont(table.getFont().deriveFont(Font.BOLD));
+                    }
+
+                    if (column == 2) {
+                        fg = AuditTheme.methodForeground(entry.displayMethod, dark);
+                        c.setFont(table.getFont().deriveFont(Font.BOLD));
+                    } else if (column == 6 && cap != null) {
+                        fg = AuditTheme.statusCodeForeground(cap.statusCode, dark);
+                        c.setFont(table.getFont().deriveFont(Font.BOLD));
                     }
                 }
+                c.setBackground(bg);
+                c.setForeground(fg);
+            }
+            if (c instanceof JLabel && value != null) {
+                String s = String.valueOf(value);
+                ((JLabel) c).setToolTipText(s.length() > 36 ? s : null);
+            }
+            return c;
+        }
+    }
+
+    /**
+     * Calm zebra + method/status renderer for auxiliary tables (Extra captures, Skipped actions).
+     */
+    public static final class SimpleAuditCellRenderer extends DefaultTableCellRenderer {
+        private final MontoyaApi api;
+        private final int methodCol;
+        private final int statusCol;
+        private final int centerCol;
+
+        public SimpleAuditCellRenderer(MontoyaApi api, int methodCol, int statusCol, int centerCol) {
+            this.api = api;
+            this.methodCol = methodCol;
+            this.statusCol = statusCol;
+            this.centerCol = centerCol;
+        }
+
+        @Override
+        public Component getTableCellRendererComponent(
+            JTable table, Object value, boolean isSelected, boolean hasFocus, int row, int column
+        ) {
+            Component c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);
+            boolean dark = AuditTheme.isDark(api, table);
+            setBorder(AuditTheme.cellPaddingBorder());
+            setHorizontalAlignment((column == methodCol || column == statusCol || column == centerCol)
+                ? SwingConstants.CENTER : SwingConstants.LEFT);
+            c.setFont(table.getFont());
+
+            if (!isSelected) {
+                Color bg = AuditTheme.zebraRowBackground(table.getBackground(), row, dark);
+                Color fg = table.getForeground();
+                String s = value != null ? String.valueOf(value) : "";
+                if (column == methodCol) {
+                    fg = AuditTheme.methodForeground(s, dark);
+                    c.setFont(table.getFont().deriveFont(Font.BOLD));
+                } else if (column == statusCol) {
+                    try {
+                        int st = Integer.parseInt(s.trim());
+                        fg = AuditTheme.statusCodeForeground(st, dark);
+                        c.setFont(table.getFont().deriveFont(Font.BOLD));
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+                c.setBackground(bg);
+                c.setForeground(fg);
+            }
+            if (c instanceof JLabel && value != null) {
+                String s = String.valueOf(value);
+                ((JLabel) c).setToolTipText(s.length() > 40 ? s : null);
             }
             return c;
         }

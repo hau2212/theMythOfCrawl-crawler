@@ -168,9 +168,12 @@ public final class LocalControlServer {
             resp.put("actionWaitMs", config.getActionWaitMs());
             resp.put("maxActionsPerPage", config.getMaxActionsPerPage());
             resp.put("autoFillForms", config.isAutoFillForms());
+            resp.put("deepCrawlMode", config.isDeepCrawlMode());
             resp.put("dangerGuardEnabled", config.isDangerGuardEnabled());
             resp.put("dangerKeywords", config.getDangerKeywordsList());
             resp.put("normalizeRouteIds", config.isNormalizeRouteIds());
+            resp.put("routeRootLabel", config.getRouteRootLabel());
+            resp.put("formFill", config.getFormFillProfile().toAgentMap());
             resp.put("clickedSignatures", state.getClickedSignatures(routeKey));
             resp.put("inFlight", state.getInFlightCount());
             resp.put("queueRemaining", state.getPendingQueueSize());
@@ -181,11 +184,14 @@ public final class LocalControlServer {
 
         if ("/__myth_crawl/context".equals(path) && "POST".equals(method)) {
             Map<String, Object> req = MiniJson.parseObject(bodyStr);
-            String actionPath = MiniJson.asString(req, "actionPath", "/ > page load");
+            String defaultRoot = config.getRouteRootLabel() + " > page load";
+            String actionPath = MiniJson.asString(req, "actionPath", defaultRoot);
+            String kind = MiniJson.asString(req, "kind", "");
+            String label = MiniJson.asString(req, "label", "");
             String pageUrl = MiniJson.asString(req, "pageUrl", "");
-            state.setCurrentContext(actionPath, pageUrl);
-            if (logger != null && !"/ > page load".equals(actionPath)) {
-                logger.accept("Context -> " + actionPath);
+            com.mythofcrawl.crawler.model.ActionGroup grp = state.setCurrentContext(actionPath, kind, label, pageUrl);
+            if (logger != null && !actionPath.endsWith("> page load")) {
+                logger.accept("Nhóm thao tác -> " + actionPath);
             }
             if (onUiEvent != null) {
                 onUiEvent.run();
@@ -193,6 +199,7 @@ public final class LocalControlServer {
             Map<String, Object> resp = new LinkedHashMap<>();
             resp.put("ok", true);
             resp.put("actionPath", actionPath);
+            resp.put("groupId", grp != null ? grp.id : 0);
             writeJson(out, resp);
             return;
         }

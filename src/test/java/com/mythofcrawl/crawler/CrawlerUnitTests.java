@@ -5,9 +5,14 @@ import com.mythofcrawl.crawler.excel.ExcelSpecMatcher;
 import com.mythofcrawl.crawler.excel.ParamExtractor;
 import com.mythofcrawl.crawler.excel.ReportExporter;
 import com.mythofcrawl.crawler.excel.SimpleXlsxReader;
+import com.mythofcrawl.crawler.model.ActionGroup;
+import com.mythofcrawl.crawler.model.ActionGroupStore;
+import com.mythofcrawl.crawler.model.ApiCall;
+import com.mythofcrawl.crawler.model.AuditNote;
 import com.mythofcrawl.crawler.model.CapturedApiEntry;
 import com.mythofcrawl.crawler.model.CrawlConfig;
 import com.mythofcrawl.crawler.model.CrawlState;
+import com.mythofcrawl.crawler.model.FormFillProfile;
 import com.mythofcrawl.crawler.model.MiniJson;
 import com.mythofcrawl.crawler.model.PathNamer;
 import com.mythofcrawl.crawler.proxy.LocalControlServer;
@@ -49,6 +54,9 @@ public final class CrawlerUnitTests {
             testPathNamerPreservesCase();
             testCrawlStateFrontierAndDangerGuard();
             testLocalControlServerLoopback();
+            testFormFillProfileAndConfigPersist();
+            testGraphqlXmlAndToppagePathNamer();
+            testActionGroupStoreNotesAndExport(tmpDir);
             System.out.println("ALL TESTS PASSED (" + passed + " test groups verified).");
         } finally {
             deleteRecursive(tmpDir.toFile());
@@ -251,6 +259,135 @@ public final class CrawlerUnitTests {
         } finally {
             server.stop();
         }
+    }
+
+    private static void testFormFillProfileAndConfigPersist() {
+        CrawlConfig cfg = new CrawlConfig();
+        FormFillProfile ff = cfg.getFormFillProfile();
+        assertEquals("TEXT", ff.get(FormFillProfile.Field.TEXT), "Default free text must be TEXT");
+        assertEquals("TEXT", ff.get(FormFillProfile.Field.TEXTAREA), "Default textarea must be TEXT");
+        assertEquals("TEXT", ff.get(FormFillProfile.Field.RICHTEXT), "Default richtext/editable table must be TEXT");
+        assertEquals("2026-01-01", ff.get(FormFillProfile.Field.DATE), "Default date");
+        assertEquals("toppage", cfg.getRouteRootLabel(), "Default route root label");
+        assertTrue(cfg.isDeepCrawlMode(), "Deep crawl mode defaults to true");
+        assertTrue(cfg.getDangerKeywordsList().contains("logout"), "Logout must be in default danger guard");
+        assertTrue(cfg.getDangerKeywordsList().contains("sign out"), "Sign out must be in default danger guard");
+        assertTrue(!cfg.getDangerKeywordsList().contains("delete"), "Non-logout business actions must NOT be skipped by default");
+
+        CrawlConfig hostCfg = new CrawlConfig();
+        hostCfg.setAllowedHostsCsv("app.example.com");
+        CrawlState s = new CrawlState();
+        s.resetAll("https://app.example.com/");
+        assertTrue(s.enqueueUrl("https://app.example.com/users/delete", hostCfg), "Business delete URL must NOT be blocked by default");
+
+        ff.applyToAllTextFields("AUDIT_STR");
+        assertEquals("AUDIT_STR", ff.get(FormFillProfile.Field.TEXT), "applyToAllTextFields updates TEXT");
+        assertEquals("AUDIT_STR", ff.get(FormFillProfile.Field.TEXTAREA), "applyToAllTextFields updates TEXTAREA");
+        assertEquals("2026-01-01", ff.get(FormFillProfile.Field.DATE), "applyToAllTextFields preserves DATE");
+        ff.set(FormFillProfile.Field.DATE, "2027-05-09");
+        ff.setRulesText("# comment line\nusername = admin_test\n/^(dob|birth)/ = 1999-12-31\n");
+
+        List<Map<String, Object>> parsedRules = FormFillProfile.parseRules(ff.getRulesText());
+        assertEquals(2, parsedRules.size(), "Parsed 2 non-comment rules");
+        assertEquals("username", parsedRules.get(0).get("pattern"), "First rule pattern");
+        assertEquals(Boolean.FALSE, parsedRules.get(0).get("regex"), "First rule is substring");
+        assertEquals(Boolean.TRUE, parsedRules.get(1).get("regex"), "Second rule is regex");
+        assertEquals("1999-12-31", parsedRules.get(1).get("value"), "Second rule value");
+
+        cfg.setRouteRootLabel("/");
+        cfg.setDeepCrawlMode(false);
+        String json = cfg.toPersistJson();
+
+        CrawlConfig restored = new CrawlConfig();
+        restored.loadFromPersistJson(json);
+        assertEquals("/", restored.getRouteRootLabel(), "Persist round-trip routeRootLabel");
+        assertTrue(!restored.isDeepCrawlMode(), "Persist round-trip deepCrawlMode");
+        assertEquals("AUDIT_STR", restored.getFormFillProfile().get(FormFillProfile.Field.TEXT), "Persist round-trip TEXT");
+        assertEquals("2027-05-09", restored.getFormFillProfile().get(FormFillProfile.Field.DATE), "Persist round-trip DATE");
+        assertTrue(restored.getFormFillProfile().getRulesText().contains("username = admin_test"), "Persist round-trip rules");
+        passed++;
+    }
+
+    private static void testGraphqlXmlAndToppagePathNamer() {
+        String gqlOp = ParamExtractor.extractGraphqlOperation(
+            "application/json; charset=utf-8",
+            "{\"operationName\":\"GetUserOrders\",\"query\":\"query GetUserOrders { orders { id } }\"}".getBytes(StandardCharsets.UTF_8));
+        assertEquals("GetUserOrders", gqlOp, "Extract GraphQL operationName");
+
+        Set<String> xmlKeys = ParamExtractor.extractParameterKeys(
+            "/soap/service",
+            "text/xml; charset=utf-8",
+            "<Envelope><Body><CreateOrder><customerId>42</customerId></CreateOrder></Body></Envelope>".getBytes(StandardCharsets.UTF_8));
+        assertTrue(xmlKeys.contains("xml.Envelope") || xmlKeys.contains("xml.CreateOrder") || xmlKeys.contains("xml.customerId"),
+            "Extract XML/SOAP tag keys");
+
+        String contactBtn = PathNamer.buildActionPath("https://target.local/contact", "button", "Send", true, "toppage");
+        assertEquals("toppage > contact > button 'Send'", contactBtn, "toppage root hierarchy naming");
+
+        String rootLoad = PathNamer.formatPageLoadPath("https://target.local/", true, "toppage");
+        assertEquals("toppage > page load", rootLoad, "toppage root page load naming");
+        passed++;
+    }
+
+    private static void testActionGroupStoreNotesAndExport(Path tmpDir) throws Exception {
+        ActionGroupStore store = new ActionGroupStore();
+        ActionGroup g1 = store.openGroup("toppage > contact > button 'Send'", "button", "Send", "https://target.local/contact");
+
+        byte[] dummyReq = "POST /api/contact HTTP/1.1\r\nHost: target.local\r\n\r\n".getBytes(StandardCharsets.UTF_8);
+        byte[] dummyResp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".getBytes(StandardCharsets.UTF_8);
+
+        // Record 5 distinct APIs triggered inside one button click group
+        String[][] apis = {
+            {"POST", "/api/contact", "POST /api/contact", "", "1", "email,message", "200"},
+            {"GET", "/api/csrf", "GET /api/csrf", "", "", "", "200"},
+            {"POST", "/api/graphql", "POST /api/graphql#SubmitLead", "SubmitLead", "", "input.name,input.text", "200"},
+            {"GET", "/api/config", "GET /api/config", "", "", "mode", "500"},
+            {"POST", "/api/audit", "POST /api/audit", "", "", "event", "200"}
+        };
+        for (String[] a : apis) {
+            Set<String> pKeys = a[5].isEmpty() ? Set.of() : Set.of(a[5].split(","));
+            CapturedApiEntry cap = new CapturedApiEntry(
+                a[4], a[0], "https://target.local" + a[1], a[1], "target.local", 443, true,
+                g1.actionPath, dummyReq, dummyResp, Integer.parseInt(a[6]), dummyResp.length, pKeys, System.currentTimeMillis());
+            ApiCall call = store.recordCall(g1, cap, a[2], a[3], a[4], a[1], true, false);
+            assertEquals("toppage > contact > button 'Send'", call.displayName(), "API display name matches group name");
+        }
+        assertEquals(5, g1.callCount(), "All 5 APIs grouped under the Send button group");
+
+        // Repeat identical call -> must deduplicate and increment hits to 2
+        CapturedApiEntry repeatCap = new CapturedApiEntry(
+            "1", "POST", "https://target.local/api/contact", "/api/contact", "target.local", 443, true,
+            g1.actionPath, dummyReq, dummyResp, 200, dummyResp.length, Set.of("email", "message"), System.currentTimeMillis());
+        ApiCall deduped = store.recordCall(g1, repeatCap, "POST /api/contact", "", "1", "/api/contact", true, false);
+        assertEquals(2, deduped.getHits(), "Identical call in same group increments hit counter");
+        assertEquals(5, g1.callCount(), "Group still has 5 unique API entries");
+
+        // Second group hits POST /api/contact with DIFFERENT params and HTTP 403 -> PARAM_DIFF, STATUS_DIFF, AUTH notes
+        ActionGroup g2 = store.openGroup("toppage > checkout > button 'Confirm'", "button", "Confirm", "https://target.local/checkout");
+        CapturedApiEntry diffCap = new CapturedApiEntry(
+            "1", "POST", "https://target.local/api/contact", "/api/contact", "target.local", 443, true,
+            g2.actionPath, dummyReq, dummyResp, 403, dummyResp.length, Set.of("email", "orderId"), System.currentTimeMillis());
+        ApiCall diffCall = store.recordCall(g2, diffCap, "POST /api/contact", "", "1", "/api/contact", true, false);
+        String noteStr = diffCall.notesSummary();
+        assertTrue(noteStr.contains("Khác tham số"), "PARAM_DIFF note added");
+        assertTrue(noteStr.contains("HTTP 403"), "STATUS_DIFF and/or AUTH note added");
+        assertEquals(2, store.sharedGroupCount("POST /api/contact"), "Endpoint shared across 2 groups");
+        assertTrue(store.noteCount(AuditNote.Severity.ERROR) >= 2, "Errors recorded for 500 and 403");
+
+        File csvOut = tmpDir.resolve("grouped.csv").toFile();
+        File jsonOut = tmpDir.resolve("grouped.json").toFile();
+        File mdOut = tmpDir.resolve("grouped.md").toFile();
+        ReportExporter.exportCsv(csvOut, ExcelSpecMatcher.empty(), List.of(), store);
+        ReportExporter.exportJson(jsonOut, ExcelSpecMatcher.empty(), List.of(), store);
+        ReportExporter.exportMarkdown(mdOut, ExcelSpecMatcher.empty(), List.of(), store);
+
+        String md = Files.readString(mdOut.toPath(), StandardCharsets.UTF_8);
+        assertTrue(md.contains("toppage > contact > button 'Send'"), "Markdown includes group name");
+        assertTrue(md.contains("SubmitLead"), "Markdown includes GraphQL op");
+        assertTrue(md.contains("Tổng hợp Bảng NOTE Audit"), "Markdown includes Audit NOTE table");
+        assertTrue(md.contains("Khác tham số"), "Markdown includes PARAM_DIFF note details");
+        assertTrue(md.contains("HTTP 500"), "Markdown includes server error note");
+        passed++;
     }
 
     private static String httpRequest(String method, String urlStr, String jsonBody) throws Exception {

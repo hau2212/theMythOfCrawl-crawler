@@ -12,6 +12,8 @@ import burp.api.montoya.proxy.http.ProxyResponseToBeSentAction;
 import com.mythofcrawl.crawler.excel.ApiSpecEntry;
 import com.mythofcrawl.crawler.excel.ExcelSpecMatcher;
 import com.mythofcrawl.crawler.excel.ParamExtractor;
+import com.mythofcrawl.crawler.model.ActionGroup;
+import com.mythofcrawl.crawler.model.ApiCall;
 import com.mythofcrawl.crawler.model.CapturedApiEntry;
 import com.mythofcrawl.crawler.model.CrawlConfig;
 import com.mythofcrawl.crawler.model.CrawlState;
@@ -124,9 +126,9 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
         CrawlState.Status st = state.getStatus();
         if (st == CrawlState.Status.RUNNING) {
             state.noteAuthStatus(interceptedResponse.statusCode(), interceptedResponse.headerValue("Location"));
-            if (state.getConsecutiveAuthRejects() >= 6) {
+            if (state.getConsecutiveAuthRejects() >= 15) {
                 state.setStatus(CrawlState.Status.PAUSED);
-                log("CẢNH BÁO: Phát hiện nhiều 401/redirect về login liên tiếp -> Tạm dừng crawl để bạn kiểm tra đăng nhập trên Firefox!");
+                log("CẢNH BÁO: 15 request liên tiếp trả 401/redirect login -> Tạm dừng crawl để bạn kiểm tra phiên đăng nhập!");
                 notifyUi();
             }
         }
@@ -176,17 +178,24 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
 
     private void processApiCapture(HttpRequest req, InterceptedResponse resp) {
         ExcelSpecMatcher currentMatcher = this.matcher;
+        boolean excelLoaded = currentMatcher != null && currentMatcher.isLoaded();
         String method = req.method() != null ? req.method().toUpperCase() : "GET";
         String pathWithQuery = req.path() != null ? req.path() : "/";
         String fullUrl = req.url() != null ? req.url() : pathWithQuery;
+
         String actionPath = state.consumeMessageActionPath(resp.messageId());
+        ActionGroup group = state.consumeMessageGroup(resp.messageId());
         if (state.getStatus() != CrawlState.Status.RUNNING) {
             String ref = req.headerValue("Referer");
             if (ref != null && !ref.isEmpty()) {
-                actionPath = PathNamer.buildActionPath(ref, "manual", "", config.isNormalizeRouteIds());
+                actionPath = PathNamer.buildActionPath(
+                    ref, "manual", "", config.isNormalizeRouteIds(), config.getRouteRootLabel());
             } else {
-                actionPath = "/ > manual";
+                actionPath = config.getRouteRootLabel() + " > manual";
             }
+            group = state.getActionGroups().openGroup(actionPath, "manual", "", ref != null ? ref : "");
+        } else if (group == null) {
+            group = state.getActionGroups().openGroup(actionPath, "", "", state.getCurrentPageUrl());
         }
 
         HttpService svc = req.httpService();
@@ -197,57 +206,112 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
         int status = resp.statusCode();
         int respLen = resp.body().length();
 
-        if (currentMatcher != null && currentMatcher.isLoaded()) {
-            ExcelSpecMatcher.MatchResult res = currentMatcher.matchAndRecord(
+        String excelStt = "";
+        String excelSpecPath = "";
+        boolean excelUpgraded = false;
+        ExcelSpecMatcher.MatchResult excelMatch = null;
+
+        if (excelLoaded) {
+            excelMatch = currentMatcher.matchAndRecord(
                 method, fullUrl, pathWithQuery,
                 svc.host(), svc.port(), svc.secure(),
                 actionPath, reqCt, reqBytes, reqBodyBytes, respBytes,
                 status, respLen, config);
-            if (res != null) {
-                switch (res.outcome) {
+            if (excelMatch != null) {
+                excelStt = excelMatch.entry.stt;
+                excelSpecPath = excelMatch.entry.rawSpecPath;
+                excelUpgraded = (excelMatch.outcome == ApiSpecEntry.RecordOutcome.UPGRADED_SUPERSET);
+                switch (excelMatch.outcome) {
                     case FIRST_MATCH:
                         log(String.format("[STT %s] MATCHED %s %s  <--  %s (%d params)",
-                            res.entry.stt, method, res.entry.normalizedSpecPath, actionPath,
-                            res.entry.getPrimaryCapture().paramCount()));
-                        notifyUi();
+                            excelMatch.entry.stt, method, excelMatch.entry.normalizedSpecPath, actionPath,
+                            excelMatch.entry.getPrimaryCapture().paramCount()));
                         break;
                     case UPGRADED_SUPERSET:
                         log(String.format("[STT %s] UPGRADED %s %s  <--  %s (%d params - đầy đủ hơn)",
-                            res.entry.stt, method, res.entry.normalizedSpecPath, actionPath,
-                            res.entry.getPrimaryCapture().paramCount()));
-                        notifyUi();
+                            excelMatch.entry.stt, method, excelMatch.entry.normalizedSpecPath, actionPath,
+                            excelMatch.entry.getPrimaryCapture().paramCount()));
                         break;
                     case ADDED_DIFF_VARIANT:
                         log(String.format("[STT %s] PARAM DIFF %s %s  <--  %s",
-                            res.entry.stt, method, res.entry.normalizedSpecPath, actionPath));
-                        notifyUi();
+                            excelMatch.entry.stt, method, excelMatch.entry.normalizedSpecPath, actionPath));
                         break;
                     case IGNORED_SAME_OR_SUBSET:
                         break;
                 }
-                return;
-            }
-            // Strict whitelist active: ignore non-Excel endpoints!
-            if (config.isStrictExcelOnly()) {
-                return;
             }
         }
 
-        if (!config.isStrictExcelOnly()) {
-            // Non-strict mode fallback (stores non-static requests into extraCaptures)
-            String lowerPath = pathWithQuery.toLowerCase();
-            if (lowerPath.matches(".*\\.(css|js|mjs|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|eot|otf|map|mp3|mp4|webm|wasm)(\\?.*)?$")) {
-                return;
-            }
-            Set<String> params = ParamExtractor.extractParameterKeys(pathWithQuery, reqCt, reqBodyBytes);
-            CapturedApiEntry extra = new CapturedApiEntry(
-                "-", method, fullUrl, pathWithQuery, svc.host(), svc.port(), svc.secure(),
-                actionPath, reqBytes, respBytes, status, respLen, params, System.currentTimeMillis());
-            state.addExtraCapture(extra);
-            log(String.format("[EXTRA] %s %s  <--  %s (%d params, HTTP %d)",
-                method, pathWithQuery, actionPath, params.size(), status));
-            notifyUi();
+        boolean isStatic = isStaticAsset(pathWithQuery);
+        if (excelMatch == null && isStatic) {
+            return;
         }
+
+        Set<String> params = ParamExtractor.extractParameterKeys(pathWithQuery, reqCt, reqBodyBytes);
+        String graphqlOp = ParamExtractor.extractGraphqlOperation(reqCt, reqBodyBytes);
+        String endpointKey = buildEndpointKey(method, pathWithQuery, graphqlOp, excelMatch, config);
+
+        CapturedApiEntry cap = new CapturedApiEntry(
+            excelStt.isEmpty() ? "-" : excelStt,
+            method, fullUrl, pathWithQuery, svc.host(), svc.port(), svc.secure(),
+            actionPath, reqBytes, respBytes, status, respLen, params, System.currentTimeMillis());
+
+        // Always record non-static APIs inside ActionGroupStore so all APIs fired by one button
+        // stay grouped together and any diff/error/extra NOTE is visible immediately.
+        ApiCall recordedCall = state.getActionGroups().recordCall(
+            group, cap, endpointKey, graphqlOp, excelStt, excelSpecPath, excelLoaded, excelUpgraded);
+
+        if (excelMatch == null && !config.isStrictExcelOnly()) {
+            state.addExtraCapture(cap);
+            if (recordedCall != null && recordedCall.getHits() == 1) {
+                log(String.format("[EXTRA] %s %s  <--  %s (%d params, HTTP %d)",
+                    method, recordedCall.displayPath(), actionPath, params.size(), status));
+            }
+        }
+        notifyUi();
+    }
+
+    private static boolean isStaticAsset(String pathWithQuery) {
+        if (pathWithQuery == null) {
+            return false;
+        }
+        int q = pathWithQuery.indexOf('?');
+        String cleanPath = (q >= 0 ? pathWithQuery.substring(0, q) : pathWithQuery).toLowerCase();
+        return cleanPath.matches(".*\\.(css|js|mjs|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|eot|otf|map|mp3|mp4|webm|wasm)$");
+    }
+
+    private static String buildEndpointKey(
+        String method,
+        String pathWithQuery,
+        String graphqlOp,
+        ExcelSpecMatcher.MatchResult excelMatch,
+        CrawlConfig config
+    ) {
+        String basePath;
+        if (excelMatch != null) {
+            basePath = excelMatch.entry.normalizedSpecPath;
+        } else {
+            boolean stripSlash = config == null || config.isIgnoreTrailingSlash();
+            String norm = ExcelSpecMatcher.normalizeSpecPath(pathWithQuery, stripSlash);
+            StringBuilder sb = new StringBuilder();
+            if ("/".equals(norm)) {
+                sb.append('/');
+            } else {
+                for (String seg : norm.substring(1).split("/")) {
+                    if (seg.isEmpty()) {
+                        continue;
+                    }
+                    sb.append('/').append(PathNamer.isDynamicIdSegment(seg) ? "{id}" : seg);
+                }
+                if (sb.length() == 0) {
+                    sb.append('/');
+                }
+            }
+            basePath = sb.toString();
+        }
+        return graphqlOp != null && !graphqlOp.isEmpty()
+            ? (method + " " + basePath + " [op:" + graphqlOp + "]")
+            : (method + " " + basePath);
     }
 
     private static String decodeBodyText(InterceptedResponse resp) {
