@@ -12,9 +12,12 @@ import com.mythofcrawl.crawler.model.AuditNote;
 import com.mythofcrawl.crawler.model.CapturedApiEntry;
 import com.mythofcrawl.crawler.model.CrawlConfig;
 import com.mythofcrawl.crawler.model.CrawlState;
+import com.mythofcrawl.crawler.model.ExtenderPushEntry;
 import com.mythofcrawl.crawler.model.FormFillProfile;
+import com.mythofcrawl.crawler.model.HeaderFilterProfile;
 import com.mythofcrawl.crawler.model.MiniJson;
 import com.mythofcrawl.crawler.model.PathNamer;
+import com.mythofcrawl.crawler.proxy.ExtenderPushManager;
 import com.mythofcrawl.crawler.proxy.LocalControlServer;
 
 import java.io.File;
@@ -25,6 +28,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.AbstractMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -57,6 +61,8 @@ public final class CrawlerUnitTests {
             testFormFillProfileAndConfigPersist();
             testGraphqlXmlAndToppagePathNamer();
             testActionGroupStoreNotesAndExport(tmpDir);
+            testHeaderFilterProfileAndSafeRequestGate();
+            testExtenderPushLedgerWithoutWireModification(tmpDir);
             System.out.println("ALL TESTS PASSED (" + passed + " test groups verified).");
         } finally {
             deleteRecursive(tmpDir.toFile());
@@ -241,6 +247,12 @@ public final class CrawlerUnitTests {
             String stJson = httpRequest("GET", "http://127.0.0.1:" + port + "/__myth_crawl/state", null);
             Map<String, Object> parsed = MiniJson.parseObject(stJson);
             assertEquals("RUNNING", String.valueOf(parsed.get("status")), "State JSON reflects RUNNING");
+            assertEquals(Boolean.FALSE, parsed.get("allowAutoRequests"), "Safe request gate defaults to false in /state");
+
+            cfg.setAllowAutoRequests(true);
+            String stJsonUnlocked = httpRequest("GET", "http://127.0.0.1:" + port + "/__myth_crawl/state", null);
+            Map<String, Object> parsedUnlocked = MiniJson.parseObject(stJsonUnlocked);
+            assertEquals(Boolean.TRUE, parsedUnlocked.get("allowAutoRequests"), "/state reflects allowAutoRequests=true when user unlocks");
 
             String discResp = httpRequest("POST", "http://127.0.0.1:" + port + "/__myth_crawl/discovered",
                 "{\"pageUrl\":\"http://127.0.0.1/home\",\"urls\":[\"http://127.0.0.1/about\",\"http://127.0.0.1/logout\"],\"skipped\":[{\"actionPath\":\"/ > home > link 'Logout'\",\"reason\":\"logout\",\"tag\":\"A\"}]}");
@@ -387,6 +399,95 @@ public final class CrawlerUnitTests {
         assertTrue(md.contains("Tổng hợp Bảng NOTE Audit"), "Markdown includes Audit NOTE table");
         assertTrue(md.contains("Khác tham số"), "Markdown includes PARAM_DIFF note details");
         assertTrue(md.contains("HTTP 500"), "Markdown includes server error note");
+        passed++;
+    }
+
+    private static void testHeaderFilterProfileAndSafeRequestGate() {
+        CrawlConfig cfg = new CrawlConfig();
+        assertTrue(!cfg.isAllowAutoRequests(), "allowAutoRequests MUST default to false (Safe Lock)");
+        cfg.setAllowAutoRequests(true);
+        String savedJson = cfg.toPersistJson();
+        CrawlConfig restoredLock = new CrawlConfig();
+        restoredLock.loadFromPersistJson(savedJson);
+        assertTrue(!restoredLock.isAllowAutoRequests(), "allowAutoRequests MUST NOT remain unlocked across restarts");
+
+        HeaderFilterProfile hfp = cfg.getHeaderFilterProfile();
+        assertTrue(!hfp.isEnabled(), "Header filter starts disabled");
+        assertTrue(hfp.isApplyOnProxyCrawl(), "Proxy crawl header injection defaults to true once enabled");
+        assertTrue(!hfp.isApplyOnExtenderPush(), "Extender push header filter defaults to false for packet integrity");
+
+        hfp.setEnabled(true);
+        hfp.addRule(new HeaderFilterProfile.Rule(true, HeaderFilterProfile.Action.SET, "X-Account", "a\r\nEvil: 1", "*"));
+        hfp.addRule(new HeaderFilterProfile.Rule(true, HeaderFilterProfile.Action.ADD_IF_MISSING, "X-Tenant", "t1", "/\\/api\\/v[12]\\//"));
+        hfp.addRule(new HeaderFilterProfile.Rule(true, HeaderFilterProfile.Action.REMOVE, "X-Legacy", "", "*"));
+        // Protected headers like Host must be skipped cleanly
+        hfp.addRule(new HeaderFilterProfile.Rule(true, HeaderFilterProfile.Action.SET, "Host", "evil.attacker", "*"));
+
+        List<Map.Entry<String, String>> initial = List.of(
+            new AbstractMap.SimpleEntry<>("Host", "target.local"),
+            new AbstractMap.SimpleEntry<>("x-account", "old-user"),
+            new AbstractMap.SimpleEntry<>("X-Legacy", "drop-me"),
+            new AbstractMap.SimpleEntry<>("Authorization", "Bearer tok1")
+        );
+
+        List<Map.Entry<String, String>> transformedApi =
+            hfp.applyToHeaderList(initial, "target.local", "https://target.local/api/v2/orders");
+        assertEquals("target.local", findHeaderVal(transformedApi, "Host"), "Protected Host header untouched");
+        assertEquals("aEvil: 1", findHeaderVal(transformedApi, "X-Account"), "X-Account SET & sanitized CR/LF");
+        assertEquals("t1", findHeaderVal(transformedApi, "X-Tenant"), "Regex scope matched /api/v2/");
+        assertTrue(findHeaderVal(transformedApi, "X-Legacy") == null, "X-Legacy removed");
+
+        List<Map.Entry<String, String>> transformedPublic =
+            hfp.applyToHeaderList(initial, "target.local", "https://target.local/home");
+        assertTrue(findHeaderVal(transformedPublic, "X-Tenant") == null, "Non-matching regex skips X-Tenant");
+
+        // Persistence round-trip for HeaderFilterProfile rules
+        String cfgJson = cfg.toPersistJson();
+        CrawlConfig cfg2 = new CrawlConfig();
+        cfg2.loadFromPersistJson(cfgJson);
+        assertTrue(cfg2.getHeaderFilterProfile().isEnabled(), "Header filter enabled persisted");
+        assertEquals(4, cfg2.getHeaderFilterProfile().getRulesSnapshot().size(), "Header rules persisted");
+        assertEquals("X-Account", cfg2.getHeaderFilterProfile().getRulesSnapshot().get(0).headerName, "First rule name persisted");
+        assertEquals("/\\/api\\/v[12]\\//", cfg2.getHeaderFilterProfile().getRulesSnapshot().get(1).scopePattern, "Regex scope persisted");
+        passed++;
+    }
+
+    private static String findHeaderVal(List<Map.Entry<String, String>> headers, String name) {
+        for (Map.Entry<String, String> e : headers) {
+            if (e.getKey().equalsIgnoreCase(name)) {
+                return e.getValue();
+            }
+        }
+        return null;
+    }
+
+    private static void testExtenderPushLedgerWithoutWireModification(Path tmpDir) throws Exception {
+        ActionGroupStore store = new ActionGroupStore();
+        ActionGroup g = store.openGroup("toppage > contact > button 'Send'", "button", "Send", "https://target.local/contact");
+        byte[] rawReq = "POST /api/contact HTTP/1.1\r\nHost: target.local\r\n\r\n{\"a\":1}".getBytes(StandardCharsets.UTF_8);
+        byte[] rawResp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".getBytes(StandardCharsets.UTF_8);
+        CapturedApiEntry cap = new CapturedApiEntry(
+            "12", "POST", "https://target.local/api/contact", "/api/contact",
+            "target.local", 443, true, g.actionPath, rawReq, rawResp, 200, rawResp.length, Set.of("a"), System.currentTimeMillis());
+        store.recordCall(g, cap, "POST /api/contact", "", "12", "/api/contact", true, false);
+
+        CrawlConfig cfg = new CrawlConfig();
+        ExtenderPushManager pushMgr = new ExtenderPushManager(null, cfg, null, null);
+        int added1 = pushMgr.enqueueGroup(g);
+        assertEquals(1, added1, "Enqueued 1 call from group");
+        int addedDup = pushMgr.enqueueGroup(g);
+        assertEquals(0, addedDup, "Already queued pending call deduplicated");
+
+        ExtenderPushEntry entry = pushMgr.snapshotEntries().get(0);
+        String comment = entry.buildBurpComment();
+        assertTrue(comment.contains("toppage > contact > button 'Send'"), "Burp annotation comment contains group path");
+        assertTrue(comment.contains("STT:12"), "Burp annotation comment contains STT");
+
+        File ledgerCsv = tmpDir.resolve("push_ledger.csv").toFile();
+        pushMgr.exportLedgerCsv(ledgerCsv);
+        String csvText = Files.readString(ledgerCsv.toPath(), StandardCharsets.UTF_8);
+        assertTrue(csvText.contains("toppage > contact > button 'Send'"), "Push ledger CSV contains group path");
+        assertTrue(csvText.contains("/api/contact"), "Push ledger CSV contains endpoint");
         passed++;
     }
 

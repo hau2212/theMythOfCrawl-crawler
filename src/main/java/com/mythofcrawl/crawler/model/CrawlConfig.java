@@ -32,15 +32,30 @@ public final class CrawlConfig {
     private volatile boolean deepCrawlMode = true;
     private volatile boolean relaxCspWhileCrawling = true;
     private volatile boolean captureJsEndpoints = true;
+    /** Safe-by-default request gate: never auto-clicks or fires seed fetches until user allows it. */
+    private volatile boolean allowAutoRequests = false;
     private volatile int actionWaitMs = 550;
     private volatile int maxActionsPerPage = 300;
     private volatile int maxPages = 500;
     private volatile int maxPaginationSamples = 5;
 
     private final FormFillProfile formFillProfile = new FormFillProfile();
+    private final HeaderFilterProfile headerFilterProfile = new HeaderFilterProfile();
 
     public FormFillProfile getFormFillProfile() {
         return formFillProfile;
+    }
+
+    public HeaderFilterProfile getHeaderFilterProfile() {
+        return headerFilterProfile;
+    }
+
+    public boolean isAllowAutoRequests() {
+        return allowAutoRequests;
+    }
+
+    public void setAllowAutoRequests(boolean allowAutoRequests) {
+        this.allowAutoRequests = allowAutoRequests;
     }
 
     public String getAllowedHostsCsv() {
@@ -258,6 +273,7 @@ public final class CrawlConfig {
         m.put("maxPages", maxPages);
         m.put("maxPaginationSamples", maxPaginationSamples);
         m.put("formFill", formFillProfile.toPersistMap());
+        m.put("headerFilter", headerFilterProfile.toPersistMap());
         return MiniJson.stringify(m);
     }
 
@@ -287,6 +303,10 @@ public final class CrawlConfig {
             Object ff = m.get("formFill");
             if (ff instanceof Map<?, ?>) {
                 formFillProfile.applyPersistMap((Map<String, Object>) ff);
+            }
+            Object hf = m.get("headerFilter");
+            if (hf instanceof Map<?, ?>) {
+                headerFilterProfile.applyPersistMap((Map<?, ?>) hf);
             }
         } catch (Exception ignored) {
         }

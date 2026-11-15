@@ -7,6 +7,7 @@ import com.mythofcrawl.crawler.excel.ExcelSpecMatcher;
 import com.mythofcrawl.crawler.model.CrawlConfig;
 import com.mythofcrawl.crawler.model.CrawlState;
 import com.mythofcrawl.crawler.proxy.ControlPlaneHandler;
+import com.mythofcrawl.crawler.proxy.ExtenderPushManager;
 import com.mythofcrawl.crawler.proxy.HtmlAgentInjector;
 import com.mythofcrawl.crawler.proxy.LocalControlServer;
 import com.mythofcrawl.crawler.proxy.StaticJsScanner;
@@ -16,8 +17,8 @@ import javax.swing.SwingUtilities;
 
 /**
  * Main Burp Suite Montoya API Entry Point for "theMythOfCrawl Crawler".
- * Coordinates the Firefox Proxy-Injected Crawler Agent, the local loopback control plane,
- * static JS endpoint extraction, strict Excel API checklist verification, and UI tab.
+ * Coordinates the Firefox/Chrome Proxy-Injected Crawler Agent, the local loopback control plane,
+ * HTTP Header Filter, Extender -> Logger++ push ledger, static JS endpoint extraction, and audit UI tab.
  */
 public final class CrawlerExtension implements BurpExtension, ExtensionUnloadingHandler {
 
@@ -27,6 +28,7 @@ public final class CrawlerExtension implements BurpExtension, ExtensionUnloading
     private CrawlConfig config;
     private LocalControlServer controlServer;
     private StaticJsScanner jsScanner;
+    private ExtenderPushManager pushManager;
     private CrawlerTabPanel tabPanel;
 
     @Override
@@ -44,6 +46,8 @@ public final class CrawlerExtension implements BurpExtension, ExtensionUnloading
         } catch (Exception ex) {
             api.logging().logToError("[theMythOfCrawl] Could not load preferences: " + ex.getMessage());
         }
+        // Safe Permission Gate always starts locked unless user explicitly enables auto-requests
+        this.config.setAllowAutoRequests(false);
         CrawlState state = new CrawlState();
         ExcelSpecMatcher matcher = ExcelSpecMatcher.empty();
 
@@ -95,9 +99,26 @@ public final class CrawlerExtension implements BurpExtension, ExtensionUnloading
             api.proxy().registerRequestHandler(reqHandler);
             api.proxy().registerResponseHandler(respHandler);
 
+            this.pushManager = new ExtenderPushManager(
+                api,
+                config,
+                () -> {
+                    if (tabPanel != null) {
+                        tabPanel.onPushLedgerUpdated();
+                    }
+                },
+                msg -> {
+                    api.logging().logToOutput("[theMythOfCrawl] " + msg);
+                    if (tabPanel != null) {
+                        tabPanel.appendLog(msg);
+                    }
+                }
+            );
+            api.http().registerHttpHandler(this.pushManager);
+
             Runnable savePrefs = this::persistPreferences;
             Runnable initUi = () -> {
-                tabPanel = new CrawlerTabPanel(api, config, state, respHandler, matcher, savePrefs);
+                tabPanel = new CrawlerTabPanel(api, config, state, respHandler, pushManager, matcher, savePrefs);
                 api.userInterface().applyThemeToComponent(tabPanel);
                 api.userInterface().registerSuiteTab("theMythOfCrawl Crawler", tabPanel);
             };
@@ -139,6 +160,9 @@ public final class CrawlerExtension implements BurpExtension, ExtensionUnloading
     @Override
     public void extensionUnloaded() {
         persistPreferences();
+        if (pushManager != null) {
+            pushManager.requestCancel();
+        }
         if (tabPanel != null) {
             tabPanel.dispose();
         }

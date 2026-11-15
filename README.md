@@ -1,35 +1,33 @@
 # theMythOfCrawl Crawler (Burp Suite Java Extension)
 
-Burp Suite Montoya API extension (Java `--release 17`, không phụ thuộc thư viện ngoài, không AI) hỗ trợ auto-crawl website nhiều công nghệ qua **Firefox / Chrome / Chromium / Burp Built-in Browser** đi qua Burp Proxy, nhóm toàn bộ API theo từng thao tác UI (`Action Group`), tự động đánh **NOTE** khi phát hiện sai khác/lỗi, đối chiếu checklist **Excel (`.xlsx` / `.csv`)** và hỗ trợ cấu hình giá trị điền form linh hoạt.
+Burp Suite Montoya API extension (Java `--release 17`, không phụ thuộc thư viện ngoài, không AI) hỗ trợ audit & crawl website đa công nghệ qua **Firefox / Chrome / Chromium / Burp Built-in Browser** đi qua Burp Proxy, gom nhóm API theo từng thao tác UI (`Action Group`), tự động đánh **NOTE**, lọc/tùy chỉnh HTTP Header, và đẩy các API sạch có kiểm soát sang **Logger++ (Extender) -> Elasticsearch** mà không sửa đổi byte gói tin.
 
 ## Điểm nổi bật bản nâng cấp
 
-1. **Nhóm chức năng & Cột/Bảng NOTE Audit (`ActionGroupStore` + `AuditNote`):**
-   - Mỗi thao tác UI (nút bấm, link, tab, `<select>`, submit form, tìm kiếm, `page load`, scroll...) tạo thành một **Nhóm Chức Năng** với đường dẫn giữ nguyên hoa/thường theo cây màn hình (mặc định gốc `toppage > ...`, ví dụ: `toppage > contact > button 'Send'`; có thể chuyển sang `/` trong cài đặt).
-   - Toàn bộ API phát sinh khi bấm nút/chức năng đó (ví dụ 5 API liên tiếp) được gom chung vào nhóm; từng API con đều giữ **Tên API đúng bằng Tên Nhóm** để dễ audit ngược luồng màn hình.
-   - Tự động khử trùng các lần gọi giống hệt nhau trong cùng nhóm bằng bộ đếm `Hits`, đồng thời đánh **NOTE** và tổng hợp sang tab **Bảng NOTE** khi có:
-     - `Khác tham số` (cùng endpoint trong nhóm hoặc khác nhóm trước đó gửi bộ key tham số khác)
-     - `Khác HTTP status`, `HTTP 5xx`, `HTTP 4xx`, `401/403 Quyền/Phiên`
-     - `Ngoài Excel` (khi tắt Strict Excel Mode) hoặc `Nâng cấp bản Excel` (khi tìm thấy bộ tham số đầy đủ hơn, ví dụ 2 -> 8 params).
-   - Chuột phải trên nhóm hoặc API để **Send CẢ NHÓM sang Repeater** hoặc xem **Các nhóm cùng gọi API này**.
+1. **Giao diện tối ưu màn hình 14 inch & dịu mắt khi audit lâu (`AuditTheme` + `CrawlerTabPanel`):**
+   - **Thanh điều khiển chính 1 dòng gọn gàng:** chỉ giữ `Host(s)`, `Bắt đầu/Tạm dừng/Dừng`, nút gạt quyền **`🔒 Tự gửi Request`** và các chip thống kê bấm nhanh (`Nhóm`, `API`, `NOTE`, `Header`, `Excel`). Toàn bộ nút phụ (`Import Excel`, `Seed URL`, `Reset`, `Xuất báo cáo`, thanh tiến độ, checkbox chế độ) nằm trong ngăn kéo **`⚙ Công cụ & Excel ▼`** ẩn mặc định.
+   - **Loại bỏ mũi tên `< >` / `^ v` nhỏ xíu của Swing SplitPane:** thay bằng dải nút rõ nét **`◧ Ẩn/Hiện danh sách Nhóm`**, **`⬓ Hiện HTTP Req/Resp`**, **`⛶ Phóng to Bảng`**; khung soi HTTP Request/Response mặc định thu gọn để vùng bảng chiếm ~85–90% chiều cao màn hình 14" (double-click dòng hoặc bấm nút để mở soi ngay).
+   - **Bảng màu dịu mắt (`AuditTheme`):** Light Mode dùng nền cool-slate dịu (`#EEF2F7` / `#F5F7FA` / `#F7F9FC`) thay cho trắng gắt `#FFFFFF`, Dark Mode tối dịu cùng màu ngữ nghĩa (`ERROR`, `WARN`, `INFO`, `OK`) giúp nhìn lâu không mỏi mắt.
 
-2. **Giao diện Audit dịu mắt (`AuditTheme` + `CrawlerTabPanel`):**
-   - Tự thích ứng **Burp Dark Mode & Light Mode** với bảng màu ngữ nghĩa dịu mắt (`ERROR` đỏ dịu, `WARN` hổ phách, `INFO` xanh lam, `OK` xanh lá dịu), zebra striping và padding rộng rãi giúp audit lâu không mỏi mắt.
-   - Bố cục 6 tab rõ ràng: **Nhóm & API**, **Bảng NOTE**, **Tiến độ Excel**, **Cây Phân cấp**, **Điền Form & Cài Đặt**, **Bị né, JS & Log** cùng HTTP Request/Response Inspector ở nửa dưới.
+2. **Khóa an toàn "Tự gửi Request" (Mặc định ĐANG KHÓA):**
+   - Nút **`🔒 Tự gửi Request: ĐANG KHÓA`** luôn bật khóa khi khởi động.
+   - Khi đang khóa: extension **KHÔNG** tự fetch `/robots.txt` / `/sitemap.xml` từ Seed URL, **KHÔNG** tự click hay submit form trong trình duyệt, nhưng Browser Agent vẫn lắng nghe thao tác bấm tay thực tế của bạn (`event.isTrusted`) để gom nhóm API chuẩn xác theo từng nút/màn hình.
+   - Chỉ khi bạn bấm mở khóa **`🔓 Tự gửi Request: ĐANG BẬT`**, chế độ tự động duyệt trang/form mới thực thi.
 
-3. **Bao phủ đa công nghệ & Không bỏ sót luồng nghiệp vụ:**
-   - Hỗ trợ REST JSON (lồng nhau + mảng), GraphQL (tách riêng theo `operationName`), XML/SOAP (`xml.<tag>`), Multipart FormData, `application/x-www-form-urlencoded`, `navigator.sendBeacon`, `fetch` & `XMLHttpRequest`.
-   - Browser Agent (`crawler-agent.js`) chỉ chạy thực thi chủ động ở `top` window (chặn iframe quảng cáo/ngoài miền cướp phiên crawl), đồng thời hook & duyệt sâu vào **same-origin `iframe`**, **open Shadow DOM**, thay đổi `<select>`, hover menu/`aria-haspopup`, cuộn trang lazy-load, SPA `pushState`/hash routing và tương thích React `_valueTracker`.
-   - **Danger Guard tối giản**: mặc định chỉ né các hành động đăng xuất (`logout,log out,sign out,signout,đăng xuất`) để không bỏ sót các nút nghiệp vụ (xóa, thanh toán, lưu, xuất dữ liệu...) trừ khi bạn tự thêm từ khóa.
+3. **Đẩy sạch qua `Extender -> Logger++ -> Elasticsearch` (`PushLedgerPanel` + `ExtenderPushManager`):**
+   - Chuột phải trên **Nhóm**, **API**, **Bảng NOTE**, **Cây Phân cấp** hoặc bấm **`📤 + Hàng đẩy Logger++`** để đưa đúng các API cần thiết vào tab **Đẩy Logger++**.
+   - **Giữ nguyên 100% gói tin HTTP:** Không tiêm header giả để đặt tên; Tên Nhóm (`toppage > ...`) được gắn vào **Burp Annotations (Comment)** thông qua `HttpHandler` và lưu đồng bộ tại **Bảng Đối Chiếu (Push Ledger)** (có cột `#`, `Giờ Đẩy`, `Tên Nhóm`, `Method`, `Endpoint`, `HTTP Gốc`, `HTTP Đẩy`, nút **Copy Tên Nhóm** và **Xuất CSV đối chiếu**).
+   - **Cấu hình trên Logger++:** Tại mục **Log From**, bỏ tick **All Tools** và **Proxy**, chỉ tick **Extender** -> cấu hình **Elastic Exporter** (Host, Port, HTTPS, Index, Basic Auth Username/Password) rồi bật **Start Elastic Exporter** trong Logger++.
 
-4. **Tự điền Form, Ngày tháng & Bảng sửa được tùy biến (`FormFillProfile`):**
-   - Mặc định điền chuỗi **`TEXT`** vào toàn bộ ô văn bản, textarea, ô tìm kiếm, rich-text / `contenteditable` và ô bảng sửa được (`2026-01-01` cho trường ngày, v.v.).
-   - Tab **Điền Form & Cài Đặt** cho phép đổi nhanh toàn bộ trường text bằng 1 bấm, chỉnh từng loại trường riêng, hoặc viết quy tắc khớp theo `từ_khóa = giá_trị` và `/regex/ = giá_trị`.
-   - Cấu hình và Profile điền form tự động lưu qua **Burp Preferences** giữa các lần mở lại Burp.
+4. **Bộ lọc & Tùy chỉnh HTTP Header (`HeaderFilterPanel` + `HeaderFilterProfile`):**
+   - Hỗ trợ **Gắn / Ghi đè (`SET`)**, **Thêm nếu chưa có (`ADD_IF_MISSING`)** và **Xóa Header (`REMOVE`)** theo phạm vi tất cả Target Hosts (`*`), chuỗi con hoặc `/regex/` (ví dụ `X-Account: a`, `Authorization`, `Cookie`).
+   - Có nút mẫu nhanh (`+ Mẫu X-Account: a`, `+ Mẫu Authorization`), lưu qua **Burp Preferences**, mặc định áp dụng khi **Browser Crawl qua Proxy** và tắt khi **Đẩy qua Extender** để bảo toàn nguyên vẹn gói tin đẩy lên Elastic.
 
-5. **Nạp checklist Excel (`.xlsx` / `.csv`) & Xuất báo cáo:**
-   - Đọc trực tiếp file `.xlsx` nhiều sheet và ánh xạ 3 cột `STT`, `Method`, `Path API` qua hộp thoại xem trước.
-   - Xuất báo cáo **CSV (UTF-8 BOM)**, **JSON**, **Markdown** bao gồm cả danh sách **Nhóm & API**, **Bảng NOTE Audit** và **Tiến độ Excel**.
+5. **Nhóm chức năng & Cột/Bảng NOTE Audit (`ActionGroupStore` + `AuditNote`):**
+   - Gom chung toàn bộ API phát sinh khi bấm nút/chức năng vào một **Nhóm Chức Năng** giữ nguyên hoa/thường (`toppage > contact > button 'Send'` hoặc `/`), khử trùng theo `Hits` và đánh **NOTE** (`Khác tham số`, `Khác HTTP status`, `HTTP 5xx`, `HTTP 401/403`, `Ngoài Excel`, `Nâng cấp bản Excel`).
+
+6. **Bao phủ đa công nghệ, Tự điền Form (`TEXT`) & Checklist Excel:**
+   - Hỗ trợ REST JSON lồng nhau, GraphQL (`operationName`), XML/SOAP, Multipart, URLEncoded, `sendBeacon`, same-origin `iframe`, open Shadow DOM, SPA routing và tự điền Form mặc định `TEXT` có thể tùy biến quy tắc.
 
 ## Cấu trúc thư mục
 
@@ -37,7 +35,7 @@ Burp Suite Montoya API extension (Java `--release 17`, không phụ thuộc thư
 - `lib/montoya-api.jar` — PortSwigger Burp Montoya API (`2025.12`) phục vụ biên dịch.
 - `src/main/java/com/mythofcrawl/crawler/` — Mã nguồn Java (`CrawlerExtension`, `excel/`, `model/`, `proxy/`, `ui/`).
 - `src/main/resources/crawler-agent.js` — Browser Agent chạy qua Burp Proxy.
-- `src/test/java/com/mythofcrawl/crawler/CrawlerUnitTests.java` — Bộ unit test thuần Java.
+- `src/test/java/com/mythofcrawl/crawler/CrawlerUnitTests.java` — Bộ unit test thuần Java (11 nhóm kiểm thử).
 - `build.ps1` — Script biên dịch (`--release 17`), đóng gói `.jar` và chạy kiểm thử.
 
 ## Build từ mã nguồn (Windows PowerShell)
@@ -50,13 +48,13 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 File đầu ra nằm tại `dist\theMythOfCrawl-crawler.jar`.
 
-## Hướng dẫn sử dụng trong Burp Suite
+## Quy trình sử dụng nhanh trên Burp Suite
 
 1. Vào **Extensions > Installed > Add** -> chọn **Extension type: `Java`** -> chọn `dist\theMythOfCrawl-crawler.jar`.
 2. Mở tab **theMythOfCrawl Crawler**:
-   - (Tùy chọn) Bấm **Import Excel (.xlsx/.csv)** và ánh xạ 3 cột `STT`, `Method`, `Path API`. Có thể bỏ tick **Chỉ giữ Excel** ngay thanh công cụ nếu muốn thu thập & nhóm toàn bộ API kể cả ngoài Excel.
-   - Vào tab **Điền Form & Cài Đặt** nếu muốn đổi giá trị mặc định `"TEXT"`, quy tắc điền theo tên trường hoặc đổi gốc cây (`toppage` / `/`).
+   - (Tùy chọn) Mở tab **Bộ lọc Header HTTP** nếu cần gắn header như `X-Account: a` khi duyệt web.
+   - (Tùy chọn) Bấm **`⚙ Công cụ & Excel ▼`** để **Import Excel (.xlsx/.csv)** hoặc nhập **Seed URL**.
    - Nhập domain đích vào **Host(s)** (ví dụ `target.example.com` hoặc `*`).
-3. Trên trình duyệt đang trỏ qua Burp Proxy (Firefox, Chrome hoặc Burp Built-in Browser), mở trang đích và đăng nhập trước nếu cần.
-4. Bấm **Bắt đầu Crawl** trong Burp rồi Reload tab trình duyệt (hoặc điền sẵn **Seed URL**).
-5. Theo dõi **Nhóm & API**, **Bảng NOTE**, **Tiến độ Excel**, **Cây Phân cấp**; chuột phải gửi 1 API hoặc **cả nhóm API** sang Repeater, hoặc bấm **Xuất báo cáo ▼**.
+3. Để nguyên **`🔒 Tự gửi Request: ĐANG KHÓA`** nếu bạn muốn tự tay bấm các nút trên trình duyệt để gom nhóm API an toàn; hoặc bấm để chuyển sang **`🔓 ĐANG BẬT`** nếu muốn Agent tự duyệt.
+4. Bấm **Bắt đầu Crawl**, thao tác trên trình duyệt trỏ qua Burp Proxy.
+5. Audit tại tab **Nhóm & API**, **Bảng NOTE**, rồi chuột phải đưa các nhóm/API sạch sang tab **Đẩy Logger++** -> tick **Chỉ `Extender`** trong Logger++ -> bấm **Đẩy đã chọn sang Logger++** và dùng **Bảng Đối Chiếu (hoặc Export CSV)** để map 1-to-1 tên chức năng khi đẩy nhiều API lên Elastic.

@@ -681,8 +681,8 @@
     try {
       var state = await apiCall(CONTROL + "/state?url=" + encodeURIComponent(location.href));
       currentConfig = state;
-      if (state.status !== "RUNNING") {
-        updateBadge(state.status, "#475569");
+      if (state.status !== "RUNNING" || !state.allowAutoRequests) {
+        updateBadge(state.status === "RUNNING" ? "CHỜ CHO PHÉP (Thủ công)" : state.status, "#475569");
         return;
       }
 
@@ -716,8 +716,8 @@
       while (actionsDone < maxActions) {
         var freshState = await apiCall(CONTROL + "/state?url=" + encodeURIComponent(location.href));
         currentConfig = freshState;
-        if (freshState.status !== "RUNNING") {
-          updateBadge(freshState.status, "#b45309");
+        if (freshState.status !== "RUNNING" || !freshState.allowAutoRequests) {
+          updateBadge(!freshState.allowAutoRequests ? "ĐÃ KHÓA TỰ GỬI" : freshState.status, "#b45309");
           return;
         }
 
@@ -853,10 +853,103 @@
     }
   }
 
+  var trackedDocs = new WeakSet();
+  var lastManualPageUrl = "";
+  var lastManualActionAt = 0;
+
+  function findInteractiveAncestor(node) {
+    if (!node || node.nodeType !== 1) return null;
+    if (node.closest) {
+      if (node.closest("[data-myth-ui='1']")) return null;
+      var match = node.closest("button, a[href], a, select, input[type='submit'], input[type='button'], input[type='checkbox'], input[type='radio'], [role='button'], [role='tab'], [role='menuitem'], [role='link'], [data-myth-clickable='1'], form");
+      if (match) return match;
+    }
+    return node;
+  }
+
+  function postManualContext(el, evType, framePrefix) {
+    try {
+      if (!currentConfig || currentConfig.status === "STOPPED") return;
+      if (currentConfig.status === "RUNNING" && currentConfig.allowAutoRequests) return;
+      var now = Date.now();
+      if (now - lastManualActionAt < 80) return;
+      lastManualActionAt = now;
+
+      var targetEl = findInteractiveAncestor(el);
+      if (!targetEl) return;
+      var info = extractElementInfo(targetEl, 0, framePrefix || "");
+      var label = framePrefix ? ("[" + framePrefix + "] " + info.label) : info.label;
+      var kind = evType === "submit" ? "form" : (evType === "change" && info.tag === "select" ? "select" : info.kind);
+      var ap = formatActionPath(location.href, kind, label, currentConfig);
+      updateBadge("Thủ công: " + ap, "#0f766e");
+      var bodyStr = JSON.stringify({
+        actionPath: ap,
+        kind: kind,
+        label: label,
+        pageUrl: location.href
+      });
+      if (navigator.sendBeacon) {
+        try {
+          var blob = new Blob([bodyStr], { type: "application/json" });
+          navigator.sendBeacon(CONTROL + "/context", blob);
+          return;
+        } catch (ignored) {}
+      }
+      topFetch(CONTROL + "/context", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: bodyStr,
+        keepalive: true
+      }).catch(function () {});
+    } catch (e) {}
+  }
+
+  function installHumanContextTracker(doc, framePrefix) {
+    try {
+      if (!doc || trackedDocs.has(doc)) return;
+      trackedDocs.add(doc);
+      doc.addEventListener("pointerdown", function (ev) {
+        if (ev && ev.isTrusted) postManualContext(ev.target, "click", framePrefix);
+      }, true);
+      doc.addEventListener("submit", function (ev) {
+        if (ev && ev.isTrusted) postManualContext(ev.target, "submit", framePrefix);
+      }, true);
+      doc.addEventListener("change", function (ev) {
+        if (ev && ev.isTrusted && ev.target && (ev.target.tagName === "SELECT" || ev.target.type === "checkbox" || ev.target.type === "radio")) {
+          postManualContext(ev.target, "change", framePrefix);
+        }
+      }, true);
+      var frames = doc.querySelectorAll ? doc.querySelectorAll("iframe") : [];
+      for (var i = 0; i < frames.length; i++) {
+        try {
+          var idoc = frames[i].contentDocument;
+          if (idoc) {
+            hookWindowRuntime(frames[i].contentWindow);
+            installHumanContextTracker(idoc, "iframe#" + (i + 1));
+          }
+        } catch (e) {}
+      }
+    } catch (e) {}
+  }
+
   function handleStatePoll(st) {
     currentConfig = st;
-    if (st.status === "RUNNING") {
+    installHumanContextTracker(document, "");
+    if (st.status === "RUNNING" && st.allowAutoRequests) {
       runCrawlPass();
+    } else if (st.status === "RUNNING") {
+      if (lastManualPageUrl !== location.href) {
+        lastManualPageUrl = location.href;
+        var pageLoadPath = formatActionPath(location.href, "page load", "", st);
+        apiCall(CONTROL + "/context", "POST", {
+          actionPath: pageLoadPath,
+          kind: "page load",
+          label: "",
+          pageUrl: location.href
+        }).catch(function () {});
+      }
+      updateBadge("Thủ công (Chưa bật tự gửi): tự bấm trên trang", "#b45309");
     } else {
       updateBadge(st.status === "IDLE" ? "Sẵn sàng (chờ Start trên Burp)" : st.status, "#475569");
     }

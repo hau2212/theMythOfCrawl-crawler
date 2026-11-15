@@ -69,14 +69,20 @@ public final class ControlPlaneHandler implements ProxyRequestHandler {
                 }
             }
 
+            // Apply custom user HTTP Header Filter rules (e.g., X-Account: a) to target requests
+            HttpRequest modified = config.getHeaderFilterProfile()
+                .applyToMontoyaRequest(interceptedRequest, svc.host(), interceptedRequest.url(), false);
+
             // Ensure browser navigation HTML documents arrive uncompressed & fresh (no br/zstd/304)
             // whenever agent injection is enabled so both Chrome and Firefox get <script> reliably.
             boolean shouldInject = (st == CrawlState.Status.RUNNING) || (agentArmed && st != CrawlState.Status.STOPPED);
-            if (shouldInject && isDocumentNavigationRequest(interceptedRequest)) {
-                HttpRequest modified = interceptedRequest
+            if (shouldInject && isDocumentNavigationRequest(modified)) {
+                modified = modified
                     .withUpdatedHeader("Accept-Encoding", "identity")
                     .withRemovedHeader("If-None-Match")
                     .withRemovedHeader("If-Modified-Since");
+            }
+            if (modified != interceptedRequest) {
                 return ProxyRequestReceivedAction.continueWith(modified);
             }
         }
@@ -88,7 +94,7 @@ public final class ControlPlaneHandler implements ProxyRequestHandler {
         return ProxyRequestToBeSentAction.continueWith(interceptedRequest);
     }
 
-    private static boolean isDocumentNavigationRequest(InterceptedRequest req) {
+    private static boolean isDocumentNavigationRequest(HttpRequest req) {
         String secFetchDest = req.headerValue("Sec-Fetch-Dest");
         if (secFetchDest != null) {
             String d = secFetchDest.trim().toLowerCase();

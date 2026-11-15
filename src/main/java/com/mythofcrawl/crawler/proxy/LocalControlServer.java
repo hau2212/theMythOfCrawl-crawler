@@ -165,6 +165,7 @@ public final class LocalControlServer {
             String routeKey = CrawlState.routeKeyForUrl(pageUrl, config.isNormalizeRouteIds());
             Map<String, Object> resp = new LinkedHashMap<>();
             resp.put("status", state.getStatus().name());
+            resp.put("allowAutoRequests", config.isAllowAutoRequests());
             resp.put("actionWaitMs", config.getActionWaitMs());
             resp.put("maxActionsPerPage", config.getMaxActionsPerPage());
             resp.put("autoFillForms", config.isAutoFillForms());

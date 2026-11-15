@@ -66,14 +66,19 @@ public final class FormAndConfigPanel extends JPanel {
         this.logger = logger;
         this.onSaved = onSaved;
 
+        boolean dark = AuditTheme.isDark(null, this);
         setLayout(new BorderLayout(8, 8));
         setBorder(BorderFactory.createEmptyBorder(6, 6, 6, 6));
+        setBackground(AuditTheme.canvasSurface(dark));
 
-        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, buildFormFillPane(), buildCrawlConfigPane());
+        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, buildFormFillPane(dark), buildCrawlConfigPane(dark));
         split.setResizeWeight(0.52);
+        split.setOneTouchExpandable(false);
+        split.setBackground(AuditTheme.canvasSurface(dark));
         add(split, BorderLayout.CENTER);
 
         JPanel footer = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 4));
+        AuditTheme.styleActionCard(footer, dark);
         JButton btnRestoreForm = new JButton("Khôi phục Form về TEXT");
         btnRestoreForm.addActionListener(e -> {
             config.getFormFillProfile().resetDefaults();
@@ -100,8 +105,9 @@ public final class FormAndConfigPanel extends JPanel {
         syncFromConfig();
     }
 
-    private JScrollPane buildFormFillPane() {
+    private JScrollPane buildFormFillPane(boolean dark) {
         JPanel p = new JPanel(new GridBagLayout());
+        p.setBackground(AuditTheme.panelSurface(dark));
         p.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
         GridBagConstraints gc = new GridBagConstraints();
         gc.insets = new Insets(3, 4, 3, 4);
@@ -110,6 +116,7 @@ public final class FormAndConfigPanel extends JPanel {
 
         // Quick-set bar for changing all free-text fields at once (default: TEXT)
         JPanel quickBar = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
+        quickBar.setBackground(AuditTheme.cardSurface(dark));
         quickBar.setBorder(BorderFactory.createTitledBorder("Đổi nhanh chữ cho mọi ô TEXT / Textarea / Search / Bảng"));
         JButton btnQuickApply = new JButton("Áp dụng cho tất cả ô chữ");
         btnQuickApply.addActionListener(e -> {
@@ -158,18 +165,22 @@ public final class FormAndConfigPanel extends JPanel {
 
         gc.gridy = r++; gc.weighty = 1.0; gc.fill = GridBagConstraints.BOTH;
         txtCustomRules.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+        txtCustomRules.setBackground(AuditTheme.tableSurface(dark));
+        txtCustomRules.setForeground(AuditTheme.textPrimary(dark));
         JScrollPane ruleScroll = new JScrollPane(txtCustomRules);
         ruleScroll.setPreferredSize(new java.awt.Dimension(320, 120));
         p.add(ruleScroll, gc);
 
         JScrollPane sp = new JScrollPane(p);
+        sp.getViewport().setBackground(AuditTheme.panelSurface(dark));
         sp.setBorder(BorderFactory.createTitledBorder("Cấu hình Tự Điền Form, Ngày Tháng & Bảng (mặc định: TEXT)"));
         sp.getVerticalScrollBar().setUnitIncrement(16);
         return sp;
     }
 
-    private JScrollPane buildCrawlConfigPane() {
+    private JScrollPane buildCrawlConfigPane(boolean dark) {
         JPanel p = new JPanel(new GridBagLayout());
+        p.setBackground(AuditTheme.panelSurface(dark));
         p.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
         GridBagConstraints gc = new GridBagConstraints();
         gc.insets = new Insets(3, 4, 3, 4);
@@ -214,6 +225,7 @@ public final class FormAndConfigPanel extends JPanel {
         p.add(new JLabel(" "), gc);
 
         JScrollPane sp = new JScrollPane(p);
+        sp.getViewport().setBackground(AuditTheme.panelSurface(dark));
         sp.setBorder(BorderFactory.createTitledBorder("Cài đặt Crawl Toàn Diện & Bảo Vệ Phiên"));
         sp.getVerticalScrollBar().setUnitIncrement(16);
         return sp;

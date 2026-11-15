@@ -19,7 +19,10 @@ import com.mythofcrawl.crawler.model.AuditNote;
 import com.mythofcrawl.crawler.model.CapturedApiEntry;
 import com.mythofcrawl.crawler.model.CrawlConfig;
 import com.mythofcrawl.crawler.model.CrawlState;
+import com.mythofcrawl.crawler.model.ExtenderPushEntry;
 import com.mythofcrawl.crawler.model.FormFillProfile;
+import com.mythofcrawl.crawler.model.HeaderFilterProfile;
+import com.mythofcrawl.crawler.proxy.ExtenderPushManager;
 import com.mythofcrawl.crawler.proxy.HtmlAgentInjector;
 import com.mythofcrawl.crawler.proxy.SeedDiscoveryHelper;
 
@@ -43,6 +46,7 @@ import javax.swing.JTabbedPane;
 import javax.swing.JTable;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
+import javax.swing.JToggleButton;
 import javax.swing.JTree;
 import javax.swing.ListSelectionModel;
 import javax.swing.SwingUtilities;
@@ -59,6 +63,7 @@ import javax.swing.tree.TreePath;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Component;
+import java.awt.Cursor;
 import java.awt.Desktop;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
@@ -84,18 +89,30 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Eye-friendly Burp Suite Audit UI for "theMythOfCrawl Crawler":
- * - Groups every triggered API under its UI action group ("toppage > contact > button 'Send'"),
- *   preserving the group name on every API inside it and highlighting anomalies via Audit NOTEs.
- * - Dedicated tabs for Groups & APIs, Consolidated NOTE Table, Excel STT Coverage,
- *   Hierarchy Tree, Configurable Form Auto-Fill ("TEXT") & Engine Settings, and Aux/Logs.
+ * Eye-friendly Burp Suite Audit UI optimized for 14-inch screens:
+ * - Slim 1-row primary control bar with explicit Request-Sending Lock ("Tự gửi Request")
+ *   and collapsible secondary tools/Excel drawer (hidden by default).
+ * - Replaces tiny Swing SplitPane < > arrows with explicit labeled toggle pills so main tables
+ *   can occupy up to ~90% of the screen, with bottom Req/Resp inspector collapsed by default.
+ * - Integrates Extender -> Logger++ -> Elasticsearch Push Ledger (zero wire packet edits)
+ *   and Custom HTTP Header Filter/Modifier (e.g. X-Account: a).
  */
 public final class CrawlerTabPanel extends JPanel {
+
+    private static final int TAB_GROUPS = 0;
+    private static final int TAB_NOTES = 1;
+    private static final int TAB_PUSH = 2;
+    private static final int TAB_HEADERS = 3;
+    private static final int TAB_COVERAGE = 4;
+    private static final int TAB_TREE = 5;
+    private static final int TAB_FORM_CONFIG = 6;
+    private static final int TAB_AUX = 7;
 
     private final MontoyaApi api;
     private final CrawlConfig config;
     private final CrawlState state;
     private final HtmlAgentInjector injector;
+    private final ExtenderPushManager pushManager;
     private final Runnable onPersistConfig;
     private volatile ExcelSpecMatcher matcher;
 
@@ -103,31 +120,50 @@ public final class CrawlerTabPanel extends JPanel {
     private final Timer refreshTimer;
     private File lastDirectory;
 
-    // Top Row 1: Primary Workflow Controls
-    private final JLabel lblExcelStatus = new JLabel("Chưa nạp Excel");
-    private final JTextField txtHosts = new JTextField(16);
-    private final JTextField txtSeedUrl = new JTextField(18);
+    // Top Row (Always visible slim control bar)
+    private final JTextField txtHosts = new JTextField(14);
     private final JButton btnStart = new JButton("Bắt đầu Crawl");
     private final JButton btnPause = new JButton("Tạm dừng");
     private final JButton btnStop = new JButton("Dừng");
+    private final JToggleButton btnAllowAuto = new JToggleButton();
+    private final JToggleButton btnToggleDrawer = new JToggleButton("⚙ Công cụ & Excel ▼");
 
-    // Top Row 2: Quick Toggles & Calm Stat Chips
+    // Calm clickable/compact stat chips on primary bar
+    private final JLabel chipGroups = new JLabel("Nhóm: 0");
+    private final JLabel chipApis = new JLabel("API: 0");
+    private final JLabel chipNotes = new JLabel("NOTE: 0");
+    private final JLabel chipHeaders = new JLabel("Header: Tắt");
+    private final JLabel chipExcel = new JLabel("Excel: 0/0");
+
+    // Collapsible Secondary Drawer (hidden by default on 14" laptop)
+    private final JPanel pnlSecondaryDrawer = new JPanel(new BorderLayout(4, 4));
+    private final JLabel lblExcelStatus = new JLabel("Chưa nạp Excel");
+    private final JTextField txtSeedUrl = new JTextField(18);
     private final JCheckBox chkArmAgent = new JCheckBox("Bơm Agent", true);
     private final JCheckBox chkPassive = new JCheckBox("Bắt thụ động", false);
     private final JCheckBox chkStrictQuick = new JCheckBox("Chỉ giữ Excel", true);
     private final JProgressBar progressBar = new JProgressBar(0, 100);
-    private final JLabel chipGroups = new JLabel("Nhóm: 0");
-    private final JLabel chipApis = new JLabel("API: 0");
-    private final JLabel chipNotes = new JLabel("NOTE: 0");
-    private final JLabel chipExcel = new JLabel("Excel: 0/0");
     private final JLabel chipPages = new JLabel("Trang: 0 | Q: 0");
-
-    // Top Row 3: Live Crawl & Form Profile Strip
-    private final JLabel lblCurrentAction = new JLabel(
-        "Sẵn sàng - Nhập Host(s), mở Firefox/Chrome qua Burp Proxy rồi bấm Bắt đầu Crawl.");
     private final JLabel lblFormSummary = new JLabel();
 
-    // Main Tabs
+    // Explicit Panel Toggle Strip (eliminating tiny < > arrows)
+    private final JToggleButton btnToggleGroupsPane = new JToggleButton("◧ Ẩn danh sách Nhóm");
+    private final JToggleButton btnToggleInspector = new JToggleButton("⬓ Hiện HTTP Req/Resp");
+    private final JToggleButton btnMaximizeTables = new JToggleButton("⛶ Phóng to Bảng");
+    private final JLabel lblCurrentAction = new JLabel(
+        "Sẵn sàng [Khóa tự gửi] - Nhập Host(s), thao tác trình duyệt qua Proxy hoặc bấm Bắt đầu.");
+
+    // Split Panes & Layout state
+    private JSplitPane mainSplitPane;
+    private JSplitPane groupsSplitPane;
+    private JPanel leftGroupsPanel;
+    private JPanel inspectorPanel;
+    private boolean groupsPaneVisible = true;
+    private boolean inspectorVisible = false;
+    private double lastGroupsDividerRatio = 0.36;
+    private double lastInspectorDividerRatio = 0.58;
+
+    // Main Tabs & Aux Tabs
     private final JTabbedPane mainTabs = new JTabbedPane();
     private final JTabbedPane auxTabs = new JTabbedPane();
 
@@ -136,38 +172,44 @@ public final class CrawlerTabPanel extends JPanel {
     private final JTable tblGroups;
     private final JComboBox<String> cbGroupFilter = new JComboBox<>(
         new String[]{"Có API (>0)", "Tất cả nhóm", "Có NOTE (!)"});
-    private final JTextField txtGroupSearch = new JTextField(14);
+    private final JTextField txtGroupSearch = new JTextField(12);
 
     private final GroupTableModel.GroupApisModel groupApisModel;
     private final JTable tblGroupApis;
     private final JLabel lblGroupHeader = new JLabel("Tất cả API đã nhóm");
     private final JCheckBox chkAllApisWhenUnselected = new JCheckBox("Hiện tất cả khi chưa chọn nhóm", true);
     private final JCheckBox chkOnlyApiNotes = new JCheckBox("Chỉ hiện NOTE", false);
-    private final JTextField txtApiSearch = new JTextField(16);
+    private final JTextField txtApiSearch = new JTextField(14);
 
     // Tab 1: Consolidated Audit NOTEs Table
     private final GroupTableModel.AuditNotesTableModel notesModel;
     private final JTable tblNotes;
     private final JComboBox<String> cbNoteSeverity = new JComboBox<>(
         new String[]{"Tất cả (ALL)", "Lỗi (ERROR)", "Cảnh báo (WARN)", "Thông tin (INFO)"});
-    private final JTextField txtNoteSearch = new JTextField(20);
+    private final JTextField txtNoteSearch = new JTextField(18);
 
-    // Tab 2: Excel Checklist Coverage
+    // Tab 2: Push Logger++ -> Elastic Ledger
+    private PushLedgerPanel pushLedgerPanel;
+
+    // Tab 3: Custom HTTP Header Filter
+    private HeaderFilterPanel headerFilterPanel;
+
+    // Tab 4: Excel Checklist Coverage
     private final CoverageTableModel coverageModel = new CoverageTableModel();
     private final JTable tblCoverage = new JTable(coverageModel);
     private final JComboBox<String> cbStatusFilter = new JComboBox<>(
         new String[]{"Tất cả (ALL)", "Đã lấy (MATCHED)", "Còn thiếu (MISSING)", "Có NOTE (!)"});
-    private final JTextField txtSearch = new JTextField(20);
+    private final JTextField txtSearch = new JTextField(18);
 
-    // Tab 3: Hierarchy Tree
+    // Tab 5: Hierarchy Tree
     private final DefaultMutableTreeNode treeRoot;
     private final DefaultTreeModel treeModel;
     private final JTree actionTree;
 
-    // Tab 4: Form Auto-Fill & Config
+    // Tab 6: Form Auto-Fill & Config
     private FormAndConfigPanel formConfigPanel;
 
-    // Tab 5: Skipped, JS Hints, Extras, Log
+    // Tab 7: Skipped, JS Hints, Extras, Log
     private final CoverageTableModel.ExtraCaptureTableModel extraModel =
         new CoverageTableModel.ExtraCaptureTableModel();
     private final JTable tblExtras = new JTable(extraModel);
@@ -180,9 +222,10 @@ public final class CrawlerTabPanel extends JPanel {
 
     // Bottom Inspector
     private final JLabel lblSelectedSummary = new JLabel(
-        "Chọn một API, NOTE hoặc lá cây để xem chi tiết Request / Response và Tên Nhóm");
+        "Chọn một API, NOTE hoặc lá cây (double-click hoặc bấm 'Hiện HTTP Req/Resp' để soi gói tin)");
     private final JComboBox<VariantItem> cbVariant = new JComboBox<>();
     private final JButton btnShowShared = new JButton("Nhóm dùng chung");
+    private final JButton btnQueueInspector = new JButton("📤 + Hàng đẩy Logger++");
     private final JButton btnSendRepeater = new JButton("Send to Repeater");
     private final JTextArea txtNotesBanner = new JTextArea(2, 40);
     private final HttpRequestEditor requestEditor;
@@ -203,7 +246,7 @@ public final class CrawlerTabPanel extends JPanel {
         HtmlAgentInjector injector,
         ExcelSpecMatcher initialMatcher
     ) {
-        this(api, config, state, injector, initialMatcher, null);
+        this(api, config, state, injector, null, initialMatcher, null);
     }
 
     public CrawlerTabPanel(
@@ -214,12 +257,27 @@ public final class CrawlerTabPanel extends JPanel {
         ExcelSpecMatcher initialMatcher,
         Runnable onPersistConfig
     ) {
+        this(api, config, state, injector, null, initialMatcher, onPersistConfig);
+    }
+
+    public CrawlerTabPanel(
+        MontoyaApi api,
+        CrawlConfig config,
+        CrawlState state,
+        HtmlAgentInjector injector,
+        ExtenderPushManager pushManager,
+        ExcelSpecMatcher initialMatcher,
+        Runnable onPersistConfig
+    ) {
         this.api = api;
         this.config = config;
         this.state = state;
         this.injector = injector;
         this.onPersistConfig = onPersistConfig;
         this.matcher = initialMatcher != null ? initialMatcher : ExcelSpecMatcher.empty();
+        this.pushManager = pushManager != null
+            ? pushManager
+            : new ExtenderPushManager(api, config, this::onPushLedgerUpdated, this::appendLog);
 
         ActionGroupStore store = state.getActionGroups();
         this.groupsModel = new GroupTableModel.ActionGroupsModel(store);
@@ -238,12 +296,18 @@ public final class CrawlerTabPanel extends JPanel {
         this.responseEditor = api != null
             ? api.userInterface().createHttpResponseEditor(EditorOptions.READ_ONLY) : null;
 
-        setLayout(new BorderLayout(6, 6));
-        setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
+        boolean dark = AuditTheme.isDark(api, this);
+        setLayout(new BorderLayout(4, 4));
+        setBorder(BorderFactory.createEmptyBorder(5, 6, 5, 6));
+        setBackground(AuditTheme.canvasSurface(dark));
 
         syncQuickCheckboxesFromConfig();
         add(buildHeaderPanel(), BorderLayout.NORTH);
-        add(buildMainSplitPane(), BorderLayout.CENTER);
+        add(buildWorkspaceArea(), BorderLayout.CENTER);
+
+        // Start Inspector collapsed & Drawer hidden for max 14" workspace
+        setSecondaryDrawerVisible(false);
+        setInspectorVisible(false);
 
         this.refreshTimer = new Timer(400, e -> {
             if (refreshPending.getAndSet(false)
@@ -256,9 +320,9 @@ public final class CrawlerTabPanel extends JPanel {
 
         refreshButtonsState();
         refreshAllViewsNow();
-        appendLog("theMythOfCrawl Audit Crawler sẵn sàng. Mặc định điền form: \""
-            + config.getFormFillProfile().get(FormFillProfile.Field.TEXT)
-            + "\" | Gốc cây: \"" + config.getRouteRootLabel() + "\".");
+        appendLog("theMythOfCrawl Crawler sẵn sàng [Giao diện tối ưu 14\" | Tự gửi Request: "
+            + (config.isAllowAutoRequests() ? "ĐANG BẬT" : "ĐANG KHÓA")
+            + "]. Form TEXT: \"" + config.getFormFillProfile().get(FormFillProfile.Field.TEXT) + "\".");
     }
 
     public void dispose() {
@@ -269,6 +333,20 @@ public final class CrawlerTabPanel extends JPanel {
 
     public void scheduleUiRefresh() {
         refreshPending.set(true);
+    }
+
+    public void onPushLedgerUpdated() {
+        Runnable task = () -> {
+            if (pushLedgerPanel != null) {
+                pushLedgerPanel.refreshView();
+            }
+            refreshPushAndHeaderTitles();
+        };
+        if (SwingUtilities.isEventDispatchThread()) {
+            task.run();
+        } else {
+            SwingUtilities.invokeLater(task);
+        }
     }
 
     public void appendLog(String msg) {
@@ -299,10 +377,16 @@ public final class CrawlerTabPanel extends JPanel {
         try {
             chkPassive.setSelected(injector != null && injector.isPassiveCapture());
             chkStrictQuick.setSelected(config.isStrictExcelOnly());
+            btnAllowAuto.setSelected(config.isAllowAutoRequests());
+            updateAllowAutoButtonStyle();
             if (formConfigPanel != null) {
                 formConfigPanel.syncFromConfig();
             }
+            if (headerFilterPanel != null) {
+                headerFilterPanel.syncFromConfig();
+            }
             refreshFormSummaryLabel();
+            refreshPushAndHeaderTitles();
         } finally {
             syncingQuickControls = false;
         }
@@ -325,71 +409,143 @@ public final class CrawlerTabPanel extends JPanel {
         lblFormSummary.setForeground(AuditTheme.accentForeground(dark));
     }
 
+    private void updateAllowAutoButtonStyle() {
+        boolean dark = AuditTheme.isDark(api, this);
+        boolean allowed = config.isAllowAutoRequests();
+        btnAllowAuto.setSelected(allowed);
+        if (allowed) {
+            btnAllowAuto.setText("🔓 Tự gửi Request: ĐANG BẬT");
+            btnAllowAuto.setToolTipText(
+                "ĐANG BẬT: Cho phép Agent tự click/nộp form trên trình duyệt và tự fetch Seed URL (/robots.txt, /sitemap.xml). Bấm để KHÓA lại.");
+            AuditTheme.styleTogglePill(btnAllowAuto, true, AuditTheme.okForeground(dark), dark);
+        } else {
+            btnAllowAuto.setText("🔒 Tự gửi Request: ĐANG KHÓA");
+            btnAllowAuto.setToolTipText(
+                "CHẾ ĐỘ AN TOÀN: Không tự click, không tự submit form, không tự fetch Seed. Chỉ ghi nhận & gom nhóm khi BẠN bấm trên trình duyệt. Bấm để cho phép.");
+            AuditTheme.styleTogglePill(
+                btnAllowAuto, true, AuditTheme.severityForeground(AuditNote.Severity.WARN, dark), dark);
+        }
+    }
+
     // =========================================================================
-    // Header / Toolbar
+    // Compact 1-Row Primary Header + Collapsible Tools/Excel Drawer
     // =========================================================================
 
     private JPanel buildHeaderPanel() {
         boolean dark = AuditTheme.isDark(api, this);
         JPanel container = new JPanel(new BorderLayout(4, 4));
+        container.setOpaque(false);
 
-        // Row 1: Primary workflow controls
+        // Row 1: Single slim always-visible bar
         JPanel row1 = new JPanel(new GridBagLayout());
-        row1.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createEtchedBorder(),
-            BorderFactory.createEmptyBorder(6, 8, 6, 8)));
+        AuditTheme.styleActionCard(row1, dark);
+
         GridBagConstraints gbc = new GridBagConstraints();
-        gbc.insets = new Insets(2, 4, 2, 4);
+        gbc.insets = new Insets(1, 3, 1, 3);
         gbc.anchor = GridBagConstraints.WEST;
         gbc.fill = GridBagConstraints.HORIZONTAL;
 
-        JButton btnImport = new JButton("Import Excel (.xlsx/.csv)");
-        btnImport.setToolTipText("Nạp danh sách API chuẩn gồm cột STT, Method, Path API");
-        btnImport.addActionListener(e -> onImportExcel());
-
-        lblExcelStatus.setForeground(AuditTheme.mutedForeground(dark));
-        lblExcelStatus.setToolTipText("Trạng thái file Excel checklist");
-
-        txtHosts.setToolTipText("Ví dụ: app.example.com,api.example.com (hoặc * để bắt mọi host)");
+        txtHosts.setToolTipText("Target Host(s): ví dụ app.example.com,api.example.com (hoặc * để bắt mọi host)");
         txtHosts.setText(config.getAllowedHostsCsv());
-
-        txtSeedUrl.setToolTipText("URL trang chủ để pre-crawl & quét JS (không bắt buộc)");
 
         btnStart.setFont(btnStart.getFont().deriveFont(Font.BOLD));
         btnStart.addActionListener(e -> onStartCrawl());
         btnPause.addActionListener(e -> onTogglePause());
         btnStop.addActionListener(e -> onStopCrawl());
 
-        JButton btnReset = new JButton("Reset");
-        btnReset.setToolTipText("Xóa kết quả crawl hiện tại (giữ lại danh sách Excel & cài đặt)");
+        btnAllowAuto.addActionListener(e -> {
+            if (!syncingQuickControls) {
+                boolean enabled = btnAllowAuto.isSelected();
+                config.setAllowAutoRequests(enabled);
+                updateAllowAutoButtonStyle();
+                appendLog(enabled
+                    ? "ĐÃ BẬT 'Tự gửi Request': Agent được phép tự duyệt & gửi seed request khi Crawl RUNNING."
+                    : "ĐÃ KHÓA 'Tự gửi Request': Tạm dừng mọi thao tác tự động — chỉ ghi nhận & gom nhóm từ tương tác tay của bạn.");
+                if (enabled && state.getStatus() == CrawlState.Status.RUNNING) {
+                    String seed = txtSeedUrl.getText().trim();
+                    if (!seed.isEmpty() && api != null) {
+                        if (!seed.startsWith("http://") && !seed.startsWith("https://")) {
+                            seed = "https://" + seed;
+                            txtSeedUrl.setText(seed);
+                        }
+                        SeedDiscoveryHelper.fetchSeedsAsync(api, seed, config, state, this::appendLog);
+                    }
+                }
+            }
+        });
+        updateAllowAutoButtonStyle();
+
+        // Clickable compact chips
+        JPanel chipsBar = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
+        chipsBar.setOpaque(false);
+        makeChipJumpable(chipGroups, TAB_GROUPS, "Xem tab Nhóm & API");
+        makeChipJumpable(chipApis, TAB_GROUPS, "Xem danh sách API đã nhóm");
+        makeChipJumpable(chipNotes, TAB_NOTES, "Mở Bảng NOTE kiểm tra bất thường");
+        makeChipJumpable(chipHeaders, TAB_HEADERS, "Mở Bộ lọc & Tùy chỉnh HTTP Header");
+        makeChipJumpable(chipExcel, TAB_COVERAGE, "Mở Tiến độ Excel Checklist");
+        chipsBar.add(chipGroups);
+        chipsBar.add(chipApis);
+        chipsBar.add(chipNotes);
+        chipsBar.add(chipHeaders);
+        chipsBar.add(chipExcel);
+
+        btnToggleDrawer.addActionListener(e -> setSecondaryDrawerVisible(btnToggleDrawer.isSelected()));
+        AuditTheme.styleTogglePill(btnToggleDrawer, false, AuditTheme.accentForeground(dark), dark);
+
+        int x = 0;
+        gbc.gridx = x++; gbc.gridy = 0; gbc.weightx = 0; row1.add(new JLabel("Host(s):"), gbc);
+        gbc.gridx = x++; gbc.weightx = 1.0; row1.add(txtHosts, gbc);
+        gbc.gridx = x++; gbc.weightx = 0; row1.add(btnStart, gbc);
+        gbc.gridx = x++; gbc.weightx = 0; row1.add(btnPause, gbc);
+        gbc.gridx = x++; gbc.weightx = 0; row1.add(btnStop, gbc);
+        gbc.gridx = x++; gbc.weightx = 0; row1.add(btnAllowAuto, gbc);
+        gbc.gridx = x++; gbc.weightx = 0; row1.add(chipsBar, gbc);
+        gbc.gridx = x;   gbc.weightx = 0; row1.add(btnToggleDrawer, gbc);
+
+        // Collapsible Secondary Drawer (Import Excel, Seed URL, Agent Toggles, Reset, Export, Progress)
+        pnlSecondaryDrawer.setOpaque(true);
+        AuditTheme.styleActionCard(pnlSecondaryDrawer, dark);
+
+        JPanel drawerRowA = new JPanel(new GridBagLayout());
+        drawerRowA.setOpaque(false);
+        GridBagConstraints da = new GridBagConstraints();
+        da.insets = new Insets(2, 4, 2, 4);
+        da.anchor = GridBagConstraints.WEST;
+        da.fill = GridBagConstraints.HORIZONTAL;
+
+        JButton btnImport = new JButton("Import Excel (.xlsx/.csv)");
+        btnImport.setToolTipText("Nạp danh sách API chuẩn gồm cột STT, Method, Path API");
+        btnImport.addActionListener(e -> onImportExcel());
+        lblExcelStatus.setForeground(AuditTheme.mutedForeground(dark));
+        txtSeedUrl.setToolTipText("URL trang chủ để quét sitemap/robots khi 'Tự gửi Request' được BẬT");
+
+        JButton btnReset = new JButton("Reset kết quả");
+        btnReset.setToolTipText("Xóa kết quả crawl hiện tại (giữ lại Excel & cấu hình Form/Header)");
         btnReset.addActionListener(e -> onResetCaptures());
 
         JButton btnExport = new JButton("Xuất báo cáo ▼");
         btnExport.addActionListener(e -> showExportMenu(btnExport));
 
-        int x = 0;
-        gbc.gridx = x++; gbc.gridy = 0; gbc.weightx = 0; row1.add(btnImport, gbc);
-        gbc.gridx = x++; gbc.weightx = 0; row1.add(lblExcelStatus, gbc);
-        gbc.gridx = x++; gbc.weightx = 0; row1.add(new JLabel("Host(s):"), gbc);
-        gbc.gridx = x++; gbc.weightx = 0.45; row1.add(txtHosts, gbc);
-        gbc.gridx = x++; gbc.weightx = 0; row1.add(new JLabel("Seed URL:"), gbc);
-        gbc.gridx = x++; gbc.weightx = 0.55; row1.add(txtSeedUrl, gbc);
-        gbc.gridx = x++; gbc.weightx = 0; row1.add(btnStart, gbc);
-        gbc.gridx = x++; gbc.weightx = 0; row1.add(btnPause, gbc);
-        gbc.gridx = x++; gbc.weightx = 0; row1.add(btnStop, gbc);
-        gbc.gridx = x++; gbc.weightx = 0; row1.add(btnReset, gbc);
-        gbc.gridx = x;   gbc.weightx = 0; row1.add(btnExport, gbc);
+        int dx = 0;
+        da.gridx = dx++; da.gridy = 0; da.weightx = 0; drawerRowA.add(btnImport, da);
+        da.gridx = dx++; da.weightx = 0; drawerRowA.add(lblExcelStatus, da);
+        da.gridx = dx++; da.weightx = 0; drawerRowA.add(new JLabel("Seed URL:"), da);
+        da.gridx = dx++; da.weightx = 1.0; drawerRowA.add(txtSeedUrl, da);
+        da.gridx = dx++; da.weightx = 0; drawerRowA.add(btnReset, da);
+        da.gridx = dx;   da.weightx = 0; drawerRowA.add(btnExport, da);
 
-        // Row 2: Quick toggles & Stat Chips
-        JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 3));
+        JPanel drawerRowB = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 2));
+        drawerRowB.setOpaque(false);
+        chkArmAgent.setOpaque(false);
         chkArmAgent.addActionListener(e -> {
             if (injector != null) {
                 injector.setAgentArmed(chkArmAgent.isSelected());
                 appendLog(chkArmAgent.isSelected()
-                    ? "Đã BẬT bơm Agent auto-crawl vào trình duyệt."
-                    : "Đã TẮT bơm Agent (chỉ nghe traffic).");
+                    ? "Đã BẬT bơm Agent vào trình duyệt (ghi nhận Action Path khi click/auto-crawl)."
+                    : "Đã TẮT bơm Agent (chỉ nghe HTTP traffic).");
             }
         });
+        chkPassive.setOpaque(false);
         chkPassive.addActionListener(e -> {
             if (!syncingQuickControls) {
                 boolean passive = chkPassive.isSelected();
@@ -398,9 +554,10 @@ public final class CrawlerTabPanel extends JPanel {
                 }
                 appendLog(passive
                     ? "Chế độ BẮT THỤ ĐỘNG: chỉ ghi nhận traffic, tạm tắt bơm Agent."
-                    : "Chế độ CHỦ ĐỘNG: Agent tự duyệt toàn bộ trang & form.");
+                    : "Chế độ CHỦ ĐỘNG: Agent hỗ trợ gom nhóm & tự duyệt (nếu Tự gửi Request được BẬT).");
             }
         });
+        chkStrictQuick.setOpaque(false);
         chkStrictQuick.setToolTipText("Khi tắt: lưu mọi API vào Nhóm & đánh NOTE 'Ngoài Excel'. Khi bật: chỉ giữ API khớp Excel.");
         chkStrictQuick.addActionListener(e -> {
             if (!syncingQuickControls) {
@@ -413,67 +570,239 @@ public final class CrawlerTabPanel extends JPanel {
         });
 
         JButton btnFormConfig = new JButton("Form (TEXT) & Cài đặt ↗");
-        btnFormConfig.addActionListener(e -> mainTabs.setSelectedIndex(4));
+        btnFormConfig.addActionListener(e -> mainTabs.setSelectedIndex(TAB_FORM_CONFIG));
 
-        progressBar.setPreferredSize(new Dimension(110, 20));
+        progressBar.setPreferredSize(new Dimension(115, 20));
         progressBar.setStringPainted(true);
         progressBar.setString("0%");
 
-        row2.add(chkArmAgent);
-        row2.add(chkPassive);
-        row2.add(chkStrictQuick);
-        row2.add(btnFormConfig);
-        row2.add(Box.createHorizontalStrut(4));
-        row2.add(progressBar);
-        row2.add(chipGroups);
-        row2.add(chipApis);
-        row2.add(chipNotes);
-        row2.add(chipExcel);
-        row2.add(chipPages);
+        drawerRowB.add(chkArmAgent);
+        drawerRowB.add(chkPassive);
+        drawerRowB.add(chkStrictQuick);
+        drawerRowB.add(btnFormConfig);
+        drawerRowB.add(Box.createHorizontalStrut(4));
+        drawerRowB.add(progressBar);
+        drawerRowB.add(chipPages);
+        drawerRowB.add(Box.createHorizontalStrut(6));
+        drawerRowB.add(lblFormSummary);
 
-        // Row 3: Live status strip
-        JPanel row3 = new JPanel(new BorderLayout(8, 0));
-        row3.setBorder(BorderFactory.createEmptyBorder(0, 6, 2, 6));
-        lblCurrentAction.setForeground(AuditTheme.accentForeground(dark));
-        lblCurrentAction.setFont(lblCurrentAction.getFont().deriveFont(Font.BOLD));
-        row3.add(lblCurrentAction, BorderLayout.CENTER);
-        row3.add(lblFormSummary, BorderLayout.EAST);
-
-        JPanel centerWrap = new JPanel(new BorderLayout(2, 2));
-        centerWrap.add(row2, BorderLayout.NORTH);
-        centerWrap.add(row3, BorderLayout.SOUTH);
+        pnlSecondaryDrawer.add(drawerRowA, BorderLayout.NORTH);
+        pnlSecondaryDrawer.add(drawerRowB, BorderLayout.SOUTH);
 
         container.add(row1, BorderLayout.NORTH);
-        container.add(centerWrap, BorderLayout.CENTER);
+        container.add(pnlSecondaryDrawer, BorderLayout.SOUTH);
         return container;
     }
 
+    private void makeChipJumpable(JLabel chip, int tabIndex, String tooltip) {
+        chip.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        chip.setToolTipText(tooltip);
+        chip.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (tabIndex >= 0 && tabIndex < mainTabs.getTabCount()) {
+                    mainTabs.setSelectedIndex(tabIndex);
+                }
+            }
+        });
+    }
+
+    private void setSecondaryDrawerVisible(boolean visible) {
+        boolean dark = AuditTheme.isDark(api, this);
+        pnlSecondaryDrawer.setVisible(visible);
+        btnToggleDrawer.setSelected(visible);
+        btnToggleDrawer.setText(visible ? "⚙ Công cụ & Excel ▲" : "⚙ Công cụ & Excel ▼");
+        AuditTheme.styleTogglePill(btnToggleDrawer, visible, AuditTheme.accentForeground(dark), dark);
+        syncMaximizeToggleButtonState();
+        revalidate();
+    }
+
     // =========================================================================
-    // Main Split Pane & Tabs
+    // Center Workspace: Explicit Panel Toggle Strip + Main Split & Tabs
     // =========================================================================
 
+    private JPanel buildWorkspaceArea() {
+        boolean dark = AuditTheme.isDark(api, this);
+        JPanel wrap = new JPanel(new BorderLayout(4, 4));
+        wrap.setOpaque(false);
+
+        // Explicit Panel Toggle Strip (replaces tiny < > / ^ v SplitPane arrows)
+        JPanel strip = new JPanel(new BorderLayout(8, 2));
+        strip.setOpaque(true);
+        strip.setBackground(AuditTheme.panelSurface(dark));
+        strip.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(AuditTheme.borderColor(dark), 1, true),
+            BorderFactory.createEmptyBorder(3, 6, 3, 8)));
+
+        JPanel toggleBtns = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        toggleBtns.setOpaque(false);
+
+        btnToggleGroupsPane.addActionListener(e -> {
+            if (mainTabs.getSelectedIndex() != TAB_GROUPS) {
+                mainTabs.setSelectedIndex(TAB_GROUPS);
+                if (!groupsPaneVisible) {
+                    setGroupsPaneVisible(true);
+                    return;
+                }
+            }
+            setGroupsPaneVisible(!groupsPaneVisible);
+        });
+
+        btnToggleInspector.addActionListener(e -> setInspectorVisible(!inspectorVisible));
+
+        btnMaximizeTables.addActionListener(e -> {
+            boolean currentlyMaximized = !inspectorVisible && !pnlSecondaryDrawer.isVisible();
+            if (currentlyMaximized) {
+                // Restore inspector so user can inspect immediately
+                setInspectorVisible(true);
+            } else {
+                setSecondaryDrawerVisible(false);
+                setInspectorVisible(false);
+            }
+            syncMaximizeToggleButtonState();
+        });
+
+        toggleBtns.add(btnToggleGroupsPane);
+        toggleBtns.add(btnToggleInspector);
+        toggleBtns.add(btnMaximizeTables);
+
+        lblCurrentAction.setForeground(AuditTheme.accentForeground(dark));
+        lblCurrentAction.setFont(lblCurrentAction.getFont().deriveFont(Font.BOLD));
+        lblCurrentAction.setHorizontalAlignment(JLabel.RIGHT);
+
+        strip.add(toggleBtns, BorderLayout.WEST);
+        strip.add(lblCurrentAction, BorderLayout.CENTER);
+
+        wrap.add(strip, BorderLayout.NORTH);
+        wrap.add(buildMainSplitPane(), BorderLayout.CENTER);
+        return wrap;
+    }
+
     private JSplitPane buildMainSplitPane() {
+        boolean dark = AuditTheme.isDark(api, this);
+
+        this.pushLedgerPanel = new PushLedgerPanel(
+            api,
+            state.getActionGroups(),
+            pushManager,
+            this::getSelectedGroup,
+            this::inspectPushEntry,
+            call -> {
+                if (call != null && call.capture != null) {
+                    String tag = (call.excelStt != null && !call.excelStt.isEmpty())
+                        ? ("STT " + call.excelStt)
+                        : ("G" + call.groupId + "#" + call.index);
+                    sendToRepeater(call.capture, tag + " " + call.capture.method);
+                }
+            },
+            this::appendLog);
+
+        this.headerFilterPanel = new HeaderFilterPanel(
+            api,
+            config,
+            this::appendLog,
+            () -> {
+                persistConfigQuietly();
+                refreshPushAndHeaderTitles();
+            });
+
+        mainTabs.setBackground(AuditTheme.panelSurface(dark));
         mainTabs.addTab("Nhóm & API", buildGroupsAndApisTab());
         mainTabs.addTab("Bảng NOTE (0)", buildNotesTab());
+        mainTabs.addTab("Đẩy Logger++ (0)", pushLedgerPanel);
+        mainTabs.addTab("Bộ lọc Header HTTP (0)", headerFilterPanel);
         mainTabs.addTab("Tiến độ Excel (0/0)", buildCoverageTab());
         mainTabs.addTab("Cây Phân cấp (0)", buildHierarchyTreeTab());
         mainTabs.addTab("Điền Form & Cài Đặt", buildFormAndConfigTab());
         mainTabs.addTab("Bị né, JS & Log", buildAuxTab());
 
-        JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, mainTabs, buildInspectorPanel());
-        split.setResizeWeight(0.60);
-        split.setOneTouchExpandable(true);
-        return split;
+        this.inspectorPanel = buildInspectorPanel();
+        this.mainSplitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT, mainTabs, inspectorPanel);
+        this.mainSplitPane.setResizeWeight(0.62);
+        this.mainSplitPane.setOneTouchExpandable(false); // Replaced by explicit toggle strip
+        this.mainSplitPane.setBackground(AuditTheme.canvasSurface(dark));
+        return this.mainSplitPane;
+    }
+
+    private void setGroupsPaneVisible(boolean visible) {
+        if (groupsSplitPane == null || leftGroupsPanel == null) {
+            return;
+        }
+        boolean dark = AuditTheme.isDark(api, this);
+        if (!visible && groupsPaneVisible && groupsSplitPane.getWidth() > 200) {
+            lastGroupsDividerRatio = Math.max(0.20, Math.min(0.60,
+                groupsSplitPane.getDividerLocation() / (double) groupsSplitPane.getWidth()));
+        }
+        groupsPaneVisible = visible;
+        leftGroupsPanel.setVisible(visible);
+        if (visible) {
+            groupsSplitPane.setDividerSize(7);
+            SwingUtilities.invokeLater(() -> {
+                if (groupsSplitPane.getWidth() > 100) {
+                    groupsSplitPane.setDividerLocation(lastGroupsDividerRatio);
+                }
+            });
+            btnToggleGroupsPane.setText("◧ Ẩn danh sách Nhóm");
+        } else {
+            groupsSplitPane.setDividerSize(0);
+            groupsSplitPane.setDividerLocation(0);
+            btnToggleGroupsPane.setText("◧ Hiện danh sách Nhóm");
+        }
+        AuditTheme.styleTogglePill(btnToggleGroupsPane, visible, AuditTheme.accentForeground(dark), dark);
+        groupsSplitPane.revalidate();
+        groupsSplitPane.repaint();
+    }
+
+    private void setInspectorVisible(boolean visible) {
+        if (mainSplitPane == null || inspectorPanel == null) {
+            return;
+        }
+        boolean dark = AuditTheme.isDark(api, this);
+        if (!visible && inspectorVisible && mainSplitPane.getHeight() > 200) {
+            lastInspectorDividerRatio = Math.max(0.35, Math.min(0.80,
+                mainSplitPane.getDividerLocation() / (double) mainSplitPane.getHeight()));
+        }
+        inspectorVisible = visible;
+        inspectorPanel.setVisible(visible);
+        if (visible) {
+            mainSplitPane.setDividerSize(7);
+            SwingUtilities.invokeLater(() -> {
+                if (mainSplitPane.getHeight() > 120) {
+                    mainSplitPane.setDividerLocation(lastInspectorDividerRatio);
+                }
+            });
+            btnToggleInspector.setText("⬓ Ẩn HTTP Req/Resp");
+        } else {
+            mainSplitPane.setDividerSize(0);
+            mainSplitPane.setDividerLocation(1.0);
+            btnToggleInspector.setText("⬓ Hiện HTTP Req/Resp");
+        }
+        AuditTheme.styleTogglePill(btnToggleInspector, visible, AuditTheme.accentForeground(dark), dark);
+        syncMaximizeToggleButtonState();
+        mainSplitPane.revalidate();
+        mainSplitPane.repaint();
+    }
+
+    private void syncMaximizeToggleButtonState() {
+        boolean dark = AuditTheme.isDark(api, this);
+        boolean maximized = !inspectorVisible && !pnlSecondaryDrawer.isVisible();
+        btnMaximizeTables.setSelected(maximized);
+        btnMaximizeTables.setText(maximized ? "⛶ Thu gọn Bảng" : "⛶ Phóng to Bảng");
+        AuditTheme.styleTogglePill(btnMaximizeTables, maximized, AuditTheme.accentForeground(dark), dark);
     }
 
     // --- Tab 0: Action Groups + APIs inside Group ---
 
     private JSplitPane buildGroupsAndApisTab() {
+        boolean dark = AuditTheme.isDark(api, this);
+
         // Left pane: Action Groups
-        JPanel leftPanel = new JPanel(new BorderLayout(4, 4));
-        leftPanel.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
+        leftGroupsPanel = new JPanel(new BorderLayout(4, 4));
+        leftGroupsPanel.setBackground(AuditTheme.panelSurface(dark));
+        leftGroupsPanel.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
 
         JPanel leftFilter = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 2));
+        leftFilter.setOpaque(false);
         leftFilter.add(new JLabel("Nhóm:"));
         cbGroupFilter.addActionListener(e -> applyGroupFilter());
         leftFilter.add(cbGroupFilter);
@@ -488,7 +817,7 @@ public final class CrawlerTabPanel extends JPanel {
         });
         leftFilter.add(btnClearGroup);
 
-        AuditTheme.configureAuditTable(tblGroups);
+        AuditTheme.configureAuditTable(tblGroups, api);
         tblGroups.setAutoCreateRowSorter(true);
         tblGroups.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         tblGroups.setDefaultRenderer(Object.class, new GroupTableModel.GroupCellRenderer(api));
@@ -502,17 +831,24 @@ public final class CrawlerTabPanel extends JPanel {
         });
         installGroupPopupMenu();
 
-        leftPanel.add(leftFilter, BorderLayout.NORTH);
-        leftPanel.add(new JScrollPane(tblGroups), BorderLayout.CENTER);
+        leftGroupsPanel.add(leftFilter, BorderLayout.NORTH);
+        JScrollPane spGroups = new JScrollPane(tblGroups);
+        spGroups.getViewport().setBackground(AuditTheme.tableSurface(dark));
+        leftGroupsPanel.add(spGroups, BorderLayout.CENTER);
 
         // Right pane: APIs inside selected group (or all grouped APIs)
         JPanel rightPanel = new JPanel(new BorderLayout(4, 4));
+        rightPanel.setBackground(AuditTheme.panelSurface(dark));
         rightPanel.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
 
         JPanel rightHeader = new JPanel(new BorderLayout(4, 2));
+        rightHeader.setOpaque(false);
         lblGroupHeader.setFont(lblGroupHeader.getFont().deriveFont(Font.BOLD));
         lblGroupHeader.setBorder(BorderFactory.createEmptyBorder(2, 4, 2, 4));
         JPanel rightFilter = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
+        rightFilter.setOpaque(false);
+        chkAllApisWhenUnselected.setOpaque(false);
+        chkOnlyApiNotes.setOpaque(false);
         chkAllApisWhenUnselected.addActionListener(e -> applyGroupApisFilter());
         chkOnlyApiNotes.addActionListener(e -> applyGroupApisFilter());
         attachDocListener(txtApiSearch, this::applyGroupApisFilter);
@@ -524,7 +860,7 @@ public final class CrawlerTabPanel extends JPanel {
         rightHeader.add(lblGroupHeader, BorderLayout.NORTH);
         rightHeader.add(rightFilter, BorderLayout.SOUTH);
 
-        AuditTheme.configureAuditTable(tblGroupApis);
+        AuditTheme.configureAuditTable(tblGroupApis, api);
         tblGroupApis.setAutoCreateRowSorter(true);
         tblGroupApis.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         tblGroupApis.setDefaultRenderer(Object.class, new GroupTableModel.GroupApiCellRenderer(api));
@@ -539,23 +875,34 @@ public final class CrawlerTabPanel extends JPanel {
                 }
             }
         });
+        attachDoubleClickToRevealInspector(tblGroupApis);
         installGroupApiPopupMenu();
 
         rightPanel.add(rightHeader, BorderLayout.NORTH);
-        rightPanel.add(new JScrollPane(tblGroupApis), BorderLayout.CENTER);
+        JScrollPane spApis = new JScrollPane(tblGroupApis);
+        spApis.getViewport().setBackground(AuditTheme.tableSurface(dark));
+        rightPanel.add(spApis, BorderLayout.CENTER);
 
-        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, leftPanel, rightPanel);
-        split.setResizeWeight(0.38);
-        split.setOneTouchExpandable(true);
-        return split;
+        groupsSplitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, leftGroupsPanel, rightPanel);
+        groupsSplitPane.setResizeWeight(0.36);
+        groupsSplitPane.setOneTouchExpandable(false); // Replaced by explicit pill button
+        groupsSplitPane.setBackground(AuditTheme.canvasSurface(dark));
+        return groupsSplitPane;
     }
 
     private void installGroupPopupMenu() {
         JPopupMenu popup = new JPopupMenu();
+        JMenuItem miPushGroup = new JMenuItem("📤 Đưa CẢ NHÓM vào hàng đẩy Logger++ (Extender)");
         JMenuItem miSendAll = new JMenuItem("Send CẢ NHÓM API sang Repeater");
         JMenuItem miCopyPath = new JMenuItem("Copy Tên Nhóm (Action Path)");
         JMenuItem miCopyUrl = new JMenuItem("Copy Page URL");
 
+        miPushGroup.addActionListener(e -> {
+            ActionGroup g = getSelectedGroup();
+            if (g != null) {
+                enqueueGroupWithFeedback(g, true);
+            }
+        });
         miSendAll.addActionListener(e -> {
             ActionGroup g = getSelectedGroup();
             if (g != null) {
@@ -575,6 +922,7 @@ public final class CrawlerTabPanel extends JPanel {
             }
         });
 
+        popup.add(miPushGroup);
         popup.add(miSendAll);
         popup.addSeparator();
         popup.add(miCopyPath);
@@ -584,12 +932,29 @@ public final class CrawlerTabPanel extends JPanel {
 
     private void installGroupApiPopupMenu() {
         JPopupMenu popup = new JPopupMenu();
+        JMenuItem miPushApi = new JMenuItem("📤 Đưa API này vào hàng đẩy Logger++ (Extender)");
+        JMenuItem miPushGroup = new JMenuItem("📤 Đưa CẢ NHÓM chứa API này vào hàng đẩy Logger++");
         JMenuItem miSend = new JMenuItem("Send to Repeater");
         JMenuItem miSendGroup = new JMenuItem("Send CẢ NHÓM chứa API này sang Repeater");
         JMenuItem miShared = new JMenuItem("Xem các nhóm cùng gọi API này");
         JMenuItem miCopyName = new JMenuItem("Copy Tên API (Tên Nhóm)");
         JMenuItem miCopyUrl = new JMenuItem("Copy Full URL");
 
+        miPushApi.addActionListener(e -> {
+            ApiCall c = getSelectedGroupApi();
+            if (c != null) {
+                enqueueCallsWithFeedback(Collections.singletonList(c), "API " + c.displayName(), true);
+            }
+        });
+        miPushGroup.addActionListener(e -> {
+            ApiCall c = getSelectedGroupApi();
+            if (c != null) {
+                ActionGroup g = state.getActionGroups().getGroup(c.groupId);
+                if (g != null) {
+                    enqueueGroupWithFeedback(g, true);
+                }
+            }
+        });
         miSend.addActionListener(e -> {
             ApiCall c = getSelectedGroupApi();
             if (c != null) {
@@ -625,6 +990,9 @@ public final class CrawlerTabPanel extends JPanel {
             }
         });
 
+        popup.add(miPushApi);
+        popup.add(miPushGroup);
+        popup.addSeparator();
         popup.add(miSend);
         popup.add(miSendGroup);
         popup.add(miShared);
@@ -637,10 +1005,13 @@ public final class CrawlerTabPanel extends JPanel {
     // --- Tab 1: Consolidated Audit NOTEs Table ---
 
     private JPanel buildNotesTab() {
+        boolean dark = AuditTheme.isDark(api, this);
         JPanel p = new JPanel(new BorderLayout(4, 4));
+        p.setBackground(AuditTheme.panelSurface(dark));
         p.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
 
         JPanel bar = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
+        bar.setOpaque(false);
         bar.add(new JLabel("Mức độ NOTE:"));
         cbNoteSeverity.addActionListener(e -> applyNotesFilter());
         bar.add(cbNoteSeverity);
@@ -648,7 +1019,7 @@ public final class CrawlerTabPanel extends JPanel {
         attachDocListener(txtNoteSearch, this::applyNotesFilter);
         bar.add(txtNoteSearch);
 
-        AuditTheme.configureAuditTable(tblNotes);
+        AuditTheme.configureAuditTable(tblNotes, api);
         tblNotes.setAutoCreateRowSorter(true);
         tblNotes.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         tblNotes.setDefaultRenderer(Object.class, new GroupTableModel.AuditNoteCellRenderer(api));
@@ -665,9 +1036,11 @@ public final class CrawlerTabPanel extends JPanel {
                 }
             }
         });
+        attachDoubleClickToRevealInspector(tblNotes);
 
         JPopupMenu popup = new JPopupMenu();
         JMenuItem miJump = new JMenuItem("Đi tới Nhóm này (Tab Nhóm & API)");
+        JMenuItem miPush = new JMenuItem("📤 Đưa API này vào hàng đẩy Logger++ (Extender)");
         JMenuItem miRepeater = new JMenuItem("Send to Repeater");
         JMenuItem miCopy = new JMenuItem("Copy Chi tiết NOTE");
 
@@ -675,6 +1048,15 @@ public final class CrawlerTabPanel extends JPanel {
             AuditNote n = getSelectedNote();
             if (n != null) {
                 jumpToGroupAndCall(n.groupId, n.callIndex);
+            }
+        });
+        miPush.addActionListener(e -> {
+            AuditNote n = getSelectedNote();
+            if (n != null) {
+                ApiCall call = findApiCall(n.groupId, n.callIndex);
+                if (call != null) {
+                    enqueueCallsWithFeedback(Collections.singletonList(call), "NOTE " + call.displayName(), true);
+                }
             }
         });
         miRepeater.addActionListener(e -> {
@@ -695,22 +1077,28 @@ public final class CrawlerTabPanel extends JPanel {
         });
 
         popup.add(miJump);
+        popup.add(miPush);
         popup.add(miRepeater);
         popup.add(miCopy);
         attachTablePopup(tblNotes, popup);
 
         p.add(bar, BorderLayout.NORTH);
-        p.add(new JScrollPane(tblNotes), BorderLayout.CENTER);
+        JScrollPane sp = new JScrollPane(tblNotes);
+        sp.getViewport().setBackground(AuditTheme.tableSurface(dark));
+        p.add(sp, BorderLayout.CENTER);
         return p;
     }
 
-    // --- Tab 2: Excel Checklist Coverage ---
+    // --- Tab 4: Excel Checklist Coverage ---
 
     private JPanel buildCoverageTab() {
+        boolean dark = AuditTheme.isDark(api, this);
         JPanel p = new JPanel(new BorderLayout(4, 4));
+        p.setBackground(AuditTheme.panelSurface(dark));
         p.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
 
         JPanel filterBar = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
+        filterBar.setOpaque(false);
         filterBar.add(new JLabel("Lọc trạng thái:"));
         cbStatusFilter.addActionListener(e -> applyCoverageFilter());
         filterBar.add(cbStatusFilter);
@@ -718,7 +1106,7 @@ public final class CrawlerTabPanel extends JPanel {
         attachDocListener(txtSearch, this::applyCoverageFilter);
         filterBar.add(txtSearch);
 
-        AuditTheme.configureAuditTable(tblCoverage);
+        AuditTheme.configureAuditTable(tblCoverage, api);
         tblCoverage.setAutoCreateRowSorter(true);
         tblCoverage.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         tblCoverage.setDefaultRenderer(Object.class, new CoverageTableModel.CoverageCellRenderer(api));
@@ -732,6 +1120,7 @@ public final class CrawlerTabPanel extends JPanel {
                 }
             }
         });
+        attachDoubleClickToRevealInspector(tblCoverage);
 
         JPopupMenu popup = new JPopupMenu();
         JMenuItem miRepeater = new JMenuItem("Send to Repeater");
@@ -764,17 +1153,22 @@ public final class CrawlerTabPanel extends JPanel {
         attachTablePopup(tblCoverage, popup);
 
         p.add(filterBar, BorderLayout.NORTH);
-        p.add(new JScrollPane(tblCoverage), BorderLayout.CENTER);
+        JScrollPane sp = new JScrollPane(tblCoverage);
+        sp.getViewport().setBackground(AuditTheme.tableSurface(dark));
+        p.add(sp, BorderLayout.CENTER);
         return p;
     }
 
-    // --- Tab 3: Hierarchy Tree ---
+    // --- Tab 5: Hierarchy Tree ---
 
     private JPanel buildHierarchyTreeTab() {
+        boolean dark = AuditTheme.isDark(api, this);
         JPanel p = new JPanel(new BorderLayout(4, 4));
+        p.setBackground(AuditTheme.panelSurface(dark));
         p.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
 
         JPanel bar = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
+        bar.setOpaque(false);
         JButton btnExpand = new JButton("Mở rộng tất cả");
         JButton btnCollapse = new JButton("Thu gọn tất cả");
         JButton btnRefreshTree = new JButton("Làm mới cây");
@@ -786,6 +1180,7 @@ public final class CrawlerTabPanel extends JPanel {
         bar.add(btnCollapse);
         bar.add(btnRefreshTree);
 
+        actionTree.setBackground(AuditTheme.tableSurface(dark));
         actionTree.setCellRenderer(new AuditTreeRenderer());
         actionTree.addTreeSelectionListener(e -> {
             DefaultMutableTreeNode node = (DefaultMutableTreeNode) actionTree.getLastSelectedPathComponent();
@@ -794,10 +1189,29 @@ public final class CrawlerTabPanel extends JPanel {
                 showApiCallInInspector(tcn.call);
             }
         });
+        actionTree.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2) {
+                    DefaultMutableTreeNode node = (DefaultMutableTreeNode) actionTree.getLastSelectedPathComponent();
+                    if (node != null && node.getUserObject() instanceof TreeCallNode) {
+                        setInspectorVisible(true);
+                    }
+                }
+            }
+        });
 
         JPopupMenu treePopup = new JPopupMenu();
+        JMenuItem miTreePush = new JMenuItem("📤 Đưa API này vào hàng đẩy Logger++ (Extender)");
         JMenuItem miTreeRep = new JMenuItem("Send to Repeater");
         JMenuItem miTreeRepGroup = new JMenuItem("Send CẢ NHÓM chứa API này sang Repeater");
+        miTreePush.addActionListener(e -> {
+            DefaultMutableTreeNode node = (DefaultMutableTreeNode) actionTree.getLastSelectedPathComponent();
+            if (node != null && node.getUserObject() instanceof TreeCallNode) {
+                TreeCallNode tcn = (TreeCallNode) node.getUserObject();
+                enqueueCallsWithFeedback(Collections.singletonList(tcn.call), tcn.call.displayName(), true);
+            }
+        });
         miTreeRep.addActionListener(e -> {
             DefaultMutableTreeNode node = (DefaultMutableTreeNode) actionTree.getLastSelectedPathComponent();
             if (node != null && node.getUserObject() instanceof TreeCallNode) {
@@ -816,16 +1230,19 @@ public final class CrawlerTabPanel extends JPanel {
                 }
             }
         });
+        treePopup.add(miTreePush);
         treePopup.add(miTreeRep);
         treePopup.add(miTreeRepGroup);
         actionTree.setComponentPopupMenu(treePopup);
 
         p.add(bar, BorderLayout.NORTH);
-        p.add(new JScrollPane(actionTree), BorderLayout.CENTER);
+        JScrollPane sp = new JScrollPane(actionTree);
+        sp.getViewport().setBackground(AuditTheme.tableSurface(dark));
+        p.add(sp, BorderLayout.CENTER);
         return p;
     }
 
-    // --- Tab 4: Configurable Form Auto-Fill ("TEXT") & Crawl Config ---
+    // --- Tab 6: Configurable Form Auto-Fill ("TEXT") & Crawl Config ---
 
     private JPanel buildFormAndConfigTab() {
         this.formConfigPanel = new FormAndConfigPanel(
@@ -840,16 +1257,22 @@ public final class CrawlerTabPanel extends JPanel {
         return formConfigPanel;
     }
 
-    // --- Tab 5: Aux (Log, Extra Captures, Danger Guard & JS Hints) ---
+    // --- Tab 7: Aux (Log, Extra Captures, Danger Guard & JS Hints) ---
 
     private JPanel buildAuxTab() {
+        boolean dark = AuditTheme.isDark(api, this);
         JPanel p = new JPanel(new BorderLayout());
+        p.setBackground(AuditTheme.panelSurface(dark));
 
         // Sub-tab 0: Activity Log
         JPanel logPanel = new JPanel(new BorderLayout(4, 4));
+        logPanel.setBackground(AuditTheme.panelSurface(dark));
         txtLog.setEditable(false);
+        txtLog.setBackground(AuditTheme.tableSurface(dark));
+        txtLog.setForeground(AuditTheme.textPrimary(dark));
         txtLog.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
         JPanel logTop = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 2));
+        logTop.setOpaque(false);
         JButton btnClearLog = new JButton("Xóa Log");
         btnClearLog.addActionListener(e -> txtLog.setText(""));
         logTop.add(btnClearLog);
@@ -857,7 +1280,7 @@ public final class CrawlerTabPanel extends JPanel {
         logPanel.add(new JScrollPane(txtLog), BorderLayout.CENTER);
 
         // Sub-tab 1: Extras (outside Excel)
-        AuditTheme.configureAuditTable(tblExtras);
+        AuditTheme.configureAuditTable(tblExtras, api);
         tblExtras.setAutoCreateRowSorter(true);
         tblExtras.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         tblExtras.setDefaultRenderer(Object.class, new CoverageTableModel.SimpleAuditCellRenderer(api, 0, 4, 3));
@@ -872,6 +1295,7 @@ public final class CrawlerTabPanel extends JPanel {
                 }
             }
         });
+        attachDoubleClickToRevealInspector(tblExtras);
         JPopupMenu extraPopup = new JPopupMenu();
         JMenuItem miExtraRep = new JMenuItem("Send to Repeater");
         JMenuItem miExtraCopy = new JMenuItem("Copy Full URL");
@@ -898,15 +1322,21 @@ public final class CrawlerTabPanel extends JPanel {
         attachTablePopup(tblExtras, extraPopup);
 
         // Sub-tab 2: Skipped Danger Actions & JS Hints
-        AuditTheme.configureAuditTable(tblSkipped);
+        AuditTheme.configureAuditTable(tblSkipped, api);
         tblSkipped.setAutoCreateRowSorter(true);
         tblSkipped.setDefaultRenderer(Object.class, new CoverageTableModel.SimpleAuditCellRenderer(api, -1, -1, 2));
         JPanel skippedWrap = new JPanel(new BorderLayout(4, 4));
+        skippedWrap.setBackground(AuditTheme.panelSurface(dark));
         skippedWrap.setBorder(BorderFactory.createTitledBorder("Nút Danger Guard đã tự né"));
-        skippedWrap.add(new JScrollPane(tblSkipped), BorderLayout.CENTER);
+        JScrollPane spSkipped = new JScrollPane(tblSkipped);
+        spSkipped.getViewport().setBackground(AuditTheme.tableSurface(dark));
+        skippedWrap.add(spSkipped, BorderLayout.CENTER);
 
         JPanel jsWrap = new JPanel(new BorderLayout(4, 4));
+        jsWrap.setBackground(AuditTheme.panelSurface(dark));
         jsWrap.setBorder(BorderFactory.createTitledBorder("Endpoint phát hiện thụ động từ file .js"));
+        lstJsEndpoints.setBackground(AuditTheme.tableSurface(dark));
+        lstJsEndpoints.setForeground(AuditTheme.textPrimary(dark));
         JPopupMenu jsPopup = new JPopupMenu();
         JMenuItem miCopyJs = new JMenuItem("Copy Endpoint JS");
         miCopyJs.addActionListener(e -> {
@@ -921,9 +1351,14 @@ public final class CrawlerTabPanel extends JPanel {
 
         JSplitPane dangerJsSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, skippedWrap, jsWrap);
         dangerJsSplit.setResizeWeight(0.5);
+        dangerJsSplit.setOneTouchExpandable(false);
 
+        JScrollPane spExtras = new JScrollPane(tblExtras);
+        spExtras.getViewport().setBackground(AuditTheme.tableSurface(dark));
+
+        auxTabs.setBackground(AuditTheme.panelSurface(dark));
         auxTabs.addTab("Log hoạt động", logPanel);
-        auxTabs.addTab("Ngoài Excel (0)", new JScrollPane(tblExtras));
+        auxTabs.addTab("Ngoài Excel (0)", spExtras);
         auxTabs.addTab("Nút bị né & JS Hints (0/0)", dangerJsSplit);
         p.add(auxTabs, BorderLayout.CENTER);
         return p;
@@ -934,16 +1369,23 @@ public final class CrawlerTabPanel extends JPanel {
     // =========================================================================
 
     private JPanel buildInspectorPanel() {
+        boolean dark = AuditTheme.isDark(api, this);
         JPanel p = new JPanel(new BorderLayout(4, 4));
-        p.setBorder(BorderFactory.createTitledBorder("Chi tiết API, NOTE & HTTP Message"));
+        p.setBackground(AuditTheme.panelSurface(dark));
+        p.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(AuditTheme.borderColor(dark), 1, true),
+            BorderFactory.createEmptyBorder(4, 6, 4, 6)));
 
         JPanel top = new JPanel(new BorderLayout(8, 2));
+        top.setOpaque(false);
         lblSelectedSummary.setFont(lblSelectedSummary.getFont().deriveFont(Font.BOLD));
+        lblSelectedSummary.setForeground(AuditTheme.textPrimary(dark));
         top.add(lblSelectedSummary, BorderLayout.CENTER);
 
         JPanel right = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+        right.setOpaque(false);
         right.add(new JLabel("Phiên bản:"));
-        cbVariant.setPreferredSize(new Dimension(250, 24));
+        cbVariant.setPreferredSize(new Dimension(230, 24));
         cbVariant.addActionListener(e -> {
             if (!updatingVariants) {
                 VariantItem item = (VariantItem) cbVariant.getSelectedItem();
@@ -957,6 +1399,16 @@ public final class CrawlerTabPanel extends JPanel {
         btnShowShared.addActionListener(e -> {
             if (!currentInspectEndpointKey.isEmpty()) {
                 showSharedGroupsDialog(currentInspectEndpointKey);
+            }
+        });
+
+        btnQueueInspector.setEnabled(false);
+        btnQueueInspector.setToolTipText("Đưa API đang xem vào hàng đẩy Logger++ (Extender)");
+        btnQueueInspector.addActionListener(e -> {
+            VariantItem item = (VariantItem) cbVariant.getSelectedItem();
+            if (item != null && item.call != null) {
+                enqueueCallsWithFeedback(
+                    Collections.singletonList(item.call), item.call.displayName(), false);
             }
         });
 
@@ -974,6 +1426,7 @@ public final class CrawlerTabPanel extends JPanel {
 
         right.add(cbVariant);
         right.add(btnShowShared);
+        right.add(btnQueueInspector);
         right.add(btnSendRepeater);
         top.add(right, BorderLayout.EAST);
 
@@ -981,9 +1434,12 @@ public final class CrawlerTabPanel extends JPanel {
         txtNotesBanner.setLineWrap(true);
         txtNotesBanner.setWrapStyleWord(true);
         txtNotesBanner.setOpaque(true);
+        txtNotesBanner.setBackground(AuditTheme.cardSurface(dark));
+        txtNotesBanner.setForeground(AuditTheme.textPrimary(dark));
         txtNotesBanner.setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6));
 
         JPanel northWrap = new JPanel(new BorderLayout(2, 2));
+        northWrap.setOpaque(false);
         northWrap.add(top, BorderLayout.NORTH);
         northWrap.add(txtNotesBanner, BorderLayout.SOUTH);
         p.add(northWrap, BorderLayout.NORTH);
@@ -992,6 +1448,7 @@ public final class CrawlerTabPanel extends JPanel {
             JSplitPane msgSplit = new JSplitPane(
                 JSplitPane.HORIZONTAL_SPLIT, requestEditor.uiComponent(), responseEditor.uiComponent());
             msgSplit.setResizeWeight(0.5);
+            msgSplit.setOneTouchExpandable(false);
             p.add(msgSplit, BorderLayout.CENTER);
         } else {
             p.add(new JLabel("Montoya HTTP Editor chỉ hiển thị khi chạy trong Burp Suite."), BorderLayout.CENTER);
@@ -1000,7 +1457,7 @@ public final class CrawlerTabPanel extends JPanel {
     }
 
     // =========================================================================
-    // Workflow Handlers (Import, Crawl Lifecycle, Export)
+    // Workflow Handlers (Import, Crawl Lifecycle, Export, Logger++ Push)
     // =========================================================================
 
     private void onImportExcel() {
@@ -1099,7 +1556,7 @@ public final class CrawlerTabPanel extends JPanel {
 
         if (state.getStatus() == CrawlState.Status.PAUSED) {
             state.setStatus(CrawlState.Status.RUNNING);
-            appendLog("Tiếp tục Crawl...");
+            appendLog("Tiếp tục Crawl (" + (config.isAllowAutoRequests() ? "Auto ON" : "Khóa tự gửi - Thao tác tay") + ")...");
             refreshButtonsState();
             return;
         }
@@ -1121,13 +1578,20 @@ public final class CrawlerTabPanel extends JPanel {
         lastTreeVersion = -1;
         refreshButtonsState();
 
+        // Strict Permission Gate: NEVER auto-fetch robots.txt/sitemap.xml while locked
         if (!seed.isEmpty() && api != null) {
-            SeedDiscoveryHelper.fetchSeedsAsync(api, seed, config, state, this::appendLog);
+            if (config.isAllowAutoRequests()) {
+                SeedDiscoveryHelper.fetchSeedsAsync(api, seed, config, state, this::appendLog);
+            } else {
+                appendLog("Tạm giữ Seed URL (chế độ Khóa tự gửi): Extension KHÔNG tự gửi /robots.txt hay /sitemap.xml cho tới khi bạn BẬT 'Tự gửi Request'.");
+            }
         }
 
-        mainTabs.setSelectedIndex(0);
+        mainTabs.setSelectedIndex(TAB_GROUPS);
         appendLog("Crawl RUNNING trên Host(s): " + config.getAllowedHostsCsv()
-            + " | Mở Firefox/Chrome qua Burp Proxy (hoặc bấm Refresh trang đang mở).");
+            + (config.isAllowAutoRequests()
+                ? " | Tự gửi Request ĐANG BẬT: Agent tự click & duyệt."
+                : " | Khóa tự gửi ĐANG BẬT: Bạn tự bấm trên trình duyệt để gom nhóm API an toàn."));
         refreshAllViewsNow();
     }
 
@@ -1161,9 +1625,46 @@ public final class CrawlerTabPanel extends JPanel {
         skippedModel.setRows(new ArrayList<>());
         jsListModel.clear();
         clearInspector();
-        appendLog("Đã Reset kết quả crawl (giữ nguyên danh sách API Excel & cấu hình Form).");
+        appendLog("Đã Reset kết quả crawl (giữ nguyên danh sách API Excel, Header Filter & Push Ledger).");
         refreshButtonsState();
         refreshAllViewsNow();
+    }
+
+    private void enqueueGroupWithFeedback(ActionGroup group, boolean switchToPushTab) {
+        if (group == null) {
+            return;
+        }
+        int added = pushManager.enqueueGroup(group);
+        onPushLedgerUpdated();
+        appendLog("Đã đưa " + added + " API từ nhóm [" + group.actionPath + "] vào hàng đẩy Logger++ (Extender).");
+        if (switchToPushTab) {
+            mainTabs.setSelectedIndex(TAB_PUSH);
+        }
+    }
+
+    private void enqueueCallsWithFeedback(List<ApiCall> calls, String label, boolean switchToPushTab) {
+        if (calls == null || calls.isEmpty()) {
+            return;
+        }
+        int added = pushManager.enqueueCalls(calls);
+        onPushLedgerUpdated();
+        appendLog("Đã đưa " + added + " API [" + label + "] vào hàng đẩy Logger++ (Extender).");
+        if (switchToPushTab) {
+            mainTabs.setSelectedIndex(TAB_PUSH);
+        }
+    }
+
+    private void inspectPushEntry(ExtenderPushEntry entry) {
+        if (entry == null) {
+            return;
+        }
+        ApiCall call = findApiCall(entry.groupId, entry.callIndex);
+        if (call != null) {
+            showApiCallInInspector(call);
+        } else {
+            showStandaloneCaptureInInspector(entry.capture);
+        }
+        setInspectorVisible(true);
     }
 
     private void showExportMenu(JButton anchor) {
@@ -1171,15 +1672,41 @@ public final class CrawlerTabPanel extends JPanel {
         JMenuItem miCsv = new JMenuItem("Xuất CSV (Nhóm + NOTE + Excel UTF-8)...");
         JMenuItem miJson = new JMenuItem("Xuất JSON (Nhóm + NOTE + Excel)...");
         JMenuItem miMd = new JMenuItem("Xuất Markdown (Cây Nhóm + Bảng NOTE)...");
+        JMenuItem miLedger = new JMenuItem("Xuất Bảng Đối Chiếu Đẩy Elastic (CSV)...");
 
         miCsv.addActionListener(e -> exportReport("csv"));
         miJson.addActionListener(e -> exportReport("json"));
         miMd.addActionListener(e -> exportReport("md"));
+        miLedger.addActionListener(e -> exportPushLedgerCsv());
 
         menu.add(miCsv);
         menu.add(miJson);
         menu.add(miMd);
+        menu.addSeparator();
+        menu.add(miLedger);
         menu.show(anchor, 0, anchor.getHeight());
+    }
+
+    private void exportPushLedgerCsv() {
+        if (pushManager.totalCount() == 0) {
+            JOptionPane.showMessageDialog(this, "Bảng Đối Chiếu đẩy Elastic chưa có dữ liệu.",
+                "Trống", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        JFileChooser fc = new JFileChooser(lastDirectory);
+        fc.setSelectedFile(new File("mythofcrawl_elastic_ledger.csv"));
+        if (fc.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) {
+            return;
+        }
+        File out = fc.getSelectedFile();
+        lastDirectory = out.getParentFile();
+        try {
+            pushManager.exportLedgerCsv(out);
+            appendLog("Đã xuất Bảng Đối Chiếu đẩy Elastic: " + out.getAbsolutePath());
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(this, "Lỗi xuất Bảng Đối Chiếu: " + ex.getMessage(),
+                "Lỗi Export", JOptionPane.ERROR_MESSAGE);
+        }
     }
 
     private void exportReport(String fmt) {
@@ -1226,11 +1753,46 @@ public final class CrawlerTabPanel extends JPanel {
         btnStop.setEnabled(st == CrawlState.Status.RUNNING || st == CrawlState.Status.PAUSED);
     }
 
+    private void refreshPushAndHeaderTitles() {
+        boolean dark = AuditTheme.isDark(api, this);
+        Color baseBg = AuditTheme.panelSurface(dark);
+
+        int pushTotal = pushManager != null ? pushManager.totalCount() : 0;
+        int pushSent = pushManager != null ? pushManager.sentCount() : 0;
+        if (mainTabs.getTabCount() > TAB_PUSH) {
+            mainTabs.setTitleAt(TAB_PUSH, pushSent > 0
+                ? String.format("Đẩy Logger++ (%d/%d)", pushSent, pushTotal)
+                : String.format("Đẩy Logger++ (%d)", pushTotal));
+        }
+
+        HeaderFilterProfile hfp = config.getHeaderFilterProfile();
+        int activeRules = 0;
+        for (HeaderFilterProfile.Rule r : hfp.getRulesSnapshot()) {
+            if (r.enabled) {
+                activeRules++;
+            }
+        }
+        if (mainTabs.getTabCount() > TAB_HEADERS) {
+            mainTabs.setTitleAt(TAB_HEADERS, hfp.isEnabled()
+                ? String.format("Bộ lọc Header HTTP (%d BẬT)", activeRules)
+                : String.format("Bộ lọc Header HTTP (%d tắt)", activeRules));
+        }
+        if (hfp.isEnabled() && activeRules > 0) {
+            chipHeaders.setText("Header: " + activeRules + " BẬT");
+            AuditTheme.styleStatChip(chipHeaders, AuditTheme.accentForeground(dark), baseBg);
+        } else {
+            chipHeaders.setText("Header: Tắt");
+            AuditTheme.styleStatChip(chipHeaders, AuditTheme.mutedForeground(dark), baseBg);
+        }
+    }
+
     private void refreshAllViewsNow() {
         refreshButtonsState();
         refreshFormSummaryLabel();
+        refreshPushAndHeaderTitles();
+
         boolean dark = AuditTheme.isDark(api, this);
-        Color baseBg = getBackground();
+        Color baseBg = AuditTheme.panelSurface(dark);
 
         ActionGroupStore store = state.getActionGroups();
         ExcelSpecMatcher.CoverageStats stats = matcher.getCoverageStats();
@@ -1243,7 +1805,6 @@ public final class CrawlerTabPanel extends JPanel {
         int infoNotes = store.noteCount(AuditNote.Severity.INFO);
         int totalNotes = errNotes + warnNotes + infoNotes;
 
-        // Calm semantic stat chips
         chipGroups.setText("Nhóm: " + store.groupCount());
         AuditTheme.styleStatChip(chipGroups, AuditTheme.accentForeground(dark), baseBg);
 
@@ -1264,7 +1825,7 @@ public final class CrawlerTabPanel extends JPanel {
 
         chipExcel.setText(String.format("Excel: %d/%d", stats.matched, stats.total));
         AuditTheme.styleStatChip(chipExcel,
-            (stats.total > 0 && stats.matched == stats.total) ? AuditTheme.okForeground(dark) : getForeground(),
+            (stats.total > 0 && stats.matched == stats.total) ? AuditTheme.okForeground(dark) : AuditTheme.textPrimary(dark),
             baseBg);
 
         chipPages.setText(String.format("Trang: %d | Q: %d",
@@ -1272,16 +1833,17 @@ public final class CrawlerTabPanel extends JPanel {
         AuditTheme.styleStatChip(chipPages, AuditTheme.mutedForeground(dark), baseBg);
 
         CrawlState.Status st = state.getStatus();
-        lblCurrentAction.setText("[" + st.name() + "] " + state.getCurrentActionPath()
+        String gateTag = config.isAllowAutoRequests() ? "Auto" : "Tay/An toàn";
+        lblCurrentAction.setText("[" + st.name() + " | " + gateTag + "] " + state.getCurrentActionPath()
             + (state.getCurrentPageUrl().isEmpty() ? "" : ("  (" + state.getCurrentPageUrl() + ")")));
 
         List<CapturedApiEntry> extras = state.getExtraCaptures();
         List<CrawlState.SkippedAction> skipped = state.getSkippedDangerActions();
         List<String> jsItems = state.getDiscoveredJsEndpoints();
 
-        mainTabs.setTitleAt(1, String.format("Bảng NOTE (%d)", totalNotes));
-        mainTabs.setTitleAt(2, String.format("Tiến độ Excel (%d/%d)", stats.matched, stats.total));
-        mainTabs.setTitleAt(3, String.format("Cây Phân cấp (%d)", store.totalCalls()));
+        mainTabs.setTitleAt(TAB_NOTES, String.format("Bảng NOTE (%d)", totalNotes));
+        mainTabs.setTitleAt(TAB_COVERAGE, String.format("Tiến độ Excel (%d/%d)", stats.matched, stats.total));
+        mainTabs.setTitleAt(TAB_TREE, String.format("Cây Phân cấp (%d)", store.totalCalls()));
         auxTabs.setTitleAt(1, String.format("Ngoài Excel (%d)", extras.size()));
         auxTabs.setTitleAt(2, String.format("Nút bị né & JS (%d/%d)", skipped.size(), jsItems.size()));
 
@@ -1605,7 +2167,8 @@ public final class CrawlerTabPanel extends JPanel {
         txtApiSearch.setText("");
         chkOnlyApiNotes.setSelected(false);
         groupsModel.refresh();
-        mainTabs.setSelectedIndex(0);
+        mainTabs.setSelectedIndex(TAB_GROUPS);
+        setGroupsPaneVisible(true);
         reselectGroup(groupId);
         applyGroupApisFilter();
         ApiCall target = findApiCall(groupId, callIndex);
@@ -1704,7 +2267,7 @@ public final class CrawlerTabPanel extends JPanel {
             return;
         }
         boolean dark = AuditTheme.isDark(api, this);
-        Color baseBg = getBackground();
+        Color baseBg = AuditTheme.panelSurface(dark);
 
         String tag;
         if (call != null) {
@@ -1730,6 +2293,14 @@ public final class CrawlerTabPanel extends JPanel {
         lblSelectedSummary.setText(tag + cap.actionPath + "  ->  " + cap.method + " " + cap.fullUrl
             + "  (HTTP " + cap.statusCode + ", " + cap.paramCount() + " params: " + cap.paramSignature() + ")");
 
+        if (!inspectorVisible) {
+            String pDisp = cap.requestPathWithQuery != null ? cap.requestPathWithQuery : "";
+            if (pDisp.length() > 42) {
+                pDisp = pDisp.substring(0, 39) + "...";
+            }
+            btnToggleInspector.setText("⬓ Hiện HTTP Req/Resp (" + cap.method + " " + pDisp + ")");
+        }
+
         if (call != null && call.hasNotes()) {
             AuditNote.Severity worst = call.worstSeverity();
             txtNotesBanner.setText("NOTE (" + call.getNotes().size() + "): " + call.notesSummary());
@@ -1742,9 +2313,10 @@ public final class CrawlerTabPanel extends JPanel {
         } else {
             txtNotesBanner.setText("Params: " + (cap.paramCount() == 0 ? "(không có tham số)" : cap.paramSignature()));
             txtNotesBanner.setForeground(AuditTheme.mutedForeground(dark));
-            txtNotesBanner.setBackground(baseBg);
+            txtNotesBanner.setBackground(AuditTheme.cardSurface(dark));
         }
 
+        btnQueueInspector.setEnabled(call != null);
         btnSendRepeater.setEnabled(api != null);
         if (requestEditor != null && responseEditor != null) {
             try {
@@ -1763,10 +2335,11 @@ public final class CrawlerTabPanel extends JPanel {
 
     private void clearInspectorForMissing(ApiSpecEntry entry) {
         boolean dark = AuditTheme.isDark(api, this);
-        Color baseBg = getBackground();
+        Color baseBg = AuditTheme.panelSurface(dark);
         currentInspectEndpointKey = "";
         btnShowShared.setEnabled(false);
         btnShowShared.setText("Nhóm dùng chung");
+        btnQueueInspector.setEnabled(false);
 
         lblSelectedSummary.setText("[STT " + entry.stt + " - MISSING] " + entry.displayMethod + " " + entry.rawSpecPath);
         List<String> hints = entry.getJsHints();
@@ -1778,7 +2351,7 @@ public final class CrawlerTabPanel extends JPanel {
             txtNotesBanner.setText("Chưa có request nào khớp API này."
                 + (entry.extraInfo.isEmpty() ? "" : (" Thông tin thêm từ Excel: " + entry.extraInfo)));
             txtNotesBanner.setForeground(AuditTheme.mutedForeground(dark));
-            txtNotesBanner.setBackground(baseBg);
+            txtNotesBanner.setBackground(AuditTheme.cardSurface(dark));
         }
         btnSendRepeater.setEnabled(false);
         if (requestEditor != null && responseEditor != null) {
@@ -1788,16 +2361,21 @@ public final class CrawlerTabPanel extends JPanel {
     }
 
     private void clearInspector() {
+        boolean dark = AuditTheme.isDark(api, this);
         currentInspectEndpointKey = "";
-        lblSelectedSummary.setText("Chọn một API, NOTE hoặc lá cây để xem chi tiết Request / Response và Tên Nhóm");
+        lblSelectedSummary.setText("Chọn một API, NOTE hoặc lá cây (double-click hoặc bấm 'Hiện HTTP Req/Resp' để soi gói tin)");
         txtNotesBanner.setText("");
-        txtNotesBanner.setBackground(getBackground());
+        txtNotesBanner.setBackground(AuditTheme.cardSurface(dark));
         updatingVariants = true;
         cbVariant.removeAllItems();
         updatingVariants = false;
         btnShowShared.setEnabled(false);
         btnShowShared.setText("Nhóm dùng chung");
+        btnQueueInspector.setEnabled(false);
         btnSendRepeater.setEnabled(false);
+        if (!inspectorVisible) {
+            btnToggleInspector.setText("⬓ Hiện HTTP Req/Resp");
+        }
         if (requestEditor != null && responseEditor != null) {
             requestEditor.setRequest(HttpRequest.httpRequest());
             responseEditor.setResponse(HttpResponse.httpResponse());
@@ -1843,6 +2421,17 @@ public final class CrawlerTabPanel extends JPanel {
         appendLog("Đã gửi " + calls.size() + " API của nhóm [" + g.actionPath + "] sang Repeater.");
     }
 
+    private void attachDoubleClickToRevealInspector(JTable table) {
+        table.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2 && table.getSelectedRow() >= 0) {
+                    setInspectorVisible(true);
+                }
+            }
+        });
+    }
+
     private static void attachDocListener(JTextField field, Runnable onChange) {
         field.getDocument().addDocumentListener(new DocumentListener() {
             @Override public void insertUpdate(DocumentEvent e) { onChange.run(); }
@@ -1885,17 +2474,21 @@ public final class CrawlerTabPanel extends JPanel {
             JTree tree, Object value, boolean sel, boolean expanded, boolean leaf, int row, boolean hasFocus
         ) {
             Component c = super.getTreeCellRendererComponent(tree, value, sel, expanded, leaf, row, hasFocus);
+            boolean dark = AuditTheme.isDark(api, tree);
+            setBackgroundNonSelectionColor(AuditTheme.tableSurface(dark));
             if (!sel && value instanceof DefaultMutableTreeNode) {
                 Object uo = ((DefaultMutableTreeNode) value).getUserObject();
-                boolean dark = AuditTheme.isDark(api, tree);
                 if (uo instanceof TreeCallNode) {
                     AuditNote.Severity sev = ((TreeCallNode) uo).call.worstSeverity();
                     if (sev != null) {
                         setForeground(AuditTheme.severityForeground(sev, dark));
                     } else if (((TreeCallNode) uo).call.inExcel) {
                         setForeground(AuditTheme.okForeground(dark));
+                    } else {
+                        setForeground(AuditTheme.textPrimary(dark));
                     }
                 } else {
+                    setForeground(AuditTheme.textPrimary(dark));
                     setFont(tree.getFont().deriveFont(Font.BOLD));
                 }
             }
