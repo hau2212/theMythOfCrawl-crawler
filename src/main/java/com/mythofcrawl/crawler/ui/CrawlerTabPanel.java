@@ -168,6 +168,11 @@ public final class CrawlerTabPanel extends JPanel {
     private final JTabbedPane auxTabs = new JTabbedPane();
 
     // Tab 0: Action Groups + APIs inside Group
+    private boolean treeViewMode = true;
+    private final JToggleButton btnViewTree = new JToggleButton("🌳 Cây thư mục & Gộp Path", true);
+    private final JToggleButton btnViewFlat = new JToggleButton("📋 Bảng phẳng (Hiện tại)", false);
+    private final JButton btnTreeExpandTables = new JButton("⊞ Sổ hết");
+    private final JButton btnTreeCollapseTables = new JButton("⊟ Thu gọn");
     private final GroupTableModel.ActionGroupsModel groupsModel;
     private final JTable tblGroups;
     private final JComboBox<String> cbGroupFilter = new JComboBox<>(
@@ -202,6 +207,9 @@ public final class CrawlerTabPanel extends JPanel {
     private final JTextField txtSearch = new JTextField(18);
 
     // Tab 5: Hierarchy Tree
+    private boolean treeTabByApiPath = false;
+    private final JToggleButton btnTreeByAction = new JToggleButton("🌳 Theo Nhóm (Gộp Path trùng)", true);
+    private final JToggleButton btnTreeByPath = new JToggleButton("📂 Theo Cây Path API (/...)", false);
     private final DefaultMutableTreeNode treeRoot;
     private final DefaultTreeModel treeModel;
     private final JTree actionTree;
@@ -818,15 +826,34 @@ public final class CrawlerTabPanel extends JPanel {
         leftFilter.add(btnClearGroup);
 
         AuditTheme.configureAuditTable(tblGroups, api);
-        tblGroups.setAutoCreateRowSorter(true);
         tblGroups.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         tblGroups.setDefaultRenderer(Object.class, new GroupTableModel.GroupCellRenderer(api));
         tblGroups.setDefaultRenderer(Integer.class, new GroupTableModel.GroupCellRenderer(api));
-        setColumnWidths(tblGroups.getColumnModel(), new int[]{38, 280, 56, 56, 56, 46});
 
         tblGroups.getSelectionModel().addListSelectionListener(e -> {
             if (!e.getValueIsAdjusting()) {
                 applyGroupApisFilter();
+            }
+        });
+        tblGroups.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (!SwingUtilities.isLeftMouseButton(e)) {
+                    return;
+                }
+                int vr = tblGroups.rowAtPoint(e.getPoint());
+                int vc = tblGroups.columnAtPoint(e.getPoint());
+                if (vr < 0) {
+                    return;
+                }
+                int mr = tblGroups.convertRowIndexToModel(vr);
+                GroupTableModel.ActionGroupsModel.GroupRow row = groupsModel.getRowAt(mr);
+                if (row != null && row.isFolder && ((vc == 0 && e.getClickCount() == 1) || e.getClickCount() == 2)) {
+                    String folderKey = row.folderKey;
+                    groupsModel.toggleFolderExpanded(mr);
+                    reselectFolderKey(folderKey);
+                    applyGroupApisFilter();
+                }
             }
         });
         installGroupPopupMenu();
@@ -836,7 +863,7 @@ public final class CrawlerTabPanel extends JPanel {
         spGroups.getViewport().setBackground(AuditTheme.tableSurface(dark));
         leftGroupsPanel.add(spGroups, BorderLayout.CENTER);
 
-        // Right pane: APIs inside selected group (or all grouped APIs)
+        // Right pane: APIs inside selected group/folder (or all grouped APIs)
         JPanel rightPanel = new JPanel(new BorderLayout(4, 4));
         rightPanel.setBackground(AuditTheme.panelSurface(dark));
         rightPanel.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
@@ -845,6 +872,35 @@ public final class CrawlerTabPanel extends JPanel {
         rightHeader.setOpaque(false);
         lblGroupHeader.setFont(lblGroupHeader.getFont().deriveFont(Font.BOLD));
         lblGroupHeader.setBorder(BorderFactory.createEmptyBorder(2, 4, 2, 4));
+
+        JPanel viewModeBar = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
+        viewModeBar.setOpaque(false);
+        btnViewTree.setToolTipText("Chế độ cây: gộp nhóm cùng nhánh và gộp >= 2 API cùng path (sổ ra vẫn giữ nguyên tên & thụt lề)");
+        btnViewFlat.setToolTipText("Chế độ bảng phẳng như ban đầu (cho phép sort theo từng cột)");
+        btnTreeExpandTables.setToolTipText("Mở rộng toàn bộ thư mục nhóm và nhóm path trùng");
+        btnTreeCollapseTables.setToolTipText("Thu gọn toàn bộ thư mục nhóm và nhóm path trùng");
+        AuditTheme.styleTogglePill(btnTreeExpandTables, false, AuditTheme.mutedForeground(dark), dark);
+        AuditTheme.styleTogglePill(btnTreeCollapseTables, false, AuditTheme.mutedForeground(dark), dark);
+        btnViewTree.addActionListener(e -> setGroupViewMode(true));
+        btnViewFlat.addActionListener(e -> setGroupViewMode(false));
+        btnTreeExpandTables.addActionListener(e -> {
+            groupsModel.expandAllFolders();
+            groupApisModel.expandAllPathGroups();
+        });
+        btnTreeCollapseTables.addActionListener(e -> {
+            groupsModel.collapseAllFolders();
+            groupApisModel.collapseAllPathGroups();
+        });
+        viewModeBar.add(btnViewTree);
+        viewModeBar.add(btnViewFlat);
+        viewModeBar.add(btnTreeExpandTables);
+        viewModeBar.add(btnTreeCollapseTables);
+
+        JPanel rightTopLine = new JPanel(new BorderLayout(6, 0));
+        rightTopLine.setOpaque(false);
+        rightTopLine.add(lblGroupHeader, BorderLayout.CENTER);
+        rightTopLine.add(viewModeBar, BorderLayout.EAST);
+
         JPanel rightFilter = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
         rightFilter.setOpaque(false);
         chkAllApisWhenUnselected.setOpaque(false);
@@ -857,25 +913,55 @@ public final class CrawlerTabPanel extends JPanel {
         rightFilter.add(new JLabel("Tìm API:"));
         rightFilter.add(txtApiSearch);
 
-        rightHeader.add(lblGroupHeader, BorderLayout.NORTH);
+        rightHeader.add(rightTopLine, BorderLayout.NORTH);
         rightHeader.add(rightFilter, BorderLayout.SOUTH);
 
         AuditTheme.configureAuditTable(tblGroupApis, api);
-        tblGroupApis.setAutoCreateRowSorter(true);
         tblGroupApis.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         tblGroupApis.setDefaultRenderer(Object.class, new GroupTableModel.GroupApiCellRenderer(api));
         tblGroupApis.setDefaultRenderer(Integer.class, new GroupTableModel.GroupApiCellRenderer(api));
-        setColumnWidths(tblGroupApis.getColumnModel(), new int[]{38, 230, 68, 240, 54, 150, 44, 68, 220});
+
+        applyGroupViewModeToTables(dark);
 
         tblGroupApis.getSelectionModel().addListSelectionListener(e -> {
             if (!e.getValueIsAdjusting()) {
-                ApiCall call = getSelectedGroupApi();
+                GroupTableModel.GroupApisModel.ApiDisplayRow row = getSelectedGroupApiRow();
+                if (row == null) {
+                    return;
+                }
+                ApiCall call = row.call != null ? row.call : pickRepresentativeCall(row.groupedCalls);
                 if (call != null) {
                     showApiCallInInspector(call);
                 }
             }
         });
-        attachDoubleClickToRevealInspector(tblGroupApis);
+        tblGroupApis.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (!SwingUtilities.isLeftMouseButton(e)) {
+                    return;
+                }
+                int vr = tblGroupApis.rowAtPoint(e.getPoint());
+                int vc = tblGroupApis.columnAtPoint(e.getPoint());
+                if (vr < 0) {
+                    return;
+                }
+                int mr = tblGroupApis.convertRowIndexToModel(vr);
+                GroupTableModel.GroupApisModel.ApiDisplayRow row = groupApisModel.getRowAt(mr);
+                if (row == null) {
+                    return;
+                }
+                if (row.isGroupHeader) {
+                    if ((vc == 0 && e.getClickCount() == 1) || e.getClickCount() == 2) {
+                        String pathKey = row.pathKey;
+                        groupApisModel.togglePathGroupExpanded(mr);
+                        reselectPathGroupHeader(pathKey);
+                    }
+                } else if (e.getClickCount() == 2) {
+                    setInspectorVisible(true);
+                }
+            }
+        });
         installGroupApiPopupMenu();
 
         rightPanel.add(rightHeader, BorderLayout.NORTH);
@@ -890,35 +976,96 @@ public final class CrawlerTabPanel extends JPanel {
         return groupsSplitPane;
     }
 
+    public boolean isGroupTreeViewMode() {
+        return treeViewMode;
+    }
+
+    public void setGroupViewMode(boolean treeMode) {
+        this.treeViewMode = treeMode;
+        GroupTableModel.ActionGroupsModel.GroupRow prevGroupRow = getSelectedGroupRow();
+        ApiCall prevCall = getSelectedGroupApi();
+        boolean dark = AuditTheme.isDark(api, this);
+        applyGroupViewModeToTables(dark);
+        if (prevGroupRow != null) {
+            if (prevGroupRow.directGroup != null) {
+                if (treeMode) {
+                    groupsModel.ensureGroupVisible(prevGroupRow.directGroup);
+                }
+                reselectGroup(prevGroupRow.directGroup.id);
+            } else if (treeMode && prevGroupRow.folderKey != null) {
+                reselectFolderKey(prevGroupRow.folderKey);
+            }
+        }
+        applyGroupApisFilter();
+        if (prevCall != null) {
+            if (treeMode) {
+                groupApisModel.ensureCallVisible(prevCall);
+            }
+            reselectGroupApi(prevCall);
+        }
+    }
+
+    private void applyGroupViewModeToTables(boolean dark) {
+        groupsModel.setTreeMode(treeViewMode);
+        groupApisModel.setTreeMode(treeViewMode);
+
+        tblGroups.setAutoCreateRowSorter(!treeViewMode);
+        tblGroupApis.setAutoCreateRowSorter(!treeViewMode);
+        if (treeViewMode) {
+            tblGroups.setRowSorter(null);
+            tblGroupApis.setRowSorter(null);
+        }
+        setColumnWidths(tblGroups.getColumnModel(), new int[]{42, 280, 56, 56, 56, 46});
+        setColumnWidths(tblGroupApis.getColumnModel(), new int[]{42, 250, 72, 240, 56, 150, 46, 68, 220});
+
+        btnViewTree.setSelected(treeViewMode);
+        btnViewFlat.setSelected(!treeViewMode);
+        AuditTheme.styleTogglePill(btnViewTree, treeViewMode, AuditTheme.accentForeground(dark), dark);
+        AuditTheme.styleTogglePill(btnViewFlat, !treeViewMode, AuditTheme.accentForeground(dark), dark);
+        btnTreeExpandTables.setVisible(treeViewMode);
+        btnTreeCollapseTables.setVisible(treeViewMode);
+    }
+
     private void installGroupPopupMenu() {
         JPopupMenu popup = new JPopupMenu();
-        JMenuItem miPushGroup = new JMenuItem("📤 Đưa CẢ NHÓM vào hàng đẩy Logger++ (Extender)");
-        JMenuItem miSendAll = new JMenuItem("Send CẢ NHÓM API sang Repeater");
+        JMenuItem miPushGroup = new JMenuItem("📤 Đưa NHÓM / NHÁNH này vào hàng đẩy Logger++ (Extender)");
+        JMenuItem miSendAll = new JMenuItem("Send tất cả API trong nhóm / nhánh sang Repeater");
         JMenuItem miCopyPath = new JMenuItem("Copy Tên Nhóm (Action Path)");
         JMenuItem miCopyUrl = new JMenuItem("Copy Page URL");
 
         miPushGroup.addActionListener(e -> {
-            ActionGroup g = getSelectedGroup();
-            if (g != null) {
-                enqueueGroupWithFeedback(g, true);
+            GroupTableModel.ActionGroupsModel.GroupRow row = getSelectedGroupRow();
+            if (row == null) {
+                return;
+            }
+            if (row.directGroup != null) {
+                enqueueGroupWithFeedback(row.directGroup, true);
+            } else {
+                List<ApiCall> calls = collectCallsFromGroups(row.subtreeGroups);
+                enqueueCallsWithFeedback(calls, "Nhánh " + row.folderKey, true);
             }
         });
         miSendAll.addActionListener(e -> {
-            ActionGroup g = getSelectedGroup();
-            if (g != null) {
-                sendGroupToRepeater(g);
+            GroupTableModel.ActionGroupsModel.GroupRow row = getSelectedGroupRow();
+            if (row == null) {
+                return;
+            }
+            if (row.directGroup != null) {
+                sendGroupToRepeater(row.directGroup);
+            } else {
+                sendCallsToRepeater(collectCallsFromGroups(row.subtreeGroups), "nhánh " + row.folderKey);
             }
         });
         miCopyPath.addActionListener(e -> {
-            ActionGroup g = getSelectedGroup();
-            if (g != null) {
-                copyToClipboard(g.actionPath);
+            GroupTableModel.ActionGroupsModel.GroupRow row = getSelectedGroupRow();
+            if (row != null) {
+                copyToClipboard(row.directGroup != null ? row.directGroup.actionPath : row.folderKey);
             }
         });
         miCopyUrl.addActionListener(e -> {
-            ActionGroup g = getSelectedGroup();
-            if (g != null) {
-                copyToClipboard(g.pageUrl);
+            GroupTableModel.ActionGroupsModel.GroupRow row = getSelectedGroupRow();
+            if (row != null && !row.subtreeGroups.isEmpty()) {
+                copyToClipboard(row.subtreeGroups.get(0).pageUrl);
             }
         });
 
@@ -932,7 +1079,7 @@ public final class CrawlerTabPanel extends JPanel {
 
     private void installGroupApiPopupMenu() {
         JPopupMenu popup = new JPopupMenu();
-        JMenuItem miPushApi = new JMenuItem("📤 Đưa API này vào hàng đẩy Logger++ (Extender)");
+        JMenuItem miPushApi = new JMenuItem("📤 Đưa API (hoặc nhóm path) này vào hàng đẩy Logger++ (Extender)");
         JMenuItem miPushGroup = new JMenuItem("📤 Đưa CẢ NHÓM chứa API này vào hàng đẩy Logger++");
         JMenuItem miSend = new JMenuItem("Send to Repeater");
         JMenuItem miSendGroup = new JMenuItem("Send CẢ NHÓM chứa API này sang Repeater");
@@ -941,13 +1088,18 @@ public final class CrawlerTabPanel extends JPanel {
         JMenuItem miCopyUrl = new JMenuItem("Copy Full URL");
 
         miPushApi.addActionListener(e -> {
-            ApiCall c = getSelectedGroupApi();
-            if (c != null) {
-                enqueueCallsWithFeedback(Collections.singletonList(c), "API " + c.displayName(), true);
+            GroupTableModel.GroupApisModel.ApiDisplayRow row = getSelectedGroupApiRow();
+            if (row == null) {
+                return;
+            }
+            if (row.isGroupHeader) {
+                enqueueCallsWithFeedback(row.groupedCalls, "Path " + row.pathKey + " (" + row.groupedCalls.size() + " API)", true);
+            } else if (row.call != null) {
+                enqueueCallsWithFeedback(Collections.singletonList(row.call), "API " + row.call.displayName(), true);
             }
         });
         miPushGroup.addActionListener(e -> {
-            ApiCall c = getSelectedGroupApi();
+            ApiCall c = getRepresentativeSelectedApiCall();
             if (c != null) {
                 ActionGroup g = state.getActionGroups().getGroup(c.groupId);
                 if (g != null) {
@@ -956,14 +1108,20 @@ public final class CrawlerTabPanel extends JPanel {
             }
         });
         miSend.addActionListener(e -> {
-            ApiCall c = getSelectedGroupApi();
-            if (c != null) {
+            GroupTableModel.GroupApisModel.ApiDisplayRow row = getSelectedGroupApiRow();
+            if (row == null) {
+                return;
+            }
+            if (row.isGroupHeader) {
+                sendCallsToRepeater(row.groupedCalls, "nhóm path " + row.pathKey);
+            } else if (row.call != null) {
+                ApiCall c = row.call;
                 String tag = c.inExcel ? ("STT " + c.excelStt) : ("G" + c.groupId + "#" + c.index);
                 sendToRepeater(c.capture, tag + " " + c.capture.method);
             }
         });
         miSendGroup.addActionListener(e -> {
-            ApiCall c = getSelectedGroupApi();
+            ApiCall c = getRepresentativeSelectedApiCall();
             if (c != null) {
                 ActionGroup g = state.getActionGroups().getGroup(c.groupId);
                 if (g != null) {
@@ -972,19 +1130,19 @@ public final class CrawlerTabPanel extends JPanel {
             }
         });
         miShared.addActionListener(e -> {
-            ApiCall c = getSelectedGroupApi();
+            ApiCall c = getRepresentativeSelectedApiCall();
             if (c != null) {
                 showSharedGroupsDialog(c.endpointKey);
             }
         });
         miCopyName.addActionListener(e -> {
-            ApiCall c = getSelectedGroupApi();
-            if (c != null) {
-                copyToClipboard(c.displayName());
+            GroupTableModel.GroupApisModel.ApiDisplayRow row = getSelectedGroupApiRow();
+            if (row != null) {
+                copyToClipboard(row.call != null ? row.call.displayName() : row.pathKey);
             }
         });
         miCopyUrl.addActionListener(e -> {
-            ApiCall c = getSelectedGroupApi();
+            ApiCall c = getRepresentativeSelectedApiCall();
             if (c != null) {
                 copyToClipboard(c.capture.fullUrl);
             }
@@ -1175,7 +1333,35 @@ public final class CrawlerTabPanel extends JPanel {
         btnExpand.addActionListener(e -> expandAllTreeNodes(true));
         btnCollapse.addActionListener(e -> expandAllTreeNodes(false));
         btnRefreshTree.addActionListener(e -> rebuildHierarchyTree());
-        bar.add(new JLabel("Cây hành động & nhóm API (root > trang > nút -> API):"));
+
+        btnTreeByAction.setSelected(!treeTabByApiPath);
+        btnTreeByPath.setSelected(treeTabByApiPath);
+        AuditTheme.styleTogglePill(btnTreeByAction, !treeTabByApiPath, AuditTheme.accentForeground(dark), dark);
+        AuditTheme.styleTogglePill(btnTreeByPath, treeTabByApiPath, AuditTheme.accentForeground(dark), dark);
+        btnTreeByAction.setToolTipText("Nhóm theo hành động UI (gộp >= 2 API cùng path ngay bên trong mỗi nhánh)");
+        btnTreeByPath.setToolTipText("Xếp theo cây thư mục URL Path (/api/v1/...) gộp mọi API cùng path & giữ tên nhóm ở từng lá");
+        btnTreeByAction.addActionListener(e -> {
+            treeTabByApiPath = false;
+            boolean isDark = AuditTheme.isDark(api, this);
+            btnTreeByAction.setSelected(true);
+            btnTreeByPath.setSelected(false);
+            AuditTheme.styleTogglePill(btnTreeByAction, true, AuditTheme.accentForeground(isDark), isDark);
+            AuditTheme.styleTogglePill(btnTreeByPath, false, AuditTheme.accentForeground(isDark), isDark);
+            rebuildHierarchyTree();
+        });
+        btnTreeByPath.addActionListener(e -> {
+            treeTabByApiPath = true;
+            boolean isDark = AuditTheme.isDark(api, this);
+            btnTreeByAction.setSelected(false);
+            btnTreeByPath.setSelected(true);
+            AuditTheme.styleTogglePill(btnTreeByAction, false, AuditTheme.accentForeground(isDark), isDark);
+            AuditTheme.styleTogglePill(btnTreeByPath, true, AuditTheme.accentForeground(isDark), isDark);
+            rebuildHierarchyTree();
+        });
+
+        bar.add(new JLabel("Chế độ cây:"));
+        bar.add(btnTreeByAction);
+        bar.add(btnTreeByPath);
         bar.add(btnExpand);
         bar.add(btnCollapse);
         bar.add(btnRefreshTree);
@@ -1202,22 +1388,34 @@ public final class CrawlerTabPanel extends JPanel {
         });
 
         JPopupMenu treePopup = new JPopupMenu();
-        JMenuItem miTreePush = new JMenuItem("📤 Đưa API này vào hàng đẩy Logger++ (Extender)");
+        JMenuItem miTreePush = new JMenuItem("📤 Đưa API (hoặc cả nhánh) vào hàng đẩy Logger++ (Extender)");
         JMenuItem miTreeRep = new JMenuItem("Send to Repeater");
         JMenuItem miTreeRepGroup = new JMenuItem("Send CẢ NHÓM chứa API này sang Repeater");
         miTreePush.addActionListener(e -> {
             DefaultMutableTreeNode node = (DefaultMutableTreeNode) actionTree.getLastSelectedPathComponent();
-            if (node != null && node.getUserObject() instanceof TreeCallNode) {
+            if (node == null) {
+                return;
+            }
+            if (node.getUserObject() instanceof TreeCallNode) {
                 TreeCallNode tcn = (TreeCallNode) node.getUserObject();
                 enqueueCallsWithFeedback(Collections.singletonList(tcn.call), tcn.call.displayName(), true);
+            } else {
+                List<ApiCall> calls = collectTreeCalls(node);
+                enqueueCallsWithFeedback(calls, "Nhánh cây " + node.getUserObject(), true);
             }
         });
         miTreeRep.addActionListener(e -> {
             DefaultMutableTreeNode node = (DefaultMutableTreeNode) actionTree.getLastSelectedPathComponent();
-            if (node != null && node.getUserObject() instanceof TreeCallNode) {
+            if (node == null) {
+                return;
+            }
+            if (node.getUserObject() instanceof TreeCallNode) {
                 TreeCallNode tcn = (TreeCallNode) node.getUserObject();
                 sendToRepeater(tcn.call.capture,
                     "G" + tcn.call.groupId + "#" + tcn.call.index + " " + tcn.call.capture.method);
+            } else {
+                List<ApiCall> calls = collectTreeCalls(node);
+                sendCallsToRepeater(calls, "nhánh cây " + node.getUserObject());
             }
         });
         miTreeRepGroup.addActionListener(e -> {
@@ -1853,17 +2051,19 @@ public final class CrawlerTabPanel extends JPanel {
             lastStoreVersion = curVer;
             lastNoteCount = totalNotes;
 
-            ActionGroup prevGroup = getSelectedGroup();
-            ApiCall prevCall = getSelectedGroupApi();
+            GroupTableModel.ActionGroupsModel.GroupRow prevGroupRow = getSelectedGroupRow();
+            GroupTableModel.GroupApisModel.ApiDisplayRow prevApiRow = getSelectedGroupApiRow();
             AuditNote prevNote = getSelectedNote();
 
             groupsModel.refresh();
-            if (prevGroup != null) {
-                reselectGroup(prevGroup.id);
-            }
+            reselectGroupOrFolder(prevGroupRow);
             applyGroupApisFilter();
-            if (prevCall != null) {
-                reselectGroupApi(prevCall);
+            if (prevApiRow != null) {
+                if (prevApiRow.call != null) {
+                    reselectGroupApi(prevApiRow.call);
+                } else if (prevApiRow.isGroupHeader) {
+                    reselectPathGroupHeader(prevApiRow.pathKey);
+                }
             }
             notesModel.refresh();
             if (prevNote != null) {
@@ -1896,7 +2096,7 @@ public final class CrawlerTabPanel extends JPanel {
     }
 
     private void applyGroupFilter() {
-        ActionGroup prev = getSelectedGroup();
+        GroupTableModel.ActionGroupsModel.GroupRow prevRow = getSelectedGroupRow();
         int idx = cbGroupFilter.getSelectedIndex();
         String mode = "WITH_APIS";
         if (idx == 1) {
@@ -1905,24 +2105,31 @@ public final class CrawlerTabPanel extends JPanel {
             mode = "WITH_NOTES";
         }
         groupsModel.setFilter(mode, txtGroupSearch.getText());
-        if (prev != null) {
-            reselectGroup(prev.id);
-        }
+        reselectGroupOrFolder(prevRow);
         applyGroupApisFilter();
     }
 
     private void applyGroupApisFilter() {
-        ActionGroup g = getSelectedGroup();
+        GroupTableModel.ActionGroupsModel.GroupRow rowMeta = getSelectedGroupRow();
         boolean showAllWhenNull = chkAllApisWhenUnselected.isSelected();
-        if (g != null) {
-            lblGroupHeader.setText("Nhóm: " + g.actionPath + "  (" + g.callCount() + " API, "
-                + g.noteCount() + " NOTE, " + g.getTriggerCount() + " lượt)");
+        List<ActionGroup> selectedGroups = Collections.emptyList();
+        if (rowMeta != null) {
+            selectedGroups = rowMeta.subtreeGroups;
+            if (rowMeta.isFolder) {
+                lblGroupHeader.setText("Nhánh: " + rowMeta.folderKey + "  ("
+                    + rowMeta.subtreeGroups.size() + " nhóm, "
+                    + rowMeta.totalApis + " API, " + rowMeta.totalNotes + " NOTE)");
+            } else if (rowMeta.directGroup != null) {
+                ActionGroup g = rowMeta.directGroup;
+                lblGroupHeader.setText("Nhóm: " + g.actionPath + "  (" + g.callCount() + " API, "
+                    + g.noteCount() + " NOTE, " + g.getTriggerCount() + " lượt)");
+            }
         } else if (showAllWhenNull) {
             lblGroupHeader.setText("Toàn bộ API đã nhóm (" + state.getActionGroups().totalCalls() + " API)");
         } else {
             lblGroupHeader.setText("Chọn một nhóm ở bảng bên trái để xem các API bên trong");
         }
-        groupApisModel.setGroupAndFilter(g, showAllWhenNull, chkOnlyApiNotes.isSelected(), txtApiSearch.getText());
+        groupApisModel.setGroupsAndFilter(selectedGroups, showAllWhenNull, chkOnlyApiNotes.isSelected(), txtApiSearch.getText());
     }
 
     private void applyNotesFilter() {
@@ -1956,29 +2163,125 @@ public final class CrawlerTabPanel extends JPanel {
         rebuildHierarchyTreeIfChanged(state.getActionGroups().version());
     }
 
+    private boolean lastBuiltTreeByPath = false;
+
     private void rebuildHierarchyTreeIfChanged(long curVer) {
-        if ((int) curVer == lastTreeVersion && treeRoot.getUserObject().equals(config.getRouteRootLabel())) {
+        String rootLabel = config.getRouteRootLabel();
+        if ((int) curVer == lastTreeVersion
+            && treeTabByApiPath == lastBuiltTreeByPath
+            && (treeTabByApiPath || rootLabel.equals(treeRoot.getUserObject()))) {
             return;
         }
         lastTreeVersion = (int) curVer;
+        lastBuiltTreeByPath = treeTabByApiPath;
 
         Set<String> expandedKeys = getExpandedDescendantKeys();
-        String rootLabel = config.getRouteRootLabel();
-        treeRoot.setUserObject(rootLabel);
         treeRoot.removeAllChildren();
 
         Map<String, DefaultMutableTreeNode> folderNodes = new LinkedHashMap<>();
-        for (ActionGroup g : state.getActionGroups().snapshotGroups()) {
-            if (g.callCount() == 0) {
-                continue;
+        if (treeTabByApiPath) {
+            treeRoot.setUserObject("API Path Tree (" + state.getActionGroups().totalCalls() + " API)");
+            for (ActionGroup g : state.getActionGroups().snapshotGroups()) {
+                for (ApiCall call : g.getCalls()) {
+                    String normPath = GroupTableModel.normalizeApiGroupPath(call);
+                    DefaultMutableTreeNode endpointFolder = resolveApiPathTreeFolder(folderNodes, normPath);
+                    endpointFolder.add(new DefaultMutableTreeNode(new TreeCallNode(call, true)));
+                }
             }
-            DefaultMutableTreeNode groupParent = resolveTreeFolder(folderNodes, g.actionPath, rootLabel);
-            for (ApiCall call : g.getCalls()) {
-                groupParent.add(new DefaultMutableTreeNode(new TreeCallNode(call)));
+        } else {
+            treeRoot.setUserObject(rootLabel);
+            Map<DefaultMutableTreeNode, List<ApiCall>> nodeCalls = new java.util.IdentityHashMap<>();
+            List<DefaultMutableTreeNode> orderedFolders = new ArrayList<>();
+            for (ActionGroup g : state.getActionGroups().snapshotGroups()) {
+                if (g.callCount() == 0) {
+                    continue;
+                }
+                DefaultMutableTreeNode groupParent = resolveTreeFolder(folderNodes, g.actionPath, rootLabel);
+                List<ApiCall> list = nodeCalls.get(groupParent);
+                if (list == null) {
+                    list = new ArrayList<>();
+                    nodeCalls.put(groupParent, list);
+                    orderedFolders.add(groupParent);
+                }
+                list.addAll(g.getCalls());
+            }
+            for (DefaultMutableTreeNode folder : orderedFolders) {
+                List<ApiCall> calls = nodeCalls.get(folder);
+                Map<String, List<ApiCall>> byPath = new LinkedHashMap<>();
+                for (ApiCall call : calls) {
+                    byPath.computeIfAbsent(GroupTableModel.normalizeApiGroupPath(call), k -> new ArrayList<>()).add(call);
+                }
+                for (Map.Entry<String, List<ApiCall>> entry : byPath.entrySet()) {
+                    List<ApiCall> bucket = entry.getValue();
+                    if (bucket.size() >= 2) {
+                        DefaultMutableTreeNode pathGroup = new DefaultMutableTreeNode(
+                            "📁 " + entry.getKey() + " (" + bucket.size() + " API)");
+                        for (ApiCall call : bucket) {
+                            pathGroup.add(new DefaultMutableTreeNode(new TreeCallNode(call, true)));
+                        }
+                        folder.add(pathGroup);
+                    } else {
+                        folder.add(new DefaultMutableTreeNode(new TreeCallNode(bucket.get(0), false)));
+                    }
+                }
             }
         }
         treeModel.reload();
         restoreExpandedKeys(expandedKeys);
+    }
+
+    private DefaultMutableTreeNode resolveApiPathTreeFolder(
+        Map<String, DefaultMutableTreeNode> folderNodes,
+        String normPath
+    ) {
+        String[] parts = normPath.split("/");
+        DefaultMutableTreeNode parent = treeRoot;
+        StringBuilder keyBuilder = new StringBuilder();
+        boolean addedAny = false;
+        for (String rawPart : parts) {
+            String seg = rawPart.trim();
+            if (seg.isEmpty()) {
+                continue;
+            }
+            addedAny = true;
+            keyBuilder.append('/').append(seg);
+            String fullKey = keyBuilder.toString();
+            DefaultMutableTreeNode node = folderNodes.get(fullKey);
+            if (node == null) {
+                node = new DefaultMutableTreeNode("/" + seg);
+                folderNodes.put(fullKey, node);
+                parent.add(node);
+            }
+            parent = node;
+        }
+        if (!addedAny) {
+            DefaultMutableTreeNode rootPath = folderNodes.get("/");
+            if (rootPath == null) {
+                rootPath = new DefaultMutableTreeNode("/");
+                folderNodes.put("/", rootPath);
+                treeRoot.add(rootPath);
+            }
+            return rootPath;
+        }
+        return parent;
+    }
+
+    private static List<ApiCall> collectTreeCalls(DefaultMutableTreeNode root) {
+        List<ApiCall> out = new ArrayList<>();
+        if (root == null) {
+            return out;
+        }
+        Enumeration<TreeNode> en = root.depthFirstEnumeration();
+        while (en.hasMoreElements()) {
+            TreeNode tn = en.nextElement();
+            if (tn instanceof DefaultMutableTreeNode) {
+                Object uo = ((DefaultMutableTreeNode) tn).getUserObject();
+                if (uo instanceof TreeCallNode) {
+                    out.add(((TreeCallNode) uo).call);
+                }
+            }
+        }
+        return out;
     }
 
     private DefaultMutableTreeNode resolveTreeFolder(
@@ -2067,12 +2370,44 @@ public final class CrawlerTabPanel extends JPanel {
     // Selection Lookups & Jump Navigation
     // =========================================================================
 
-    private ActionGroup getSelectedGroup() {
+    private GroupTableModel.ActionGroupsModel.GroupRow getSelectedGroupRow() {
         int vr = tblGroups.getSelectedRow();
         if (vr < 0) {
             return null;
         }
-        return groupsModel.getGroupAt(tblGroups.convertRowIndexToModel(vr));
+        return groupsModel.getRowAt(tblGroups.convertRowIndexToModel(vr));
+    }
+
+    private ActionGroup getSelectedGroup() {
+        GroupTableModel.ActionGroupsModel.GroupRow row = getSelectedGroupRow();
+        return row != null ? row.directGroup : null;
+    }
+
+    private void reselectGroupOrFolder(GroupTableModel.ActionGroupsModel.GroupRow prevRow) {
+        if (prevRow == null) {
+            return;
+        }
+        if (prevRow.directGroup != null) {
+            reselectGroup(prevRow.directGroup.id);
+        } else if (prevRow.isFolder && prevRow.folderKey != null) {
+            reselectFolderKey(prevRow.folderKey);
+        }
+    }
+
+    private void reselectFolderKey(String folderKey) {
+        if (folderKey == null) {
+            return;
+        }
+        for (int r = 0; r < groupsModel.getRowCount(); r++) {
+            GroupTableModel.ActionGroupsModel.GroupRow row = groupsModel.getRowAt(r);
+            if (row != null && row.isFolder && folderKey.equals(row.folderKey)) {
+                int vr = tblGroups.convertRowIndexToView(r);
+                if (vr >= 0) {
+                    tblGroups.setRowSelectionInterval(vr, vr);
+                }
+                break;
+            }
+        }
     }
 
     private void reselectGroup(int groupId) {
@@ -2088,6 +2423,14 @@ public final class CrawlerTabPanel extends JPanel {
         }
     }
 
+    private GroupTableModel.GroupApisModel.ApiDisplayRow getSelectedGroupApiRow() {
+        int vr = tblGroupApis.getSelectedRow();
+        if (vr < 0) {
+            return null;
+        }
+        return groupApisModel.getRowAt(tblGroupApis.convertRowIndexToModel(vr));
+    }
+
     private ApiCall getSelectedGroupApi() {
         int vr = tblGroupApis.getSelectedRow();
         if (vr < 0) {
@@ -2096,15 +2439,80 @@ public final class CrawlerTabPanel extends JPanel {
         return groupApisModel.getCallAt(tblGroupApis.convertRowIndexToModel(vr));
     }
 
-    private void reselectGroupApi(ApiCall target) {
+    private ApiCall getRepresentativeSelectedApiCall() {
+        GroupTableModel.GroupApisModel.ApiDisplayRow row = getSelectedGroupApiRow();
+        if (row == null) {
+            return null;
+        }
+        return row.call != null ? row.call : pickRepresentativeCall(row.groupedCalls);
+    }
+
+    private static ApiCall pickRepresentativeCall(List<ApiCall> calls) {
+        if (calls == null || calls.isEmpty()) {
+            return null;
+        }
+        for (ApiCall c : calls) {
+            if (c.hasNotes()) {
+                return c;
+            }
+        }
+        return calls.get(0);
+    }
+
+    private void reselectPathGroupHeader(String pathKey) {
+        if (pathKey == null) {
+            return;
+        }
         for (int r = 0; r < groupApisModel.getRowCount(); r++) {
-            if (groupApisModel.getCallAt(r) == target) {
+            GroupTableModel.GroupApisModel.ApiDisplayRow row = groupApisModel.getRowAt(r);
+            if (row != null && row.isGroupHeader && pathKey.equals(row.pathKey)) {
                 int vr = tblGroupApis.convertRowIndexToView(r);
                 if (vr >= 0) {
                     tblGroupApis.setRowSelectionInterval(vr, vr);
                 }
                 break;
             }
+        }
+    }
+
+    private void reselectGroupApi(ApiCall target) {
+        int r = groupApisModel.findRowForCall(target);
+        if (r >= 0) {
+            int vr = tblGroupApis.convertRowIndexToView(r);
+            if (vr >= 0) {
+                tblGroupApis.setRowSelectionInterval(vr, vr);
+            }
+        }
+    }
+
+    private static List<ApiCall> collectCallsFromGroups(List<ActionGroup> groups) {
+        List<ApiCall> out = new ArrayList<>();
+        if (groups == null) {
+            return out;
+        }
+        for (ActionGroup g : groups) {
+            if (g != null) {
+                out.addAll(g.getCalls());
+            }
+        }
+        return out;
+    }
+
+    private void sendCallsToRepeater(List<ApiCall> calls, String label) {
+        if (calls == null || calls.isEmpty()) {
+            return;
+        }
+        if (calls.size() > 25) {
+            int ok = JOptionPane.showConfirmDialog(this,
+                "Nhánh/nhóm [" + label + "] chứa " + calls.size() + " API. Gửi toàn bộ sang Repeater?",
+                "Xác nhận gửi sang Repeater", JOptionPane.YES_NO_OPTION);
+            if (ok != JOptionPane.YES_OPTION) {
+                return;
+            }
+        }
+        for (ApiCall c : calls) {
+            String tag = c.inExcel ? ("STT " + c.excelStt) : ("G" + c.groupId + "#" + c.index);
+            sendToRepeater(c.capture, tag + " " + c.capture.method);
         }
     }
 
@@ -2166,6 +2574,10 @@ public final class CrawlerTabPanel extends JPanel {
         txtGroupSearch.setText("");
         txtApiSearch.setText("");
         chkOnlyApiNotes.setSelected(false);
+        ActionGroup targetGroup = state.getActionGroups().getGroup(groupId);
+        if (targetGroup != null) {
+            groupsModel.ensureGroupVisible(targetGroup);
+        }
         groupsModel.refresh();
         mainTabs.setSelectedIndex(TAB_GROUPS);
         setGroupsPaneVisible(true);
@@ -2173,6 +2585,7 @@ public final class CrawlerTabPanel extends JPanel {
         applyGroupApisFilter();
         ApiCall target = findApiCall(groupId, callIndex);
         if (target != null) {
+            groupApisModel.ensureCallVisible(target);
             reselectGroupApi(target);
             showApiCallInInspector(target);
         }
@@ -2479,16 +2892,19 @@ public final class CrawlerTabPanel extends JPanel {
             if (!sel && value instanceof DefaultMutableTreeNode) {
                 Object uo = ((DefaultMutableTreeNode) value).getUserObject();
                 if (uo instanceof TreeCallNode) {
-                    AuditNote.Severity sev = ((TreeCallNode) uo).call.worstSeverity();
+                    TreeCallNode tcn = (TreeCallNode) uo;
+                    AuditNote.Severity sev = tcn.call.worstSeverity();
+                    setFont(tree.getFont());
                     if (sev != null) {
                         setForeground(AuditTheme.severityForeground(sev, dark));
-                    } else if (((TreeCallNode) uo).call.inExcel) {
+                    } else if (tcn.call.inExcel) {
                         setForeground(AuditTheme.okForeground(dark));
                     } else {
                         setForeground(AuditTheme.textPrimary(dark));
                     }
                 } else {
-                    setForeground(AuditTheme.textPrimary(dark));
+                    String txt = uo != null ? String.valueOf(uo) : "";
+                    setForeground(txt.startsWith("📁 ") ? AuditTheme.accentForeground(dark) : AuditTheme.textPrimary(dark));
                     setFont(tree.getFont().deriveFont(Font.BOLD));
                 }
             }
@@ -2517,9 +2933,11 @@ public final class CrawlerTabPanel extends JPanel {
 
     private static final class TreeCallNode {
         final ApiCall call;
+        final boolean includeGroupName;
 
-        TreeCallNode(ApiCall call) {
+        TreeCallNode(ApiCall call, boolean includeGroupName) {
             this.call = call;
+            this.includeGroupName = includeGroupName;
         }
 
         @Override
@@ -2528,9 +2946,10 @@ public final class CrawlerTabPanel extends JPanel {
                 ? ("[STT " + call.excelStt + "]")
                 : ("[G" + call.groupId + "#" + call.index + "]");
             String noteTag = call.hasNotes() ? ("  [NOTE: " + call.notesSummary() + "]") : "";
+            String groupTag = includeGroupName ? ("  —  Nhóm: " + call.displayName()) : "";
             return tag + " " + call.capture.method + " " + call.displayPath()
                 + "  (" + call.capture.paramCount() + " params, HTTP " + call.capture.statusCode
-                + ", x" + call.getHits() + ")" + noteTag;
+                + ", x" + call.getHits() + ")" + groupTag + noteTag;
         }
     }
 }

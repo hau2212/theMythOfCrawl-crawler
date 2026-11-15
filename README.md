@@ -23,8 +23,10 @@ Burp Suite Montoya API extension (Java `--release 17`, không phụ thuộc thư
    - Hỗ trợ **Gắn / Ghi đè (`SET`)**, **Thêm nếu chưa có (`ADD_IF_MISSING`)** và **Xóa Header (`REMOVE`)** theo phạm vi tất cả Target Hosts (`*`), chuỗi con hoặc `/regex/` (ví dụ `X-Account: a`, `Authorization`, `Cookie`).
    - Có nút mẫu nhanh (`+ Mẫu X-Account: a`, `+ Mẫu Authorization`), lưu qua **Burp Preferences**, mặc định áp dụng khi **Browser Crawl qua Proxy** và tắt khi **Đẩy qua Extender** để bảo toàn nguyên vẹn gói tin đẩy lên Elastic.
 
-5. **Nhóm chức năng & Cột/Bảng NOTE Audit (`ActionGroupStore` + `AuditNote`):**
+5. **Nhóm chức năng, Kiến trúc Cây Gộp Path & Hai chế độ View (`ActionGroupStore` + `GroupTableModel` + `CrawlerTabPanel`):**
    - Gom chung toàn bộ API phát sinh khi bấm nút/chức năng vào một **Nhóm Chức Năng** giữ nguyên hoa/thường theo đúng vùng UI & tiêu đề card/popup (ví dụ `toppage > Tin khuyến mãi > Happy Day... > Nút '334'`, `toppage > Đầu trang > Nút 'Đăng Nhập'`), khử trùng theo `Hits` và đánh **NOTE** (`Khác tham số`, `Khác HTTP status`, `HTTP 5xx`, `HTTP 401/403`, `Ngoài Excel`, `Nâng cấp bản Excel`, `Chuyển hướng ngoài`, `Tạm NOTE chuyển hướng`).
+   - **Hai chế độ View ngay trong tab `Nhóm & API`:** **`🌳 Cây thư mục & Gộp Path`** (mặc định: gộp các nhóm cùng nhánh Action Path thành thư mục tổng hợp số liệu và tự động gộp mọi path có `>= 2` API vào nhóm collapsible `📂 /path (N API)`; khi sổ ra vẫn giữ đầy đủ `Tên Nhóm` và thụt lề `↳` phân cấp) hoặc **`📋 Bảng phẳng (Hiện tại)`** (bảng phẳng kèm sort theo cột như ban đầu).
+   - **Tab `Cây Phân cấp`** hỗ trợ 2 chế độ chuyển nhanh: **`🌳 Theo Nhóm (Gộp Path trùng)`** và **`📂 Theo Cây Path API (/...)`** xếp theo cây thư mục endpoint gộp chung path trùng.
 
 6. **Duyệt từ Trên xuống Dưới & Chống kẹt Redirect Ngoài Host (`crawler-agent.js` + `ControlPlaneHandler` + `HtmlAgentInjector` + `CrawlState`):**
    - Sắp xếp mọi control theo tọa độ hình ảnh **(Popup/Modal trước -> Trên xuống Dưới theo hàng ngang -> Trái sang Phải)**, lọc bỏ container gộp nhiều nút để tránh dính chuỗi header dài.
@@ -39,7 +41,7 @@ Burp Suite Montoya API extension (Java `--release 17`, không phụ thuộc thư
 - `lib/montoya-api.jar` — PortSwigger Burp Montoya API (`2025.12`) phục vụ biên dịch.
 - `src/main/java/com/mythofcrawl/crawler/` — Mã nguồn Java (`CrawlerExtension`, `excel/`, `model/`, `proxy/`, `ui/`).
 - `src/main/resources/crawler-agent.js` — Browser Agent chạy qua Burp Proxy.
-- `src/test/java/com/mythofcrawl/crawler/CrawlerUnitTests.java` — Bộ unit test thuần Java (15 nhóm kiểm thử).
+- `src/test/java/com/mythofcrawl/crawler/CrawlerUnitTests.java` — Bộ unit test thuần Java (16 nhóm kiểm thử).
 - `build.ps1` — Script biên dịch (`--release 17`), đóng gói `.jar` và chạy kiểm thử.
 
 ## Build từ mã nguồn (Windows PowerShell)

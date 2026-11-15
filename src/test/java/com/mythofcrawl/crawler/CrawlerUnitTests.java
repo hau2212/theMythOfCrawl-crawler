@@ -71,6 +71,7 @@ public final class CrawlerUnitTests {
             testMultiLevelTrailBacktrackAndRedirectBounce();
             testStandaloneAuditNotesAndTableFilter();
             testLocalControlServerNoteBacktrackAndBounceEndpoints();
+            testTreeGroupingAndDualViewModels();
             System.out.println("ALL TESTS PASSED (" + passed + " test groups verified).");
         } finally {
             deleteRecursive(tmpDir.toFile());
@@ -522,6 +523,11 @@ public final class CrawlerUnitTests {
             CrawlerTabPanel panel = new CrawlerTabPanel(
                 null, cfg, st, null, pushMgr, ExcelSpecMatcher.empty(), null);
             assertTrue(panel.getComponentCount() >= 2, "CrawlerTabPanel mounted header and workspace");
+            assertTrue(panel.isGroupTreeViewMode(), "CrawlerTabPanel defaults to Tree & Path-Group View");
+            panel.setGroupViewMode(false);
+            assertTrue(!panel.isGroupTreeViewMode(), "Switches cleanly to Flat View");
+            panel.setGroupViewMode(true);
+            assertTrue(panel.isGroupTreeViewMode(), "Switches back cleanly to Tree View");
             panel.onPushLedgerUpdated();
             panel.dispose();
         });
@@ -652,6 +658,91 @@ public final class CrawlerUnitTests {
         } finally {
             server.stop();
         }
+    }
+
+    private static void testTreeGroupingAndDualViewModels() {
+        ActionGroupStore store = new ActionGroupStore();
+        ActionGroup g1 = store.openGroup("toppage > button 'Đăng nhập'", "button", "Đăng nhập", "https://target.local/");
+        ActionGroup g2 = store.openGroup("toppage > button 'Ưu đãi'", "button", "Ưu đãi", "https://target.local/");
+        ActionGroup g3 = store.openGroup("phim-dang-chieu > modal > button 'Đặt vé'", "button", "Đặt vé", "https://target.local/phim");
+
+        byte[] req = "GET /api HTTP/1.1\r\nHost: target.local\r\n\r\n".getBytes(StandardCharsets.UTF_8);
+        byte[] resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".getBytes(StandardCharsets.UTF_8);
+        long now = System.currentTimeMillis();
+
+        // /api/v2/promotions appears 3 times across g1 & g2; /api/v2/orders appears twice across g2 & g3; /api/v2/profile once
+        CapturedApiEntry cProm1 = new CapturedApiEntry("", "GET", "https://target.local/api/v2/promotions?page=1",
+            "/api/v2/promotions?page=1", "target.local", 443, true, g1.actionPath, req, resp, 200, resp.length, Set.of("page"), now);
+        CapturedApiEntry cProf = new CapturedApiEntry("", "GET", "https://target.local/api/v2/user/profile",
+            "/api/v2/user/profile", "target.local", 443, true, g1.actionPath, req, resp, 403, resp.length, Set.of(), now);
+        CapturedApiEntry cProm2 = new CapturedApiEntry("", "GET", "https://target.local/api/v2/promotions?page=2",
+            "/api/v2/promotions?page=2", "target.local", 443, true, g2.actionPath, req, resp, 200, resp.length, Set.of("page"), now);
+        CapturedApiEntry cProm3 = new CapturedApiEntry("", "POST", "https://target.local/api/v2/promotions?type=vip",
+            "/api/v2/promotions?type=vip", "target.local", 443, true, g2.actionPath, req, resp, 200, resp.length, Set.of("type"), now);
+        CapturedApiEntry cOrd1 = new CapturedApiEntry("", "POST", "https://target.local/api/v2/orders",
+            "/api/v2/orders", "target.local", 443, true, g2.actionPath, req, resp, 200, resp.length, Set.of(), now);
+        CapturedApiEntry cOrd2 = new CapturedApiEntry("", "DELETE", "https://target.local/api/v2/orders",
+            "/api/v2/orders", "target.local", 443, true, g3.actionPath, req, resp, 200, resp.length, Set.of(), now);
+
+        store.recordCall(g1, cProm1, "GET /api/v2/promotions", "", "", "", false, false);
+        store.recordCall(g1, cProf, "GET /api/v2/user/profile", "", "", "", false, false);
+        store.recordCall(g2, cProm2, "GET /api/v2/promotions", "", "", "", false, false);
+        store.recordCall(g2, cProm3, "POST /api/v2/promotions", "", "", "", false, false);
+        store.recordCall(g2, cOrd1, "POST /api/v2/orders", "", "", "", false, false);
+        store.recordCall(g3, cOrd2, "DELETE /api/v2/orders", "", "", "", false, false);
+
+        // 1) ActionGroupsModel Tree Mode: merges "toppage" folder (2 children) + path-compresses g3 -> 4 rows
+        GroupTableModel.ActionGroupsModel gm = new GroupTableModel.ActionGroupsModel(store);
+        gm.setFilter("WITH_APIS", "");
+        assertEquals(4, gm.getRowCount(), "Tree mode merges toppage prefix folder (1 folder + 2 children + 1 singleton)");
+        assertTrue(gm.isFolderRow(0), "Row 0 is merged folder toppage");
+        assertEquals(Integer.valueOf(5), gm.getValueAt(0, 2), "Folder rolls up 5 APIs under toppage");
+        assertEquals(2, gm.getGroupsAt(0).size(), "Folder exposes both child groups");
+        String childLabel = String.valueOf(gm.getValueAt(1, 1));
+        assertTrue(childLabel.startsWith("    ↳ ") && childLabel.contains("Đăng nhập"),
+            "Child group indented and keeps action name: " + childLabel);
+
+        gm.toggleFolderExpanded(0);
+        assertEquals(2, gm.getRowCount(), "Collapsing toppage hides its 2 child groups");
+        gm.toggleFolderExpanded(0);
+        assertEquals(4, gm.getRowCount(), "Re-expanding toppage restores 4 rows");
+
+        gm.setTreeMode(false);
+        assertEquals(3, gm.getRowCount(), "Flat mode shows 3 flat groups");
+
+        // 2) GroupApisModel Tree Mode: groups >= 2 calls sharing same normalized path & keeps full group names indented
+        GroupTableModel.GroupApisModel am = new GroupTableModel.GroupApisModel(store);
+        am.setGroupsAndFilter(null, true, false, "");
+        // /api/v2/promotions (1 header + 3 children) + /api/v2/user/profile (1 singleton) + /api/v2/orders (1 header + 2 children) = 8 rows
+        assertEquals(8, am.getRowCount(), "Path grouping wraps >= 2 calls and leaves singleton ungrouped");
+        assertTrue(am.isGroupHeaderRow(0), "Row 0 is /api/v2/promotions group header");
+        assertEquals("/api/v2/promotions", am.getRowAt(0).pathKey, "Header normalized path matches");
+        assertEquals(3, am.getCallsAt(0).size(), "Header holds 3 matching calls");
+
+        String childName1 = String.valueOf(am.getValueAt(1, 1));
+        String childName2 = String.valueOf(am.getValueAt(2, 1));
+        assertEquals("    ↳ toppage > button 'Đăng nhập'", childName1, "Indented child 1 retains full group name");
+        assertEquals("    ↳ toppage > button 'Ưu đãi'", childName2, "Indented child 2 retains full group name");
+
+        // Singleton profile at row 4 has no wrapper & no indent
+        assertTrue(!am.isGroupHeaderRow(4), "Singleton path has no group wrapper");
+        assertEquals("toppage > button 'Đăng nhập'", String.valueOf(am.getValueAt(4, 1)), "Singleton unindented");
+
+        // Orders >= 2 merged across g2 and g3
+        assertTrue(am.isGroupHeaderRow(5), "Row 5 is /api/v2/orders group header");
+        assertEquals(2, am.getCallsAt(5).size(), "Orders header groups 2 cross-group calls");
+        assertEquals("    ↳ phim-dang-chieu > modal > button 'Đặt vé'", String.valueOf(am.getValueAt(7, 1)),
+            "Indented cross-group child preserves full name");
+
+        am.togglePathGroupExpanded(0);
+        assertEquals(5, am.getRowCount(), "Collapsing /api/v2/promotions reduces row count by 3");
+        am.togglePathGroupExpanded(0);
+        assertEquals(8, am.getRowCount(), "Re-expanding restores all 8 rows");
+
+        am.setTreeMode(false);
+        assertEquals(6, am.getRowCount(), "Flat view shows all 6 calls without headers or indentation");
+        assertEquals("toppage > button 'Đăng nhập'", String.valueOf(am.getValueAt(0, 1)), "Flat mode keeps unindented name");
+        passed++;
     }
 
     private static String httpRequest(String method, String urlStr, String jsonBody) throws Exception {
