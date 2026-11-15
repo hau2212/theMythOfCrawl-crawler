@@ -44,7 +44,7 @@ public final class FormAndConfigPanel extends JPanel {
     private final JCheckBox cbUploadMockFiles = new JCheckBox("Tạo file giả đính kèm cho <input type='file'>");
 
     // Crawl & Tech settings
-    private final JComboBox<String> cbRootLabel = new JComboBox<>(new String[]{"toppage", "/"});
+    private final JComboBox<String> cbRootLabel = new JComboBox<>(new String[]{"/", "toppage"});
     private final JTextField tfApiPrefix = new JTextField(20);
     private final JCheckBox cbAutoFill = new JCheckBox("Bật tự điền Form khi Crawl");
     private final JCheckBox cbDeepCrawl = new JCheckBox("Crawl sâu toàn công nghệ (Shadow DOM, Same-origin Iframe, Lazy Scroll, Select Filter, Bảng Editable)");
@@ -275,7 +275,7 @@ public final class FormAndConfigPanel extends JPanel {
 
         Object rootObj = cbRootLabel.getEditor() != null
             ? cbRootLabel.getEditor().getItem() : cbRootLabel.getSelectedItem();
-        config.setRouteRootLabel(rootObj != null ? String.valueOf(rootObj) : "toppage");
+        config.setRouteRootLabel(rootObj != null ? String.valueOf(rootObj) : "/");
         config.setApiBasePrefix(tfApiPrefix.getText());
         config.setAutoFillForms(cbAutoFill.isSelected());
         config.setDeepCrawlMode(cbDeepCrawl.isSelected());

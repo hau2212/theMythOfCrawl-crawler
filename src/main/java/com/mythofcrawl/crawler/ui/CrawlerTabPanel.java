@@ -1016,7 +1016,7 @@ public final class CrawlerTabPanel extends JPanel {
             tblGroupApis.setRowSorter(null);
         }
         setColumnWidths(tblGroups.getColumnModel(), new int[]{42, 280, 56, 56, 56, 46});
-        setColumnWidths(tblGroupApis.getColumnModel(), new int[]{42, 250, 72, 240, 56, 150, 46, 68, 220});
+        setColumnWidths(tblGroupApis.getColumnModel(), new int[]{44, 300, 66, 230, 52, 210, 44, 64, 210});
 
         btnViewTree.setSelected(treeViewMode);
         btnViewFlat.setSelected(!treeViewMode);
@@ -2289,18 +2289,18 @@ public final class CrawlerTabPanel extends JPanel {
         String actionPath,
         String rootLabel
     ) {
-        String[] parts = actionPath.split("\\s*>\\s*");
+        List<String> parts = GroupTableModel.treeSegmentsForActionPath(actionPath);
         DefaultMutableTreeNode parent = treeRoot;
         StringBuilder keyBuilder = new StringBuilder(rootLabel);
         int start = 0;
-        if (parts.length > 0) {
-            String first = parts[0].trim();
-            if (first.equals("/") || first.equalsIgnoreCase(rootLabel)) {
+        if (!parts.isEmpty()) {
+            String first = parts.get(0).trim();
+            if ("/".equals(first) || (!"/".equals(rootLabel) && first.equalsIgnoreCase(rootLabel))) {
                 start = 1;
             }
         }
-        for (int i = start; i < parts.length; i++) {
-            String seg = parts[i].trim();
+        for (int i = start; i < parts.size(); i++) {
+            String seg = parts.get(i).trim();
             if (seg.isEmpty()) {
                 continue;
             }

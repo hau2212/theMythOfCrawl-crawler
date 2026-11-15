@@ -43,10 +43,18 @@ public final class GroupTableModel {
         if (c == null) {
             return "/";
         }
-        String raw = (c.inExcel && c.excelPath != null && !c.excelPath.trim().isEmpty())
-            ? c.excelPath.trim()
-            : c.displayPath();
-        return normalizeRawPathKey(raw);
+        if (c.inExcel && c.excelPath != null && !c.excelPath.trim().isEmpty()) {
+            return normalizeRawPathKey(c.excelPath.trim());
+        }
+        if (c.endpointKey != null && !c.endpointKey.trim().isEmpty()) {
+            String ek = c.endpointKey.trim();
+            int sp = ek.indexOf(' ');
+            if (sp > 0 && sp < 10) {
+                ek = ek.substring(sp + 1).trim();
+            }
+            return normalizeRawPathKey(ek);
+        }
+        return normalizeRawPathKey(c.displayPath());
     }
 
     public static String normalizeRawPathKey(String raw) {
@@ -102,6 +110,51 @@ public final class GroupTableModel {
             out.add("root");
         }
         return out;
+    }
+
+    public static List<String> treeSegmentsForActionPath(String actionPath) {
+        List<String> raw = splitActionPath(actionPath);
+        if (raw.size() >= 2 && "/".equals(raw.get(0))) {
+            List<String> out = new ArrayList<>(raw.size());
+            String second = raw.get(1);
+            if (isUiOrControlSegment(second)) {
+                out.add("Trang chủ (/)");
+                out.addAll(raw.subList(1, raw.size()));
+            } else {
+                out.add("/" + second);
+                out.addAll(raw.subList(2, raw.size()));
+            }
+            return out;
+        }
+        return raw;
+    }
+
+    private static boolean isUiOrControlSegment(String seg) {
+        if (seg == null) {
+            return false;
+        }
+        String l = seg.trim().toLowerCase();
+        return l.equals("page load")
+            || l.equals("manual")
+            || l.startsWith("section ")
+            || l.startsWith("popup ")
+            || l.startsWith("menu ")
+            || l.startsWith("mục ")
+            || l.startsWith("form ")
+            || l.startsWith("iframe ")
+            || l.startsWith("button ")
+            || l.startsWith("link ")
+            || l.startsWith("tab ")
+            || l.startsWith("menu-item ")
+            || l.startsWith("select ")
+            || l.startsWith("toggle ")
+            || l.startsWith("search ")
+            || l.startsWith("input ")
+            || l.startsWith("nút ")
+            || l.equals("button")
+            || l.equals("link")
+            || l.equals("form")
+            || l.equals("input");
     }
 
     private static String indentPrefix(int depth) {
@@ -256,7 +309,7 @@ public final class GroupTableModel {
 
             PrefixNode root = new PrefixNode("", "");
             for (ActionGroup g : filtered) {
-                List<String> parts = splitActionPath(g.actionPath);
+                List<String> parts = treeSegmentsForActionPath(g.actionPath);
                 PrefixNode cur = root;
                 StringBuilder pathAcc = new StringBuilder();
                 for (String part : parts) {
@@ -466,7 +519,7 @@ public final class GroupTableModel {
             if (findRowForGroupId(group.id) >= 0) {
                 return;
             }
-            List<String> parts = splitActionPath(group.actionPath);
+            List<String> parts = treeSegmentsForActionPath(group.actionPath);
             StringBuilder acc = new StringBuilder();
             boolean changed = false;
             for (int i = 0; i < parts.size(); i++) {
@@ -517,13 +570,14 @@ public final class GroupTableModel {
 
     public static final class GroupApisModel extends AbstractTableModel {
         private static final String[] COLS = {
-            "#", "Tên API (Tên Nhóm)", "Method", "Endpoint / Path", "HTTP", "Params", "Hits", "Excel", "NOTE"
+            "#", "Tên / Vị trí tìm thấy (Action Path)", "Method", "Endpoint / Path", "HTTP", "Params", "Hits", "Excel", "NOTE"
         };
 
         public static final class ApiDisplayRow {
             public final boolean isGroupHeader;
             public final boolean indentedChild;
             public final boolean collapsed;
+            public final boolean diffParamVariant;
             public final String pathKey;
             public final String titleDisplay;
             public final String methodDisplay;
@@ -542,6 +596,7 @@ public final class GroupTableModel {
                 boolean isGroupHeader,
                 boolean indentedChild,
                 boolean collapsed,
+                boolean diffParamVariant,
                 String pathKey,
                 String titleDisplay,
                 String methodDisplay,
@@ -559,6 +614,7 @@ public final class GroupTableModel {
                 this.isGroupHeader = isGroupHeader;
                 this.indentedChild = indentedChild;
                 this.collapsed = collapsed;
+                this.diffParamVariant = diffParamVariant;
                 this.pathKey = pathKey;
                 this.titleDisplay = titleDisplay;
                 this.methodDisplay = methodDisplay;
@@ -578,7 +634,8 @@ public final class GroupTableModel {
         private final ActionGroupStore store;
         private List<ApiCall> filteredCalls = new ArrayList<>();
         private List<ApiDisplayRow> rows = new ArrayList<>();
-        private final Set<String> collapsedPaths = new HashSet<>();
+        // Default collapsed so >= 2 same-path / diff-param calls stay rolled up until user expands
+        private final Set<String> expandedPaths = new HashSet<>();
         private boolean treeMode = true;
         private String searchQuery = "";
         private boolean onlyWithNotes = false;
@@ -634,6 +691,7 @@ public final class GroupTableModel {
                         || c.displayPath().toLowerCase().contains(this.searchQuery)
                         || normalizeApiGroupPath(c).toLowerCase().contains(this.searchQuery)
                         || c.capture.method.toLowerCase().contains(this.searchQuery)
+                        || c.capture.paramSignature().toLowerCase().contains(this.searchQuery)
                         || c.notesSummary().toLowerCase().contains(this.searchQuery)
                         || c.excelStt.toLowerCase().contains(this.searchQuery);
                     if (!hit) {
@@ -651,7 +709,7 @@ public final class GroupTableModel {
             List<ApiDisplayRow> out = new ArrayList<>();
             if (!treeMode) {
                 for (ApiCall c : filteredCalls) {
-                    out.add(leafRow(c, false));
+                    out.add(singletonLeafRow(c));
                 }
                 this.rows = out;
                 return;
@@ -666,20 +724,25 @@ public final class GroupTableModel {
                 String pathKey = entry.getKey();
                 List<ApiCall> bucket = entry.getValue();
                 if (bucket.size() < 2) {
-                    out.add(leafRow(bucket.get(0), false));
+                    out.add(singletonLeafRow(bucket.get(0)));
                     continue;
                 }
 
-                boolean collapsed = collapsedPaths.contains(pathKey);
+                // Auto-expand while user is searching so matches inside collapsed groups appear directly.
+                boolean expanded = expandedPaths.contains(pathKey) || !searchQuery.isEmpty();
+                boolean collapsed = !expanded;
+
                 Set<String> methods = new LinkedHashSet<>();
                 Set<Integer> statuses = new LinkedHashSet<>();
                 Set<String> groupNames = new LinkedHashSet<>();
                 Set<String> excelStts = new LinkedHashSet<>();
+                Map<String, List<ApiCall>> byParamSig = new LinkedHashMap<>();
                 int totalHits = 0;
                 int excelCount = 0;
                 int noteCallCount = 0;
                 AuditNote.Severity worst = null;
                 String sampleNote = "";
+
                 for (ApiCall c : bucket) {
                     if (!c.capture.method.isEmpty()) {
                         methods.add(c.capture.method);
@@ -688,6 +751,7 @@ public final class GroupTableModel {
                         statuses.add(c.capture.statusCode);
                     }
                     groupNames.add(c.displayName());
+                    byParamSig.computeIfAbsent(canonicalParamKey(c.capture.paramKeys), k -> new ArrayList<>()).add(c);
                     totalHits += c.getHits();
                     if (c.inExcel) {
                         excelCount++;
@@ -703,13 +767,18 @@ public final class GroupTableModel {
                         }
                     }
                 }
+
+                int variantCount = byParamSig.size();
+                boolean hasDiffParams = variantCount > 1;
                 String title = (collapsed ? "📁 " : "📂 ")
                     + pathKey
                     + " (" + bucket.size() + " API"
-                    + (groupNames.size() > 1 ? " • " + groupNames.size() + " nhóm" : "")
+                    + (hasDiffParams ? (" • " + variantCount + " kiểu param") : " • cùng param")
+                    + (groupNames.size() > 1 ? (" • " + groupNames.size() + " vị trí") : "")
                     + ")";
                 String methodText = String.join(", ", methods);
                 String statusText = joinInts(statuses);
+                String paramsHeader = formatHeaderParamsSummary(byParamSig, bucket.get(0));
                 String excelText = excelCount == 0
                     ? "-"
                     : (excelStts.size() == 1 && excelCount == bucket.size()
@@ -723,12 +792,13 @@ public final class GroupTableModel {
                     true,
                     false,
                     collapsed,
+                    hasDiffParams,
                     pathKey,
                     title,
                     methodText,
                     pathKey,
                     statusText,
-                    "Nhóm trùng path (" + bucket.size() + " API)",
+                    paramsHeader,
                     totalHits,
                     excelText,
                     noteText,
@@ -739,24 +809,29 @@ public final class GroupTableModel {
                 ));
 
                 if (!collapsed) {
-                    for (ApiCall child : bucket) {
-                        out.add(leafRow(child, true));
+                    Set<String> baselineKeys = bucket.get(0).capture.paramKeys;
+                    int variantIdx = 0;
+                    for (List<ApiCall> variantCalls : byParamSig.values()) {
+                        variantIdx++;
+                        for (ApiCall child : variantCalls) {
+                            out.add(groupedChildRow(child, variantIdx, variantCount, baselineKeys));
+                        }
                     }
                 }
             }
             this.rows = out;
         }
 
-        private static ApiDisplayRow leafRow(ApiCall c, boolean indented) {
-            String prefix = indented ? "    ↳ " : "";
+        private static ApiDisplayRow singletonLeafRow(ApiCall c) {
             return new ApiDisplayRow(
                 false,
-                indented,
+                false,
+                false,
                 false,
                 normalizeApiGroupPath(c),
-                prefix + c.displayName(),
+                c.displayName(),
                 c.capture.method,
-                prefix + c.displayPath(),
+                c.displayPath(),
                 String.valueOf(c.capture.statusCode),
                 c.capture.paramCount() + (c.capture.paramCount() > 0 ? " (" + c.capture.paramSignature() + ")" : ""),
                 c.getHits(),
@@ -767,6 +842,99 @@ public final class GroupTableModel {
                 c,
                 Collections.singletonList(c)
             );
+        }
+
+        private static ApiDisplayRow groupedChildRow(
+            ApiCall c,
+            int variantIdx,
+            int variantCount,
+            Set<String> baselineKeys
+        ) {
+            String baseParamLabel = c.capture.paramCount() > 0
+                ? (c.capture.paramCount() + " (" + c.capture.paramSignature() + ")")
+                : "0 (không param)";
+            boolean diffFromBaseline = variantCount > 1 && variantIdx > 1;
+            String paramText;
+            if (variantCount <= 1) {
+                paramText = baseParamLabel + " [cùng param]";
+            } else if (variantIdx == 1) {
+                paramText = "[Kiểu 1/" + variantCount + " (gốc)] " + baseParamLabel;
+            } else {
+                String diff = describeKeyDiffCompact(c.capture.paramKeys, baselineKeys);
+                paramText = "[Kiểu " + variantIdx + "/" + variantCount
+                    + (diff.isEmpty() ? "" : " | " + diff) + "] " + baseParamLabel;
+            }
+            return new ApiDisplayRow(
+                false,
+                true,
+                false,
+                diffFromBaseline,
+                normalizeApiGroupPath(c),
+                "    ↳ " + c.displayName(),
+                c.capture.method,
+                "    ↳ " + c.displayPath(),
+                String.valueOf(c.capture.statusCode),
+                paramText,
+                c.getHits(),
+                c.inExcel ? ("STT " + c.excelStt) : "-",
+                c.notesSummary(),
+                c.worstSeverity(),
+                c.inExcel,
+                c,
+                Collections.singletonList(c)
+            );
+        }
+
+        private static String canonicalParamKey(Set<String> keys) {
+            if (keys == null || keys.isEmpty()) {
+                return "";
+            }
+            List<String> sorted = new ArrayList<>(keys);
+            Collections.sort(sorted);
+            return String.join(", ", sorted);
+        }
+
+        private static String formatHeaderParamsSummary(Map<String, List<ApiCall>> byParamSig, ApiCall first) {
+            if (byParamSig.size() <= 1) {
+                int cnt = first.capture.paramCount();
+                if (cnt == 0) {
+                    return "Cùng param: 0 param";
+                }
+                return "Cùng param: " + cnt + " (" + first.capture.paramSignature() + ")";
+            }
+            StringBuilder variants = new StringBuilder();
+            int idx = 0;
+            for (String sig : byParamSig.keySet()) {
+                if (idx > 0) {
+                    variants.append(" | ");
+                }
+                variants.append(sig.isEmpty() ? "(rỗng)" : sig);
+                idx++;
+                if (idx >= 4 && byParamSig.size() > 4) {
+                    variants.append(" | ...");
+                    break;
+                }
+            }
+            return byParamSig.size() + " kiểu param: [" + variants + "]";
+        }
+
+        private static String describeKeyDiffCompact(Set<String> now, Set<String> base) {
+            List<String> added = new ArrayList<>();
+            List<String> removed = new ArrayList<>();
+            for (String k : now) {
+                if (!base.contains(k)) {
+                    added.add("+" + k);
+                }
+            }
+            for (String k : base) {
+                if (!now.contains(k)) {
+                    removed.add("-" + k);
+                }
+            }
+            List<String> all = new ArrayList<>(added.size() + removed.size());
+            all.addAll(added);
+            all.addAll(removed);
+            return String.join(", ", all);
         }
 
         private static String joinInts(Set<Integer> nums) {
@@ -807,29 +975,37 @@ public final class GroupTableModel {
             if (r == null || !r.isGroupHeader) {
                 return;
             }
-            if (!collapsedPaths.remove(r.pathKey)) {
-                collapsedPaths.add(r.pathKey);
+            if (!expandedPaths.add(r.pathKey)) {
+                expandedPaths.remove(r.pathKey);
             }
             rebuildDisplayRows();
             fireTableDataChanged();
         }
 
         public void expandAllPathGroups() {
-            if (!collapsedPaths.isEmpty()) {
-                collapsedPaths.clear();
+            boolean changed = false;
+            Map<String, Integer> counts = new LinkedHashMap<>();
+            for (ApiCall c : filteredCalls) {
+                String k = normalizeApiGroupPath(c);
+                counts.put(k, counts.getOrDefault(k, 0) + 1);
+            }
+            for (Map.Entry<String, Integer> e : counts.entrySet()) {
+                if (e.getValue() >= 2 && expandedPaths.add(e.getKey())) {
+                    changed = true;
+                }
+            }
+            if (changed) {
                 rebuildDisplayRows();
                 fireTableDataChanged();
             }
         }
 
         public void collapseAllPathGroups() {
-            for (ApiDisplayRow r : rows) {
-                if (r.isGroupHeader) {
-                    collapsedPaths.add(r.pathKey);
-                }
+            if (!expandedPaths.isEmpty()) {
+                expandedPaths.clear();
+                rebuildDisplayRows();
+                fireTableDataChanged();
             }
-            rebuildDisplayRows();
-            fireTableDataChanged();
         }
 
         public void ensureCallVisible(ApiCall target) {
@@ -840,7 +1016,7 @@ public final class GroupTableModel {
                 return;
             }
             String key = normalizeApiGroupPath(target);
-            if (collapsedPaths.remove(key)) {
+            if (expandedPaths.add(key)) {
                 rebuildDisplayRows();
                 fireTableDataChanged();
             }
@@ -1058,12 +1234,13 @@ public final class GroupTableModel {
                 GroupApisModel.ApiDisplayRow meta = ((GroupApisModel) table.getModel()).getRowAt(mr);
                 if (meta != null) {
                     if (meta.isGroupHeader) {
-                        tooltip = meta.pathKey + " (" + meta.groupedCalls.size() + " API cùng path — bấm "
-                            + (meta.collapsed ? "▶ để sổ ra" : "▼ để thu gọn") + ")";
+                        tooltip = meta.pathKey + " (" + meta.groupedCalls.size() + " API — " + meta.paramsDisplay + ") — bấm "
+                            + (meta.collapsed ? "▶ để sổ chi tiết" : "▼ để thu gọn");
                     } else if (meta.call != null && value != null) {
                         String s = String.valueOf(value);
-                        if (s.length() > 36) {
-                            tooltip = column == 1 ? meta.call.displayName() : (column == 3 ? meta.call.displayPath() : s);
+                        if (s.length() > 30 || column == 5) {
+                            tooltip = column == 1 ? meta.call.displayName()
+                                : (column == 3 ? meta.call.displayPath() : s);
                         }
                     }
                     if (!isSelected) {
@@ -1096,7 +1273,12 @@ public final class GroupTableModel {
                                 fg = AuditTheme.statusCodeForeground(meta.groupedCalls.get(0).capture.statusCode, dark);
                                 c.setFont(table.getFont().deriveFont(Font.BOLD));
                             } else if (column == 5) {
-                                fg = AuditTheme.mutedForeground(dark);
+                                fg = meta.diffParamVariant
+                                    ? AuditTheme.severityForeground(AuditNote.Severity.WARN, dark)
+                                    : AuditTheme.mutedForeground(dark);
+                                if (meta.diffParamVariant) {
+                                    c.setFont(table.getFont().deriveFont(Font.BOLD));
+                                }
                             } else if (column == 7 && meta.anyExcel) {
                                 fg = AuditTheme.okForeground(dark);
                                 c.setFont(table.getFont().deriveFont(Font.BOLD));
@@ -1111,6 +1293,9 @@ public final class GroupTableModel {
                                 c.setFont(table.getFont().deriveFont(Font.BOLD));
                             } else if (column == 4) {
                                 fg = AuditTheme.statusCodeForeground(call.capture.statusCode, dark);
+                                c.setFont(table.getFont().deriveFont(Font.BOLD));
+                            } else if (column == 5 && meta.diffParamVariant) {
+                                fg = AuditTheme.severityForeground(AuditNote.Severity.WARN, dark);
                                 c.setFont(table.getFont().deriveFont(Font.BOLD));
                             } else if (column == 7 && call.inExcel) {
                                 fg = AuditTheme.okForeground(dark);

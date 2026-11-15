@@ -48,7 +48,7 @@ public final class CrawlState {
         Pattern.CASE_INSENSITIVE);
 
     private volatile Status status = Status.IDLE;
-    private volatile String currentActionPath = "toppage > page load";
+    private volatile String currentActionPath = "/ > page load";
     private volatile String currentPageUrl = "";
     private volatile ActionGroup currentGroup;
     private volatile int pagesVisitedCount = 0;
@@ -221,7 +221,7 @@ public final class CrawlState {
         lastContextActionAtMs = 0L;
         pagesVisitedCount = 0;
         consecutiveAuthRejects = 0;
-        currentActionPath = "toppage > page load";
+        currentActionPath = "/ > page load";
         currentPageUrl = seedUrl != null ? seedUrl : "";
         currentGroup = null;
         if (seedUrl != null && !seedUrl.trim().isEmpty()) {

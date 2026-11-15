@@ -226,12 +226,13 @@
     }
   }
 
-  // Hierarchy Action Path formatter keeping original UI casing
+  // Hierarchy Action Path formatter keeping original UI casing and step-by-step context
   function sanitizeLabel(raw, maxLen) {
     if (!raw) return "";
     return String(raw)
       .replace(/[\r\n\t]+/g, " ")
       .replace(/>/g, "›")
+      .replace(/"/g, "”")
       .replace(/'/g, "’")
       .replace(/\s+/g, " ")
       .trim()
@@ -240,16 +241,16 @@
 
   function kindDisplayLabel(kind) {
     var k = String(kind || "").toLowerCase();
-    if (k === "button") return "Nút";
-    if (k === "link") return "Link";
-    if (k === "tab") return "Tab";
-    if (k === "menu") return "Menu";
-    if (k === "select") return "Danh sách";
-    if (k === "toggle") return "Công tắc";
-    if (k === "search") return "Ô tìm kiếm";
-    if (k === "form") return "Form";
-    if (k === "input") return "Ô nhập";
-    return kind || "Nút";
+    if (k === "button" || k === "nút") return "button";
+    if (k === "link") return "link";
+    if (k === "tab") return "tab";
+    if (k === "menu") return "menu-item";
+    if (k === "select" || k === "danh sách") return "select";
+    if (k === "toggle" || k === "công tắc") return "toggle";
+    if (k === "search" || k === "ô tìm kiếm") return "search";
+    if (k === "form") return "form";
+    if (k === "input" || k === "ô nhập") return "input";
+    return kind || "button";
   }
 
   function routeSegments(urlStr, normalizeIds) {
@@ -277,14 +278,20 @@
     return segs;
   }
 
-  function formatActionPath(urlStr, kind, label, stateObj, regionSegments) {
+  function formatActionPath(urlStr, kind, label, stateObj, regionSegments, framePrefix) {
     var normalizeIds = !stateObj || !!stateObj.normalizeRouteIds;
-    var rootLabel = (stateObj && stateObj.routeRootLabel) ? String(stateObj.routeRootLabel).trim() : "toppage";
-    if (!rootLabel) rootLabel = "toppage";
+    var rootLabel = (stateObj && stateObj.routeRootLabel) ? String(stateObj.routeRootLabel).trim() : "/";
+    if (!rootLabel) rootLabel = "/";
     var parts = [rootLabel].concat(routeSegments(urlStr, normalizeIds));
+    if (framePrefix) {
+      var fSeg = 'iframe "' + sanitizeLabel(framePrefix, 32) + '"';
+      if (parts.indexOf(fSeg) < 0) {
+        parts.push(fSeg);
+      }
+    }
     if (Array.isArray(regionSegments)) {
       for (var i = 0; i < regionSegments.length; i++) {
-        var seg = sanitizeLabel(regionSegments[i], 38);
+        var seg = sanitizeLabel(regionSegments[i], 56);
         if (seg && parts.indexOf(seg) < 0) {
           parts.push(seg);
         }
@@ -293,7 +300,7 @@
     if (!kind || kind === "page load") {
       parts.push("page load");
     } else if (label) {
-      parts.push(kindDisplayLabel(kind) + " '" + sanitizeLabel(label, 52) + "'");
+      parts.push(kindDisplayLabel(kind) + ' "' + sanitizeLabel(label, 52) + '"');
     } else {
       parts.push(kindDisplayLabel(kind));
     }
@@ -478,57 +485,213 @@
     return "Biểu tượng " + (tag || "nút");
   }
 
+  function cleanContainerHeading(raw, ownLower) {
+    var s = sanitizeLabel(raw, 42);
+    if (!s || s.length < 2) return "";
+    if (ownLower && s.toLowerCase() === ownLower) return "";
+    return s;
+  }
+
+  function findHeadingAbove(container, el, elRect, ownLower) {
+    if (!container) return "";
+    try {
+      var aria = cleanContainerHeading(
+        container.getAttribute && (container.getAttribute("aria-label") || container.getAttribute("data-title")),
+        ownLower
+      );
+      if (aria) return aria;
+      var labelledBy = container.getAttribute && container.getAttribute("aria-labelledby");
+      if (labelledBy && container.ownerDocument) {
+        var lblEl = container.ownerDocument.getElementById(labelledBy);
+        if (lblEl) {
+          var lt = cleanContainerHeading(extractDirectVisibleText(lblEl), ownLower);
+          if (lt) return lt;
+        }
+      }
+      if (container.querySelectorAll) {
+        var hList = container.querySelectorAll(
+          "h1, h2, h3, h4, h5, legend, .section-title, .block-title, .widget-title, .box-title, .panel-title, .card-title, .card-header, .footer-title, .sidebar-title, .title-box, [role='heading']"
+        );
+        for (var i = 0; i < hList.length && i < 6; i++) {
+          var hd = hList[i];
+          if (!hd || hd === el || (hd.contains && hd.contains(el)) || !isVisible(hd)) continue;
+          if (elRect) {
+            var hr = hd.getBoundingClientRect();
+            if (hr.top > elRect.bottom + 8) continue;
+          }
+          var txt = cleanContainerHeading(extractDirectVisibleText(hd), ownLower);
+          if (txt) return txt;
+        }
+      }
+      var prev = container.previousElementSibling;
+      if (prev && /^H[1-5]$/.test(prev.tagName || "")) {
+        var pt = cleanContainerHeading(extractDirectVisibleText(prev), ownLower);
+        if (pt) return pt;
+      }
+    } catch (e) {}
+    return "";
+  }
+
+  function findEnclosingLandmark(el, pattern) {
+    var cur = el ? el.parentElement : null;
+    for (var depth = 0; cur && cur !== document.body && cur !== document.documentElement && depth < 14; depth++) {
+      var tag = (cur.tagName || "").toUpperCase();
+      var role = (cur.getAttribute && cur.getAttribute("role") || "").toLowerCase();
+      var idCls = ((cur.id || "") + " " + (typeof cur.className === "string" ? cur.className : "")).toLowerCase();
+      if (pattern === "header") {
+        if (tag === "HEADER" || role === "banner") return cur;
+        if (/(^|[-_\s])(site-header|main-header|top-header|topbar|top-bar|navbar)($|[-_\s])/.test(idCls)
+          || ((/(^|[-_\s])header($|[-_\s])/.test(idCls)) && idCls.indexOf("card-header") < 0 && idCls.indexOf("modal-header") < 0 && idCls.indexOf("panel-header") < 0)) {
+          return cur;
+        }
+      } else if (pattern === "footer") {
+        if (tag === "FOOTER" || role === "contentinfo") return cur;
+        if (/(^|[-_\s])(site-footer|main-footer|bottom-bar|footer)($|[-_\s])/.test(idCls)
+          && idCls.indexOf("card-footer") < 0 && idCls.indexOf("modal-footer") < 0) {
+          return cur;
+        }
+      } else if (pattern === "sidebar") {
+        if (tag === "ASIDE" || role === "complementary") return cur;
+        if (/(sidebar|side-bar|left-menu|right-menu|menu-left|nav-left|aside-menu)/.test(idCls)) {
+          return cur;
+        }
+      }
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+
   function extractUiRegionSegments(el, ownLabel) {
     var segs = [];
-    var ownLower = (ownLabel || "").toLowerCase();
-    function pushUnique(raw) {
-      var s = sanitizeLabel(raw, 36);
-      if (!s || s.toLowerCase() === ownLower) return;
-      for (var i = 0; i < segs.length; i++) {
-        if (segs[i].toLowerCase() === s.toLowerCase()) return;
-      }
-      segs.push(s);
+    var ownLower = (ownLabel || "").trim().toLowerCase();
+    var seenTexts = {};
+
+    function pushSegment(prefix, title) {
+      var clean = sanitizeLabel(title, 36);
+      if (!clean) return false;
+      if (clean.toLowerCase() === ownLower || seenTexts[clean.toLowerCase()]) return false;
+      seenTexts[clean.toLowerCase()] = true;
+      segs.push(prefix + ' "' + clean + '"');
+      return true;
     }
+
     try {
+      var elRect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+
+      // 1. Popup / Modal / Drawer layer
       var modal = findModalContainer(el);
       if (modal) {
-        var mTitle = modal.getAttribute("aria-label") || "";
-        if (!mTitle && modal.querySelector) {
-          var mt = modal.querySelector("h1, h2, h3, h4, [role='heading'], .modal-title, [class*='title']");
-          if (mt) mTitle = extractDirectVisibleText(mt);
-        }
-        pushUnique(mTitle ? ("Popup '" + sanitizeLabel(mTitle, 28) + "'") : "Popup");
+        var mTitle = findHeadingAbove(modal, el, elRect, ownLower) || "hộp thoại";
+        pushSegment("popup", mTitle);
       }
 
-      if (el.closest) {
-        if (el.closest("header, [role='banner'], [class*='header']")) {
-          pushUnique("Đầu trang");
-        } else if (el.closest("footer, [role='contentinfo'], [class*='footer']")) {
-          pushUnique("Chân trang");
-        } else if (el.closest("aside, [role='complementary'], [class*='sidebar']")) {
-          pushUnique("Thanh bên");
-        }
+      // 2. Major Page Section (Header / Footer / Sidebar / Titled Section / Tab Panel / Main)
+      var zoneEl = null;
+      var headerEl = findEnclosingLandmark(el, "header");
+      var footerEl = headerEl ? null : findEnclosingLandmark(el, "footer");
+      var sidebarEl = (!headerEl && !footerEl) ? findEnclosingLandmark(el, "sidebar") : null;
 
-        // Nearest section heading
-        var section = el.closest("section, [role='region']");
-        if (section && section.querySelector) {
-          var sh = section.querySelector("h1, h2, h3");
-          if (sh && sh !== el && (!sh.contains || !sh.contains(el))) {
-            pushUnique(extractDirectVisibleText(sh));
+      if (headerEl) {
+        zoneEl = headerEl;
+        pushSegment("section", "đầu trang");
+      } else if (footerEl) {
+        zoneEl = footerEl;
+        pushSegment("section", "chân trang");
+      } else if (sidebarEl) {
+        zoneEl = sidebarEl;
+        var sbTitle = findHeadingAbove(sidebarEl, el, elRect, ownLower);
+        pushSegment("section", sbTitle ? ("thanh bên - " + sbTitle) : "thanh bên");
+      } else if (el.closest) {
+        var tabPane = el.closest("[role='tabpanel'], .tab-pane");
+        if (tabPane) {
+          zoneEl = tabPane;
+          var tabTitle = findHeadingAbove(tabPane, el, elRect, ownLower);
+          pushSegment("section", tabTitle ? ("tab " + tabTitle) : "nội dung tab");
+        }
+        if (!zoneEl) {
+          var cur = el.parentElement;
+          for (var d = 0; cur && cur !== document.body && cur !== document.documentElement && d < 12; d++) {
+            var tg = (cur.tagName || "").toUpperCase();
+            var rl = (cur.getAttribute && cur.getAttribute("role") || "").toLowerCase();
+            var cs = typeof cur.className === "string" ? cur.className.toLowerCase() : "";
+            var isSecCandidate = tg === "SECTION" || rl === "region" || tg === "ARTICLE"
+              || /(section|widget|block|module|box|panel|tab-content|news|featured)/.test(cs);
+            if (isSecCandidate) {
+              var secHeading = findHeadingAbove(cur, el, elRect, ownLower);
+              if (secHeading) {
+                zoneEl = cur;
+                pushSegment("section", secHeading);
+                break;
+              }
+            }
+            cur = cur.parentElement;
+          }
+        }
+        if (!zoneEl) {
+          var mainEl = el.closest("main, [role='main'], #main, .main-content, #content, .content, .entry-content");
+          if (mainEl) {
+            zoneEl = mainEl;
+            var mainHeading = findHeadingAbove(mainEl, el, elRect, ownLower);
+            pushSegment("section", mainHeading || "nội dung chính");
+          }
+        }
+      }
+
+      // 3. Intermediate context inside the section (nested dropdown menu, form, or column/widget/card)
+      var boundary = zoneEl || modal || document.body;
+      if (el.closest) {
+        // 3a. Enclosing dropdown / submenu parent item
+        var submenu = el.closest("ul ul, .dropdown-menu, .sub-menu, .submenu, [role='menu']");
+        if (submenu && boundary && boundary.contains(submenu)) {
+          var parentLi = submenu.closest("li, .dropdown, .menu-item");
+          if (parentLi && boundary.contains(parentLi)) {
+            var triggerLink = null;
+            for (var cIdx = 0; cIdx < parentLi.children.length; cIdx++) {
+              var ch = parentLi.children[cIdx];
+              var cht = (ch.tagName || "").toUpperCase();
+              if (cht === "A" || cht === "BUTTON" || cht === "SPAN") {
+                triggerLink = ch;
+                break;
+              }
+            }
+            if (triggerLink && triggerLink !== el && (!triggerLink.contains || !triggerLink.contains(el))) {
+              pushSegment("menu", extractDirectVisibleText(triggerLink));
+            }
+          }
+        } else {
+          var navEl = el.closest("nav[aria-label]");
+          if (navEl && boundary && boundary.contains(navEl) && navEl !== zoneEl) {
+            pushSegment("menu", navEl.getAttribute("aria-label"));
           }
         }
 
-        // Nearest card / form title
-        var card = el.closest("article, form, [class*='card'], [class*='Card'], [class*='item'], [class*='Item'], li");
-        if (card && card !== section && card.querySelector) {
-          var ch = card.querySelector("h1, h2, h3, h4, h5, legend, [class*='title'], [class*='Title'], [class*='name'], [class*='Name']");
-          if (ch && ch !== el && (!ch.contains || !ch.contains(el))) {
-            pushUnique(extractDirectVisibleText(ch));
+        // 3b. Enclosing Form
+        var formEl = el.closest("form");
+        if (formEl && (!boundary || boundary.contains(formEl) || formEl === boundary)) {
+          var fName = findHeadingAbove(formEl, el, elRect, ownLower);
+          if (!fName) {
+            var fMeta = ((formEl.getAttribute("name") || "") + " " + (formEl.id || "") + " " + (typeof formEl.className === "string" ? formEl.className : "")).toLowerCase();
+            if (/search|tim[-_]?kiem|find/.test(fMeta) || formEl.querySelector("input[type='search']")) fName = "tìm kiếm";
+            else if (/login|sign[-_]?in|dang[-_]?nhap/.test(fMeta)) fName = "đăng nhập";
+            else if (/register|sign[-_]?up|dang[-_]?ky/.test(fMeta)) fName = "đăng ký";
+            else if (/contact|lien[-_]?he/.test(fMeta)) fName = "liên hệ";
+          }
+          if (fName) {
+            pushSegment("form", fName);
+          }
+        }
+
+        // 3c. Enclosing column / widget / card block inside the zone
+        var subBox = el.closest("article, fieldset, [class*='footer-col'], [class*='widget'], [class*='box'], [class*='card'], [class*='col-']");
+        if (subBox && boundary && subBox !== boundary && boundary.contains(subBox)) {
+          var subHeading = findHeadingAbove(subBox, el, elRect, ownLower);
+          if (subHeading) {
+            pushSegment("mục", subHeading);
           }
         }
       }
     } catch (e) {}
-    return segs.slice(0, 2);
+    return segs.slice(0, 3);
   }
 
   function extractElementInfo(el, idx, framePrefix, docPosKey) {
@@ -1107,7 +1270,7 @@
             var badKw = isDangerousElement(el, info, freshState.dangerKeywords);
             if (badKw) {
               clickedSet.add(info.signature);
-              var skippedPath = formatActionPath(location.href, info.kindLabel, info.label, freshState, info.regionSegments);
+              var skippedPath = formatActionPath(location.href, info.kindLabel, info.label, freshState, info.regionSegments, item.framePrefix);
               skippedBatch.push({
                 actionPath: skippedPath,
                 reason: "Danger Guard: " + badKw,
@@ -1139,8 +1302,8 @@
         var targetEl = targetItem.el;
         clickedSet.add(targetInfo.signature);
         var beforeUrl = location.href;
-        var actionLabel = targetItem.framePrefix ? ("[" + targetItem.framePrefix + "] " + targetInfo.label) : targetInfo.label;
-        var actionPath = formatActionPath(beforeUrl, targetInfo.kindLabel, actionLabel, freshState, targetInfo.regionSegments);
+        var actionLabel = targetInfo.label;
+        var actionPath = formatActionPath(beforeUrl, targetInfo.kindLabel, actionLabel, freshState, targetInfo.regionSegments, targetItem.framePrefix);
 
         // Guard against external / non-HTTP links BEFORE clicking them (e.g., App Store / Google Play / social / mailto)
         var linkEl = (targetEl.tagName === "A" || (targetEl.getAttribute && targetEl.getAttribute("href")))
@@ -1289,10 +1452,10 @@
       var targetEl = findInteractiveAncestor(el);
       if (!targetEl) return;
       var info = extractElementInfo(targetEl, 0, framePrefix || "", "");
-      var label = framePrefix ? ("[" + framePrefix + "] " + info.label) : info.label;
+      var label = info.label;
       var kind = evType === "submit" ? "form" : (evType === "change" && info.tag === "select" ? "select" : info.kind);
       var kindLbl = kindDisplayLabel(kind);
-      var ap = formatActionPath(location.href, kindLbl, label, currentConfig, info.regionSegments);
+      var ap = formatActionPath(location.href, kindLbl, label, currentConfig, info.regionSegments, framePrefix);
       updateBadge("Thủ công: " + ap, "#0f766e");
       var bodyStr = JSON.stringify({
         actionPath: ap,

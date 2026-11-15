@@ -22,7 +22,7 @@ public final class CrawlConfig {
 
     private volatile String allowedHostsCsv = "";
     private volatile String apiBasePrefix = "";
-    private volatile String routeRootLabel = "toppage";
+    private volatile String routeRootLabel = "/";
     private volatile boolean strictExcelOnly = true;
     private volatile boolean ignoreTrailingSlash = true;
     private volatile boolean normalizeRouteIds = true;
@@ -133,7 +133,7 @@ public final class CrawlConfig {
 
     public void setRouteRootLabel(String routeRootLabel) {
         String clean = routeRootLabel != null ? routeRootLabel.trim() : "";
-        this.routeRootLabel = clean.isEmpty() ? "toppage" : clean;
+        this.routeRootLabel = clean.isEmpty() ? "/" : clean;
     }
 
     public boolean isStrictExcelOnly() {
@@ -256,6 +256,7 @@ public final class CrawlConfig {
 
     public String toPersistJson() {
         Map<String, Object> m = new LinkedHashMap<>();
+        m.put("pathStyleV2", true);
         m.put("allowedHostsCsv", allowedHostsCsv);
         m.put("apiBasePrefix", apiBasePrefix);
         m.put("routeRootLabel", routeRootLabel);
@@ -286,7 +287,14 @@ public final class CrawlConfig {
             Map<String, Object> m = MiniJson.parseObject(json);
             if (m.containsKey("allowedHostsCsv")) setAllowedHostsCsv(MiniJson.asString(m, "allowedHostsCsv", ""));
             if (m.containsKey("apiBasePrefix")) setApiBasePrefix(MiniJson.asString(m, "apiBasePrefix", ""));
-            if (m.containsKey("routeRootLabel")) setRouteRootLabel(MiniJson.asString(m, "routeRootLabel", "toppage"));
+            if (m.containsKey("routeRootLabel")) {
+                String savedRoot = MiniJson.asString(m, "routeRootLabel", "/");
+                // One-time upgrade from legacy default "toppage" to readable "/" unless user explicitly saved v2 prefs
+                if (!m.containsKey("pathStyleV2") && "toppage".equalsIgnoreCase(savedRoot)) {
+                    savedRoot = "/";
+                }
+                setRouteRootLabel(savedRoot);
+            }
             strictExcelOnly = MiniJson.asBoolean(m, "strictExcelOnly", strictExcelOnly);
             ignoreTrailingSlash = MiniJson.asBoolean(m, "ignoreTrailingSlash", ignoreTrailingSlash);
             normalizeRouteIds = MiniJson.asBoolean(m, "normalizeRouteIds", normalizeRouteIds);

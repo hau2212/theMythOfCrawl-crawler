@@ -289,7 +289,7 @@ public final class CrawlerUnitTests {
         assertEquals("TEXT", ff.get(FormFillProfile.Field.TEXTAREA), "Default textarea must be TEXT");
         assertEquals("TEXT", ff.get(FormFillProfile.Field.RICHTEXT), "Default richtext/editable table must be TEXT");
         assertEquals("2026-01-01", ff.get(FormFillProfile.Field.DATE), "Default date");
-        assertEquals("toppage", cfg.getRouteRootLabel(), "Default route root label");
+        assertEquals("/", cfg.getRouteRootLabel(), "Default route root label");
         assertTrue(cfg.isDeepCrawlMode(), "Deep crawl mode defaults to true");
         assertTrue(cfg.getDangerKeywordsList().contains("logout"), "Logout must be in default danger guard");
         assertTrue(cfg.getDangerKeywordsList().contains("sign out"), "Sign out must be in default danger guard");
@@ -315,17 +315,21 @@ public final class CrawlerUnitTests {
         assertEquals(Boolean.TRUE, parsedRules.get(1).get("regex"), "Second rule is regex");
         assertEquals("1999-12-31", parsedRules.get(1).get("value"), "Second rule value");
 
-        cfg.setRouteRootLabel("/");
+        cfg.setRouteRootLabel("toppage");
         cfg.setDeepCrawlMode(false);
         String json = cfg.toPersistJson();
 
         CrawlConfig restored = new CrawlConfig();
         restored.loadFromPersistJson(json);
-        assertEquals("/", restored.getRouteRootLabel(), "Persist round-trip routeRootLabel");
+        assertEquals("toppage", restored.getRouteRootLabel(), "Explicit pathStyleV2 toppage round-trip");
         assertTrue(!restored.isDeepCrawlMode(), "Persist round-trip deepCrawlMode");
         assertEquals("AUDIT_STR", restored.getFormFillProfile().get(FormFillProfile.Field.TEXT), "Persist round-trip TEXT");
         assertEquals("2027-05-09", restored.getFormFillProfile().get(FormFillProfile.Field.DATE), "Persist round-trip DATE");
         assertTrue(restored.getFormFillProfile().getRulesText().contains("username = admin_test"), "Persist round-trip rules");
+
+        CrawlConfig legacyMigrated = new CrawlConfig();
+        legacyMigrated.loadFromPersistJson("{\"routeRootLabel\":\"toppage\"}");
+        assertEquals("/", legacyMigrated.getRouteRootLabel(), "Legacy default toppage migrates to / once");
         passed++;
     }
 
@@ -710,23 +714,35 @@ public final class CrawlerUnitTests {
         gm.setTreeMode(false);
         assertEquals(3, gm.getRowCount(), "Flat mode shows 3 flat groups");
 
-        // 2) GroupApisModel Tree Mode: groups >= 2 calls sharing same normalized path & keeps full group names indented
+        // 2) GroupApisModel Tree Mode: collapsed by default, groups >= 2 calls sharing same path & splits same-param vs diff-param
         GroupTableModel.GroupApisModel am = new GroupTableModel.GroupApisModel(store);
         am.setGroupsAndFilter(null, true, false, "");
-        // /api/v2/promotions (1 header + 3 children) + /api/v2/user/profile (1 singleton) + /api/v2/orders (1 header + 2 children) = 8 rows
-        assertEquals(8, am.getRowCount(), "Path grouping wraps >= 2 calls and leaves singleton ungrouped");
+        // Collapsed by default: /api/v2/promotions (collapsed header) + /api/v2/user/profile (singleton) + /api/v2/orders (collapsed header) = 3 rows
+        assertEquals(3, am.getRowCount(), "Collapsed by default: 2 path headers + 1 singleton leaf");
         assertTrue(am.isGroupHeaderRow(0), "Row 0 is /api/v2/promotions group header");
+        assertTrue(am.getRowAt(0).collapsed, "Path group starts collapsed by default");
+        assertTrue(am.getRowAt(0).diffParamVariant, "/api/v2/promotions has multiple param variants");
         assertEquals("/api/v2/promotions", am.getRowAt(0).pathKey, "Header normalized path matches");
         assertEquals(3, am.getCallsAt(0).size(), "Header holds 3 matching calls");
+        assertEquals("2 kiểu param: [page | type]", String.valueOf(am.getValueAt(0, 5)), "Diff-param summary shown on header");
 
+        assertTrue(!am.isGroupHeaderRow(1), "Singleton profile at row 1 when headers collapsed");
+        assertEquals("toppage > button 'Đăng nhập'", String.valueOf(am.getValueAt(1, 1)), "Singleton unindented");
+
+        assertTrue(am.isGroupHeaderRow(2), "Row 2 is /api/v2/orders group header");
+        assertTrue(!am.getRowAt(2).diffParamVariant, "/api/v2/orders shares identical params");
+        assertEquals("Cùng param: 0 param", String.valueOf(am.getValueAt(2, 5)), "Same-param summary shown accurately");
+
+        // Expand all -> 1 header + 3 children + 1 singleton + 1 header + 2 children = 8 rows
+        am.expandAllPathGroups();
+        assertEquals(8, am.getRowCount(), "Expanded view shows all 8 rows across 2 path groups + 1 singleton");
         String childName1 = String.valueOf(am.getValueAt(1, 1));
         String childName2 = String.valueOf(am.getValueAt(2, 1));
         assertEquals("    ↳ toppage > button 'Đăng nhập'", childName1, "Indented child 1 retains full group name");
         assertEquals("    ↳ toppage > button 'Ưu đãi'", childName2, "Indented child 2 retains full group name");
-
-        // Singleton profile at row 4 has no wrapper & no indent
-        assertTrue(!am.isGroupHeaderRow(4), "Singleton path has no group wrapper");
-        assertEquals("toppage > button 'Đăng nhập'", String.valueOf(am.getValueAt(4, 1)), "Singleton unindented");
+        assertEquals("[Kiểu 1/2 (gốc)] 1 (page)", String.valueOf(am.getValueAt(1, 5)), "Baseline variant label");
+        assertEquals("[Kiểu 2/2 | +type, -page] 1 (type)", String.valueOf(am.getValueAt(3, 5)), "Diff variant annotation");
+        assertTrue(am.getRowAt(3).diffParamVariant, "Different param variant highlighted");
 
         // Orders >= 2 merged across g2 and g3
         assertTrue(am.isGroupHeaderRow(5), "Row 5 is /api/v2/orders group header");
@@ -738,10 +754,47 @@ public final class CrawlerUnitTests {
         assertEquals(5, am.getRowCount(), "Collapsing /api/v2/promotions reduces row count by 3");
         am.togglePathGroupExpanded(0);
         assertEquals(8, am.getRowCount(), "Re-expanding restores all 8 rows");
+        am.collapseAllPathGroups();
+        assertEquals(3, am.getRowCount(), "collapseAllPathGroups returns to 3 rows");
+
+        // Searching auto-expands matching collapsed groups with >= 2 hits, and shows single match directly
+        am.setGroupsAndFilter(null, true, false, "page=");
+        assertEquals(3, am.getRowCount(), "Search matching 2 calls expands collapsed path group (1 header + 2 children)");
+        assertEquals("    ↳ toppage > button 'Đăng nhập'", String.valueOf(am.getValueAt(1, 1)), "Search match 1 indented child visible");
+        am.setGroupsAndFilter(null, true, false, "type=vip");
+        assertEquals(1, am.getRowCount(), "Search matching single call renders direct row");
+        assertEquals("toppage > button 'Ưu đãi'", String.valueOf(am.getValueAt(0, 1)), "Single search match visible immediately");
+        am.setGroupsAndFilter(null, true, false, "");
+        assertEquals(3, am.getRowCount(), "Clearing search restores collapsed default");
 
         am.setTreeMode(false);
         assertEquals(6, am.getRowCount(), "Flat view shows all 6 calls without headers or indentation");
         assertEquals("toppage > button 'Đăng nhập'", String.valueOf(am.getValueAt(0, 1)), "Flat mode keeps unindented name");
+
+        // 3) Step-by-step "/" UI context tree normalization & {id} route normalization + non-empty same-param header
+        assertEquals(List.of("Trang chủ (/)", "section \"đầu trang\"", "button \"Login\""),
+            GroupTableModel.treeSegmentsForActionPath("/ > section \"đầu trang\" > button \"Login\""),
+            "Root UI path maps to Trang chủ (/)");
+        assertEquals(List.of("/contact", "section \"chân trang\"", "button \"search\""),
+            GroupTableModel.treeSegmentsForActionPath("/ > contact > section \"chân trang\" > button \"search\""),
+            "Subpage UI path surfaces /contact at tree root");
+
+        ActionGroupStore store2 = new ActionGroupStore();
+        ActionGroup u1 = store2.openGroup("/ > contact > section \"chân trang\" > button \"search\"", "button", "search", "https://target.local/contact");
+        ActionGroup u2 = store2.openGroup("/ > news > section \"nội dung chính\" > link \"Chi tiết\"", "link", "Chi tiết", "https://target.local/news");
+        CapturedApiEntry id1 = new CapturedApiEntry("", "GET", "https://target.local/api/users/101?isajax=true",
+            "/api/users/101?isajax=true", "target.local", 443, true, u1.actionPath, req, resp, 200, resp.length, Set.of("isajax"), now);
+        CapturedApiEntry id2 = new CapturedApiEntry("", "GET", "https://target.local/api/users/202?isajax=true",
+            "/api/users/202?isajax=true", "target.local", 443, true, u2.actionPath, req, resp, 200, resp.length, Set.of("isajax"), now);
+        store2.recordCall(u1, id1, "GET /api/users/{id}", "", "", "", false, false);
+        store2.recordCall(u2, id2, "GET /api/users/{id}", "", "", "", false, false);
+
+        GroupTableModel.GroupApisModel am2 = new GroupTableModel.GroupApisModel(store2);
+        am2.setGroupsAndFilter(null, true, false, "");
+        assertEquals(1, am2.getRowCount(), "{id} normalized paths merge into 1 collapsed header");
+        assertEquals("/api/users/{id}", am2.getRowAt(0).pathKey, "Route template preserved as group pathKey");
+        assertTrue(!am2.getRowAt(0).diffParamVariant, "Identical isajax param marks same-param group");
+        assertEquals("Cùng param: 1 (isajax)", String.valueOf(am2.getValueAt(0, 5)), "Same non-empty param label formatted clearly");
         passed++;
     }
 
