@@ -700,14 +700,14 @@ public final class CrawlerUnitTests {
         gm.setFilter("WITH_APIS", "");
         assertEquals(4, gm.getRowCount(), "Tree mode merges toppage prefix folder (1 folder + 2 children + 1 singleton)");
         assertTrue(gm.isFolderRow(0), "Row 0 is merged folder toppage");
-        assertEquals("▼ 1", String.valueOf(gm.getValueAt(0, 0)), "Folder shows hierarchical tree number 1");
+        assertEquals("v 1", String.valueOf(gm.getValueAt(0, 0)), "Folder shows hierarchical tree number 1");
         assertEquals("1.1", String.valueOf(gm.getValueAt(1, 0)), "First child shows hierarchical number 1.1");
         assertEquals("1.2", String.valueOf(gm.getValueAt(2, 0)), "Second child shows hierarchical number 1.2");
         assertEquals("2", String.valueOf(gm.getValueAt(3, 0)), "Second top branch shows hierarchical number 2");
         assertEquals(Integer.valueOf(5), gm.getValueAt(0, 2), "Folder rolls up 5 APIs under toppage");
         assertEquals(2, gm.getGroupsAt(0).size(), "Folder exposes both child groups");
         String childLabel = String.valueOf(gm.getValueAt(1, 1));
-        assertTrue((childLabel.startsWith("├─ ") || childLabel.startsWith("└─ ")) && childLabel.contains("Đăng nhập"),
+        assertTrue((childLabel.startsWith("|-- ") || childLabel.startsWith("+-- ")) && childLabel.contains("Đăng nhập"),
             "Child group uses clear tree branch prefix and keeps action name: " + childLabel);
 
         gm.toggleFolderExpanded(0);
@@ -742,8 +742,8 @@ public final class CrawlerUnitTests {
         assertEquals(8, am.getRowCount(), "Expanded view shows all 8 rows across 2 path groups + 1 singleton");
         String childName1 = String.valueOf(am.getValueAt(1, 1));
         String childName2 = String.valueOf(am.getValueAt(2, 1));
-        assertEquals("    ↳ toppage > button 'Đăng nhập'", childName1, "Indented child 1 retains full group name");
-        assertEquals("    ↳ toppage > button 'Ưu đãi'", childName2, "Indented child 2 retains full group name");
+        assertEquals("    -> toppage > button 'Đăng nhập'", childName1, "Indented child 1 retains full group name");
+        assertEquals("    -> toppage > button 'Ưu đãi'", childName2, "Indented child 2 retains full group name");
         assertEquals("[Kiểu 1/2 (gốc)] 1 (page)", String.valueOf(am.getValueAt(1, 5)), "Baseline variant label");
         assertEquals("[Kiểu 2/2 | +type, -page] 1 (type)", String.valueOf(am.getValueAt(3, 5)), "Diff variant annotation");
         assertTrue(am.getRowAt(3).diffParamVariant, "Different param variant highlighted");
@@ -751,7 +751,7 @@ public final class CrawlerUnitTests {
         // Orders >= 2 merged across g2 and g3
         assertTrue(am.isGroupHeaderRow(5), "Row 5 is /api/v2/orders group header");
         assertEquals(2, am.getCallsAt(5).size(), "Orders header groups 2 cross-group calls");
-        assertEquals("    ↳ phim-dang-chieu > modal > button 'Đặt vé'", String.valueOf(am.getValueAt(7, 1)),
+        assertEquals("    -> phim-dang-chieu > modal > button 'Đặt vé'", String.valueOf(am.getValueAt(7, 1)),
             "Indented cross-group child preserves full name");
 
         am.togglePathGroupExpanded(0);
@@ -764,7 +764,7 @@ public final class CrawlerUnitTests {
         // Searching auto-expands matching collapsed groups with >= 2 hits, and shows single match directly
         am.setGroupsAndFilter(null, true, false, "page=");
         assertEquals(3, am.getRowCount(), "Search matching 2 calls expands collapsed path group (1 header + 2 children)");
-        assertEquals("    ↳ toppage > button 'Đăng nhập'", String.valueOf(am.getValueAt(1, 1)), "Search match 1 indented child visible");
+        assertEquals("    -> toppage > button 'Đăng nhập'", String.valueOf(am.getValueAt(1, 1)), "Search match 1 indented child visible");
         am.setGroupsAndFilter(null, true, false, "type=vip");
         assertEquals(1, am.getRowCount(), "Search matching single call renders direct row");
         assertEquals("toppage > button 'Ưu đãi'", String.valueOf(am.getValueAt(0, 1)), "Single search match visible immediately");

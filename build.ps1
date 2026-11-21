@@ -27,7 +27,7 @@ Remove-Item -Recurse -Force "$BuildTest\*" -ErrorAction SilentlyContinue
 
 $MainSources = @(Get-ChildItem -Path (Join-Path $Root "src\main\java") -Recurse -Filter "*.java" | ForEach-Object { $_.FullName })
 Write-Host "Compiling $($MainSources.Count) main Java files (--release 17)..."
-& $Javac --release 17 -encoding UTF-8 -Xlint:unchecked -cp $LibJar -d $BuildMain @MainSources
+& $Javac --release 17 -encoding UTF-8 -Xlint:unchecked,deprecation -cp $LibJar -d $BuildMain @MainSources
 if ($LASTEXITCODE -ne 0) {
     throw "javac main compilation failed with exit code $LASTEXITCODE"
 }
@@ -37,27 +37,44 @@ if (Test-Path $ResDir) {
     Copy-Item -Path "$ResDir\*" -Destination $BuildMain -Recurse -Force
 }
 
-Write-Host "Packaging JAR: $OutJar..."
-& $JarTool --create --file $OutJar -C $BuildMain .
-if ($LASTEXITCODE -ne 0) {
-    throw "jar packaging failed with exit code $LASTEXITCODE"
-}
-
 $TestSources = @(Get-ChildItem -Path (Join-Path $Root "src\test\java") -Recurse -Filter "*.java" | ForEach-Object { $_.FullName })
 if ($TestSources.Count -gt 0) {
     $TestCp = $BuildMain + ";" + $LibJar
     Write-Host "Compiling $($TestSources.Count) test Java files..."
-    & $Javac --release 17 -encoding UTF-8 -cp $TestCp -d $BuildTest @TestSources
+    & $Javac --release 17 -encoding UTF-8 -Xlint:unchecked,deprecation -cp $TestCp -d $BuildTest @TestSources
     if ($LASTEXITCODE -ne 0) {
         throw "javac test compilation failed with exit code $LASTEXITCODE"
     }
 
     $RunCp = $BuildTest + ";" + $BuildMain + ";" + $LibJar
-    Write-Host "Running CrawlerUnitTests..."
-    & $Java -cp $RunCp com.mythofcrawl.crawler.CrawlerUnitTests
-    if ($LASTEXITCODE -ne 0) {
-        throw "Unit tests failed with exit code $LASTEXITCODE"
+    Push-Location $Root
+    try {
+        Write-Host "Running CrawlerUnitTests..."
+        & $Java "-Djava.awt.headless=true" -cp $RunCp com.mythofcrawl.crawler.CrawlerUnitTests
+        if ($LASTEXITCODE -ne 0) {
+            throw "CrawlerUnitTests failed with exit code $LASTEXITCODE"
+        }
+
+        Write-Host "Running DeepCrawlerTests..."
+        & $Java "-Djava.awt.headless=true" -cp $RunCp com.mythofcrawl.crawler.DeepCrawlerTests
+        if ($LASTEXITCODE -ne 0) {
+            throw "DeepCrawlerTests failed with exit code $LASTEXITCODE"
+        }
+
+        Write-Host "Running BlueprintGuardTests..."
+        & $Java "-Djava.awt.headless=true" -cp $RunCp com.mythofcrawl.crawler.BlueprintGuardTests
+        if ($LASTEXITCODE -ne 0) {
+            throw "BlueprintGuardTests failed with exit code $LASTEXITCODE"
+        }
+    } finally {
+        Pop-Location
     }
+}
+
+Write-Host "Packaging JAR: $OutJar..."
+& $JarTool --create --file $OutJar -C $BuildMain .
+if ($LASTEXITCODE -ne 0) {
+    throw "jar packaging failed with exit code $LASTEXITCODE"
 }
 
 Write-Host "SUCCESS! Extension JAR ready at: $OutJar"

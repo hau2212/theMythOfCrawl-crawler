@@ -1,8 +1,8 @@
 package com.mythofcrawl.crawler.proxy;
 
 import burp.api.montoya.MontoyaApi;
-import burp.api.montoya.core.ByteArray;
 import burp.api.montoya.core.ToolType;
+import burp.api.montoya.http.HttpMode;
 import burp.api.montoya.http.HttpService;
 import burp.api.montoya.http.handler.HttpHandler;
 import burp.api.montoya.http.handler.HttpRequestToBeSent;
@@ -25,13 +25,11 @@ import java.nio.file.Files;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
-import java.util.Deque;
 import java.util.List;
-import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /**
@@ -39,17 +37,24 @@ import java.util.function.Consumer;
  * (`api.http().sendRequest`), so Logger++ (`Log From -> Extender`) captures only clean selected APIs
  * and forwards them to Elasticsearch with zero Proxy noise.
  *
- * Packet bytes are NEVER modified for naming; group names ride solely inside Burp Annotations (Comment)
- * and the 1-to-1 timestamped Push Ledger table.
+ * STRICT PACKET INTEGRITY:
+ * - Outgoing wire packets are NEVER modified (no extra headers or bytes added for correlation).
+ * - Group metadata rides solely inside Burp Annotations (Comment) correlated via single-flight
+ *   {@link AtomicReference} on the dispatch thread, preserving original {@link HttpMode}.
+ * - Ledger items deduplicate by monotonic {@code callUid} so resets never collide.
  */
 public final class ExtenderPushManager implements HttpHandler {
 
+    private static final long COMMENT_TTL_MS = 60_000L;
+
     private static final class PendingAnnotation {
         final String comment;
+        final String expectedHost;
         final long createdAtMs;
 
-        PendingAnnotation(String comment) {
+        PendingAnnotation(String comment, String expectedHost) {
             this.comment = comment;
+            this.expectedHost = expectedHost != null ? expectedHost : "";
             this.createdAtMs = System.currentTimeMillis();
         }
     }
@@ -63,10 +68,10 @@ public final class ExtenderPushManager implements HttpHandler {
     private final List<ExtenderPushEntry> entries = new ArrayList<>();
     private final AtomicBoolean pushing = new AtomicBoolean(false);
     private final AtomicBoolean cancelRequested = new AtomicBoolean(false);
+    private final AtomicReference<Thread> activePushThread = new AtomicReference<>();
 
-    // Dual-key annotation lookup so Burp's URL normalization (:80/:443 removal) still matches cleanly
-    private final ConcurrentHashMap<String, Deque<PendingAnnotation>> pendingBySig = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<Integer, String> activeMessageComments = new ConcurrentHashMap<>();
+    private final AtomicReference<PendingAnnotation> activePushAnnotation = new AtomicReference<>();
+    private final ConcurrentHashMap<Integer, PendingAnnotation> activeMessageComments = new ConcurrentHashMap<>();
 
     public ExtenderPushManager(
         MontoyaApi api,
@@ -86,6 +91,10 @@ public final class ExtenderPushManager implements HttpHandler {
 
     public void requestCancel() {
         cancelRequested.set(true);
+        Thread t = activePushThread.get();
+        if (t != null) {
+            t.interrupt();
+        }
     }
 
     public synchronized List<ExtenderPushEntry> snapshotEntries() {
@@ -134,7 +143,7 @@ public final class ExtenderPushManager implements HttpHandler {
             if (call == null || call.capture == null) {
                 continue;
             }
-            if (isAlreadyQueued(call.groupId, call.index)) {
+            if (isAlreadyQueued(call)) {
                 continue;
             }
             entries.add(new ExtenderPushEntry(seq.incrementAndGet(), call));
@@ -146,11 +155,18 @@ public final class ExtenderPushManager implements HttpHandler {
         return added;
     }
 
-    private boolean isAlreadyQueued(int groupId, int callIndex) {
+    private boolean isAlreadyQueued(ApiCall call) {
         for (ExtenderPushEntry e : entries) {
-            if (e.groupId == groupId && e.callIndex == callIndex
-                && (e.getStatus() == ExtenderPushEntry.Status.QUEUED
-                    || e.getStatus() == ExtenderPushEntry.Status.SENDING)) {
+            boolean active = (e.getStatus() == ExtenderPushEntry.Status.QUEUED
+                || e.getStatus() == ExtenderPushEntry.Status.SENDING);
+            if (!active) {
+                continue;
+            }
+            if (call.callUid > 0 && e.callUid > 0) {
+                if (e.callUid == call.callUid) {
+                    return true;
+                }
+            } else if (e.groupId == call.groupId && e.callIndex == call.index) {
                 return true;
             }
         }
@@ -212,6 +228,7 @@ public final class ExtenderPushManager implements HttpHandler {
         final int safeDelay = Math.max(0, Math.min(10000, delayMs));
 
         Thread t = new Thread(() -> {
+            activePushThread.set(Thread.currentThread());
             int okCount = 0;
             int failCount = 0;
             try {
@@ -241,23 +258,27 @@ public final class ExtenderPushManager implements HttpHandler {
                     try {
                         CapturedApiEntry cap = item.capture;
                         HttpService svc = HttpService.httpService(cap.host, cap.port, cap.https);
-                        HttpRequest req = HttpRequest.httpRequest(svc, ByteArray.byteArray(cap.requestBytes));
-                        // Strict packet integrity: only applies custom header rules if explicitly toggled ON
+                        HttpRequest req = cap.toMontoyaRequest(svc);
+                        // Strict packet integrity: never add correlation headers; only apply user header filter if explicitly toggled ON
                         req = config.getHeaderFilterProfile()
                             .applyToMontoyaRequest(req, cap.host, cap.fullUrl, true);
 
-                        String key = buildSigKey(req.method(), svc.host(), req.path());
-                        pendingBySig.computeIfAbsent(key, k -> new ConcurrentLinkedDeque<>())
-                            .addLast(new PendingAnnotation(item.buildBurpComment()));
-
+                        activePushAnnotation.set(new PendingAnnotation(item.buildBurpComment(), svc.host()));
                         item.setPushedAtText(fmt.format(new Date()));
-                        HttpRequestResponse res = api.http().sendRequest(req);
+                        HttpMode mode = cap.getHttpMode();
+                        HttpRequestResponse res;
+                        try {
+                            res = api.http().sendRequest(req, mode);
+                        } finally {
+                            activePushAnnotation.set(null);
+                        }
                         int st = res != null && res.hasResponse() ? res.response().statusCode() : 0;
                         item.setPushedHttpStatus(st);
                         item.setStatus(ExtenderPushEntry.Status.SENT);
                         item.setErrorText("");
                         okCount++;
                     } catch (Exception ex) {
+                        activePushAnnotation.set(null);
                         item.setStatus(ExtenderPushEntry.Status.FAILED);
                         item.setErrorText(ex.getMessage() != null ? ex.getMessage() : "Error");
                         failCount++;
@@ -287,6 +308,8 @@ public final class ExtenderPushManager implements HttpHandler {
                         + (cancelRequested.get() ? " (đã hủy giữa chừng)." : "."));
                 }
             } finally {
+                activePushAnnotation.set(null);
+                activePushThread.set(null);
                 pushing.set(false);
                 pruneOldPending();
                 notifyUi();
@@ -306,17 +329,19 @@ public final class ExtenderPushManager implements HttpHandler {
     @Override
     public RequestToBeSentAction handleHttpRequestToBeSent(HttpRequestToBeSent req) {
         if (req.toolSource() != null && req.toolSource().isFromTool(ToolType.EXTENSIONS)) {
-            HttpService svc = req.httpService();
-            String key = buildSigKey(req.method(), svc != null ? svc.host() : "", req.path());
-            Deque<PendingAnnotation> q = pendingBySig.get(key);
-            if (q != null) {
-                PendingAnnotation meta = q.pollFirst();
-                if (meta != null && (System.currentTimeMillis() - meta.createdAtMs) < 30_000L) {
-                    if (activeMessageComments.size() < 4096) {
-                        activeMessageComments.put(req.messageId(), meta.comment);
+            PendingAnnotation active = activePushAnnotation.get();
+            if (active != null && (System.currentTimeMillis() - active.createdAtMs) < COMMENT_TTL_MS) {
+                HttpService svc = req.httpService();
+                String reqHost = svc != null && svc.host() != null ? svc.host() : "";
+                if (active.expectedHost.isEmpty() || active.expectedHost.equalsIgnoreCase(reqHost)) {
+                    if (activePushAnnotation.compareAndSet(active, null)) {
+                        if (activeMessageComments.size() > 2048) {
+                            pruneOldPending();
+                        }
+                        activeMessageComments.put(req.messageId(), active);
+                        // Keep exact HTTP packet untouched; attach Burp Comment metadata only
+                        return RequestToBeSentAction.continueWith(req, req.annotations().withNotes(active.comment));
                     }
-                    // Keep exact HTTP packet untouched; attach Burp Comment metadata only
-                    return RequestToBeSentAction.continueWith(req, req.annotations().withNotes(meta.comment));
                 }
             }
         }
@@ -325,25 +350,16 @@ public final class ExtenderPushManager implements HttpHandler {
 
     @Override
     public ResponseReceivedAction handleHttpResponseReceived(HttpResponseReceived resp) {
-        String comment = activeMessageComments.remove(resp.messageId());
-        if (comment != null && !comment.isEmpty()) {
-            return ResponseReceivedAction.continueWith(resp, resp.annotations().withNotes(comment));
+        PendingAnnotation meta = activeMessageComments.remove(resp.messageId());
+        if (meta != null && meta.comment != null && !meta.comment.isEmpty()) {
+            return ResponseReceivedAction.continueWith(resp, resp.annotations().withNotes(meta.comment));
         }
         return ResponseReceivedAction.continueWith(resp);
     }
 
-    private static String buildSigKey(String method, String host, String path) {
-        return (method != null ? method.toUpperCase(Locale.ROOT) : "GET")
-            + "|" + (host != null ? host.toLowerCase(Locale.ROOT) : "")
-            + "|" + (path != null ? path : "/");
-    }
-
     private void pruneOldPending() {
         long now = System.currentTimeMillis();
-        pendingBySig.values().forEach(q -> q.removeIf(a -> now - a.createdAtMs > 30_000L));
-        if (activeMessageComments.size() > 2048) {
-            activeMessageComments.clear();
-        }
+        activeMessageComments.entrySet().removeIf(e -> (now - e.getValue().createdAtMs) > COMMENT_TTL_MS);
     }
 
     /** Exports 1-to-1 timestamped Push Ledger CSV so the user can cross-reference names on Elastic UI. */
@@ -373,6 +389,13 @@ public final class ExtenderPushManager implements HttpHandler {
         if (v == null) {
             return "\"\"";
         }
-        return "\"" + v.replace("\"", "\"\"") + "\"";
+        String safe = v;
+        if (!"-".equals(safe) && !safe.isEmpty()) {
+            char first = safe.charAt(0);
+            if (first == '=' || first == '+' || first == '-' || first == '@' || first == '\t' || first == '\r') {
+                safe = "'" + safe;
+            }
+        }
+        return "\"" + safe.replace("\"", "\"\"") + "\"";
     }
 }

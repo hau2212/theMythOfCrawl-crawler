@@ -22,6 +22,8 @@ public final class ExtenderPushEntry {
     }
 
     public final int seq;
+    public final long callUid;
+    public final long sessionEpoch;
     public final int groupId;
     public final int callIndex;
     public final String groupPath;
@@ -41,6 +43,8 @@ public final class ExtenderPushEntry {
 
     public ExtenderPushEntry(int seq, ApiCall call) {
         this.seq = seq;
+        this.callUid = call.callUid;
+        this.sessionEpoch = call.sessionEpoch;
         this.groupId = call.groupId;
         this.callIndex = call.index;
         this.groupPath = call.displayName();

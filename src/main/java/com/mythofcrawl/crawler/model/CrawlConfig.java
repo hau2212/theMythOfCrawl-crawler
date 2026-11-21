@@ -9,7 +9,8 @@ import java.util.Set;
 
 /**
  * Runtime configuration for the Browser + Excel Burp Auto-Crawler.
- * Serializable to/from JSON so settings and custom FormFill values persist across Burp restarts.
+ * Serializable to/from JSON so settings, column preferences, and custom FormFill values
+ * persist across Burp restarts.
  */
 public final class CrawlConfig {
 
@@ -21,6 +22,7 @@ public final class CrawlConfig {
         "logout,log out,sign out,signout,đăng xuất";
 
     private volatile String allowedHostsCsv = "";
+    private volatile String seedUrl = "";
     private volatile String apiBasePrefix = "";
     private volatile String routeRootLabel = "/";
     private volatile boolean strictExcelOnly = true;
@@ -32,12 +34,17 @@ public final class CrawlConfig {
     private volatile boolean deepCrawlMode = true;
     private volatile boolean relaxCspWhileCrawling = true;
     private volatile boolean captureJsEndpoints = true;
+    private volatile boolean bypassServiceWorker = true;
+    private volatile boolean cdpSidecarEnabled = false;
+    private volatile int cdpPort = 9222;
+    private volatile String columnPrefsJson = "";
     /** Safe-by-default request gate: never auto-clicks or fires seed fetches until user allows it. */
     private volatile boolean allowAutoRequests = false;
     private volatile int actionWaitMs = 550;
     private volatile int maxActionsPerPage = 300;
     private volatile int maxPages = 500;
     private volatile int maxPaginationSamples = 5;
+    private volatile int maxPageDurationSec = 90;
 
     private final FormFillProfile formFillProfile = new FormFillProfile();
     private final HeaderFilterProfile headerFilterProfile = new HeaderFilterProfile();
@@ -56,6 +63,42 @@ public final class CrawlConfig {
 
     public void setAllowAutoRequests(boolean allowAutoRequests) {
         this.allowAutoRequests = allowAutoRequests;
+    }
+
+    public boolean isBypassServiceWorker() {
+        return bypassServiceWorker;
+    }
+
+    public void setBypassServiceWorker(boolean bypassServiceWorker) {
+        this.bypassServiceWorker = bypassServiceWorker;
+    }
+
+    public boolean isCdpSidecarEnabled() {
+        return cdpSidecarEnabled;
+    }
+
+    public void setCdpSidecarEnabled(boolean cdpSidecarEnabled) {
+        this.cdpSidecarEnabled = cdpSidecarEnabled;
+    }
+
+    public int getCdpPort() {
+        return cdpPort;
+    }
+
+    public void setCdpPort(int cdpPort) {
+        if (cdpPort >= 1 && cdpPort <= 65535) {
+            this.cdpPort = cdpPort;
+        } else {
+            this.cdpPort = 9222;
+        }
+    }
+
+    public String getColumnPrefsJson() {
+        return columnPrefsJson;
+    }
+
+    public void setColumnPrefsJson(String columnPrefsJson) {
+        this.columnPrefsJson = columnPrefsJson != null ? columnPrefsJson : "";
     }
 
     public String getAllowedHostsCsv() {
@@ -255,6 +298,14 @@ public final class CrawlConfig {
         this.maxPages = Math.max(1, Math.min(10000, maxPages));
     }
 
+    public String getSeedUrl() {
+        return seedUrl;
+    }
+
+    public void setSeedUrl(String seedUrl) {
+        this.seedUrl = seedUrl != null ? seedUrl.trim() : "";
+    }
+
     public int getMaxPaginationSamples() {
         return maxPaginationSamples;
     }
@@ -263,10 +314,19 @@ public final class CrawlConfig {
         this.maxPaginationSamples = Math.max(1, Math.min(100, maxPaginationSamples));
     }
 
+    public int getMaxPageDurationSec() {
+        return maxPageDurationSec;
+    }
+
+    public void setMaxPageDurationSec(int maxPageDurationSec) {
+        this.maxPageDurationSec = Math.max(15, Math.min(600, maxPageDurationSec));
+    }
+
     public String toPersistJson() {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("pathStyleV2", true);
         m.put("allowedHostsCsv", allowedHostsCsv);
+        m.put("seedUrl", seedUrl);
         m.put("apiBasePrefix", apiBasePrefix);
         m.put("routeRootLabel", routeRootLabel);
         m.put("strictExcelOnly", strictExcelOnly);
@@ -278,10 +338,15 @@ public final class CrawlConfig {
         m.put("deepCrawlMode", deepCrawlMode);
         m.put("relaxCspWhileCrawling", relaxCspWhileCrawling);
         m.put("captureJsEndpoints", captureJsEndpoints);
+        m.put("bypassServiceWorker", bypassServiceWorker);
+        m.put("cdpSidecarEnabled", cdpSidecarEnabled);
+        m.put("cdpPort", cdpPort);
+        m.put("columnPrefsJson", columnPrefsJson);
         m.put("actionWaitMs", actionWaitMs);
         m.put("maxActionsPerPage", maxActionsPerPage);
         m.put("maxPages", maxPages);
         m.put("maxPaginationSamples", maxPaginationSamples);
+        m.put("maxPageDurationSec", maxPageDurationSec);
         m.put("formFill", formFillProfile.toPersistMap());
         m.put("headerFilter", headerFilterProfile.toPersistMap());
         return MiniJson.stringify(m);
@@ -295,6 +360,7 @@ public final class CrawlConfig {
         try {
             Map<String, Object> m = MiniJson.parseObject(json);
             if (m.containsKey("allowedHostsCsv")) setAllowedHostsCsv(MiniJson.asString(m, "allowedHostsCsv", ""));
+            if (m.containsKey("seedUrl")) setSeedUrl(MiniJson.asString(m, "seedUrl", ""));
             if (m.containsKey("apiBasePrefix")) setApiBasePrefix(MiniJson.asString(m, "apiBasePrefix", ""));
             if (m.containsKey("routeRootLabel")) {
                 String savedRoot = MiniJson.asString(m, "routeRootLabel", "/");
@@ -313,10 +379,15 @@ public final class CrawlConfig {
             deepCrawlMode = MiniJson.asBoolean(m, "deepCrawlMode", deepCrawlMode);
             relaxCspWhileCrawling = MiniJson.asBoolean(m, "relaxCspWhileCrawling", relaxCspWhileCrawling);
             captureJsEndpoints = MiniJson.asBoolean(m, "captureJsEndpoints", captureJsEndpoints);
+            bypassServiceWorker = MiniJson.asBoolean(m, "bypassServiceWorker", bypassServiceWorker);
+            cdpSidecarEnabled = MiniJson.asBoolean(m, "cdpSidecarEnabled", cdpSidecarEnabled);
+            setCdpPort(asInt(m.get("cdpPort"), cdpPort));
+            if (m.containsKey("columnPrefsJson")) setColumnPrefsJson(MiniJson.asString(m, "columnPrefsJson", ""));
             setActionWaitMs(asInt(m.get("actionWaitMs"), actionWaitMs));
             setMaxActionsPerPage(asInt(m.get("maxActionsPerPage"), maxActionsPerPage));
             setMaxPages(asInt(m.get("maxPages"), maxPages));
             setMaxPaginationSamples(asInt(m.get("maxPaginationSamples"), maxPaginationSamples));
+            setMaxPageDurationSec(asInt(m.get("maxPageDurationSec"), maxPageDurationSec));
             Object ff = m.get("formFill");
             if (ff instanceof Map<?, ?>) {
                 formFillProfile.applyPersistMap((Map<String, Object>) ff);

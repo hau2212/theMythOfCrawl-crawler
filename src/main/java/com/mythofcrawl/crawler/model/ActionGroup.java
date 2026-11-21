@@ -1,12 +1,19 @@
 package com.mythofcrawl.crawler.model;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * A UI action (page load, button, link, tab, select, form submit, search input, scroll...)
  * and every API it triggered. Groups are keyed by their action path, so repeating the
  * same action merges into the same group.
+ *
+ * Uses a {@link ReentrantReadWriteLock} and an O(1) internal dedup index so concurrent
+ * EDT snapshots and proxy capture threads do not contend on coarse monitors.
  */
 public final class ActionGroup {
 
@@ -17,10 +24,14 @@ public final class ActionGroup {
     public final String pageUrl;
     public final long firstSeenMs;
 
-    private long lastSeenMs;
+    private final ReentrantReadWriteLock rwl = new ReentrantReadWriteLock();
+    private volatile long lastSeenMs;
     private int triggerCount = 1;
     private final List<ApiCall> calls = new ArrayList<>();
+    private final Map<String, ApiCall> dedupIndex = new HashMap<>();
+    private final Map<String, ApiCall> firstByEndpoint = new HashMap<>();
     private final List<AuditNote> groupNotes = new ArrayList<>();
+    private volatile List<ActionStep> actionTrail = Collections.emptyList();
 
     public ActionGroup(int id, String actionPath, String kind, String label, String pageUrl, long nowMs) {
         this.id = id;
@@ -32,73 +43,168 @@ public final class ActionGroup {
         this.lastSeenMs = nowMs;
     }
 
-    synchronized void touch() {
-        triggerCount++;
-        lastSeenMs = System.currentTimeMillis();
-    }
-
-    synchronized void addCall(ApiCall call) {
-        calls.add(call);
-        lastSeenMs = System.currentTimeMillis();
-    }
-
-    synchronized void addGroupNote(AuditNote note) {
-        if (note != null) {
-            groupNotes.add(note);
+    void touch() {
+        rwl.writeLock().lock();
+        try {
+            triggerCount++;
             lastSeenMs = System.currentTimeMillis();
+        } finally {
+            rwl.writeLock().unlock();
         }
     }
 
-    public synchronized List<AuditNote> getGroupNotes() {
-        return new ArrayList<>(groupNotes);
+    ApiCall findDuplicateCall(String endpointKey, String paramSig, int statusCode) {
+        String key = dedupKey(endpointKey, paramSig, statusCode);
+        rwl.readLock().lock();
+        try {
+            return dedupIndex.get(key);
+        } finally {
+            rwl.readLock().unlock();
+        }
     }
 
-    synchronized List<ApiCall> callsView() {
-        return calls;
+    ApiCall firstCallForEndpoint(String endpointKey) {
+        rwl.readLock().lock();
+        try {
+            return firstByEndpoint.get(endpointKey);
+        } finally {
+            rwl.readLock().unlock();
+        }
     }
 
-    public synchronized List<ApiCall> getCalls() {
-        return new ArrayList<>(calls);
+    void addCall(ApiCall call) {
+        rwl.writeLock().lock();
+        try {
+            calls.add(call);
+            String dKey = dedupKey(call.endpointKey, call.paramSig, call.capture.statusCode);
+            dedupIndex.putIfAbsent(dKey, call);
+            firstByEndpoint.putIfAbsent(call.endpointKey, call);
+            lastSeenMs = System.currentTimeMillis();
+        } finally {
+            rwl.writeLock().unlock();
+        }
     }
 
-    public synchronized int callCount() {
-        return calls.size();
+    void addGroupNote(AuditNote note) {
+        if (note == null) {
+            return;
+        }
+        rwl.writeLock().lock();
+        try {
+            groupNotes.add(note);
+            lastSeenMs = System.currentTimeMillis();
+        } finally {
+            rwl.writeLock().unlock();
+        }
     }
 
-    public synchronized int getTriggerCount() {
-        return triggerCount;
+    public List<AuditNote> getGroupNotes() {
+        rwl.readLock().lock();
+        try {
+            return new ArrayList<>(groupNotes);
+        } finally {
+            rwl.readLock().unlock();
+        }
     }
 
-    public synchronized long getLastSeenMs() {
+    public List<ApiCall> getCalls() {
+        rwl.readLock().lock();
+        try {
+            return new ArrayList<>(calls);
+        } finally {
+            rwl.readLock().unlock();
+        }
+    }
+
+    public int callCount() {
+        rwl.readLock().lock();
+        try {
+            return calls.size();
+        } finally {
+            rwl.readLock().unlock();
+        }
+    }
+
+    public int getTriggerCount() {
+        rwl.readLock().lock();
+        try {
+            return triggerCount;
+        } finally {
+            rwl.readLock().unlock();
+        }
+    }
+
+    public long getLastSeenMs() {
         return lastSeenMs;
     }
 
-    public synchronized int noteCount() {
-        int n = groupNotes.size();
-        for (ApiCall c : calls) {
-            n += c.getNotes().size();
+    public void setActionTrail(List<ActionStep> trail) {
+        if (trail == null || trail.isEmpty()) {
+            return;
         }
-        return n;
+        List<ActionStep> existing = this.actionTrail;
+        boolean incomingHasLocator = trail.stream().anyMatch(ActionStep::hasDomLocator);
+        boolean existingHasLocator = existing.stream().anyMatch(ActionStep::hasDomLocator);
+        if (existing.isEmpty() || (incomingHasLocator && !existingHasLocator) || trail.size() >= existing.size()) {
+            this.actionTrail = Collections.unmodifiableList(new ArrayList<>(trail));
+        }
     }
 
-    public synchronized int excelMatchedCount() {
-        int n = 0;
-        for (ApiCall c : calls) {
-            if (c.inExcel) {
-                n++;
+    public List<ActionStep> getActionTrail() {
+        List<ActionStep> t = this.actionTrail;
+        if (t != null && !t.isEmpty()) {
+            return t;
+        }
+        return ActionStep.fallbackFromActionPath(actionPath, pageUrl);
+    }
+
+    public int noteCount() {
+        rwl.readLock().lock();
+        try {
+            int n = groupNotes.size();
+            for (ApiCall c : calls) {
+                n += c.noteCount();
             }
+            return n;
+        } finally {
+            rwl.readLock().unlock();
         }
-        return n;
     }
 
-    public synchronized AuditNote.Severity worstSeverity() {
-        AuditNote.Severity w = null;
-        for (AuditNote n : groupNotes) {
-            w = AuditNote.worst(w, n.severity);
+    public int excelMatchedCount() {
+        rwl.readLock().lock();
+        try {
+            int n = 0;
+            for (ApiCall c : calls) {
+                if (c.inExcel) {
+                    n++;
+                }
+            }
+            return n;
+        } finally {
+            rwl.readLock().unlock();
         }
-        for (ApiCall c : calls) {
-            w = AuditNote.worst(w, c.worstSeverity());
+    }
+
+    public AuditNote.Severity worstSeverity() {
+        rwl.readLock().lock();
+        try {
+            AuditNote.Severity w = null;
+            for (AuditNote n : groupNotes) {
+                w = AuditNote.worst(w, n.severity);
+            }
+            for (ApiCall c : calls) {
+                w = AuditNote.worst(w, c.worstSeverity());
+            }
+            return w;
+        } finally {
+            rwl.readLock().unlock();
         }
-        return w;
+    }
+
+    private static String dedupKey(String endpointKey, String paramSig, int statusCode) {
+        return (endpointKey != null ? endpointKey : "")
+            + "\u0000" + (paramSig != null ? paramSig : "")
+            + "\u0000" + statusCode;
     }
 }

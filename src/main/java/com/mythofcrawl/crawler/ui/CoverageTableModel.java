@@ -35,6 +35,11 @@ public final class CoverageTableModel extends AbstractTableModel {
     private List<ApiSpecEntry> visibleEntries = new ArrayList<>();
     private String statusFilter = "ALL"; // ALL | MATCHED | MISSING | NOTES
     private String searchQuery = "";
+    private BurpFilterBar.FilterCriteria filterCriteria;
+
+    public int getTotalSourceCount() {
+        return allEntries.size();
+    }
 
     public void setMatcher(ExcelSpecMatcher matcher) {
         this.allEntries = matcher != null ? matcher.getEntries() : Collections.emptyList();
@@ -42,8 +47,14 @@ public final class CoverageTableModel extends AbstractTableModel {
     }
 
     public void setFilter(String statusFilter, String searchQuery) {
+        setFilter(statusFilter, searchQuery, null);
+    }
+
+    public void setFilter(String statusFilter, String searchQuery, BurpFilterBar.FilterCriteria criteria) {
         this.statusFilter = statusFilter != null ? statusFilter : "ALL";
-        this.searchQuery = searchQuery != null ? searchQuery.trim().toLowerCase() : "";
+        this.filterCriteria = criteria;
+        String rawQ = criteria != null ? criteria.rawQuery : searchQuery;
+        this.searchQuery = rawQ != null ? rawQ.trim().toLowerCase() : "";
         applyFilter();
     }
 
@@ -65,8 +76,33 @@ public final class CoverageTableModel extends AbstractTableModel {
             if ("NOTES".equals(statusFilter) && !hasNotes) {
                 continue;
             }
-            if (!searchQuery.isEmpty()) {
-                CapturedApiEntry cap = entry.getPrimaryCapture();
+            CapturedApiEntry cap = entry.getPrimaryCapture();
+            if (filterCriteria != null) {
+                String method = cap != null ? cap.method : entry.displayMethod;
+                int status = cap != null ? cap.statusCode : 0;
+                int paramCount = cap != null ? cap.paramCount() : 0;
+                String actionPath = cap != null ? cap.actionPath : "";
+                String url = cap != null ? cap.fullUrl : "";
+                boolean hit = filterCriteria.matches(
+                    method,
+                    status,
+                    "",
+                    paramCount,
+                    hasNotes,
+                    matched,
+                    entry.hasParamDiffNote(),
+                    entry.stt,
+                    entry.displayMethod,
+                    entry.rawSpecPath,
+                    actionPath,
+                    url,
+                    entry.getNotesSummary(),
+                    String.join(" ", entry.getJsHints())
+                );
+                if (!hit) {
+                    continue;
+                }
+            } else if (!searchQuery.isEmpty()) {
                 String actionPath = cap != null ? cap.actionPath.toLowerCase() : "";
                 String url = cap != null ? cap.fullUrl.toLowerCase() : "";
                 String notes = entry.getNotesSummary().toLowerCase();
@@ -91,6 +127,14 @@ public final class CoverageTableModel extends AbstractTableModel {
             return visibleEntries.get(modelRow);
         }
         return null;
+    }
+
+    public String getKeyAt(int modelRow) {
+        ApiSpecEntry entry = getEntryAt(modelRow);
+        if (entry == null) {
+            return null;
+        }
+        return entry.stt + "|" + entry.displayMethod + "|" + entry.rawSpecPath;
     }
 
     @Override
@@ -174,6 +218,9 @@ public final class CoverageTableModel extends AbstractTableModel {
             setHorizontalAlignment((column == 0 || column == 1 || column == 2 || column == 5 || column == 6)
                 ? SwingConstants.CENTER : SwingConstants.LEFT);
             c.setFont(table.getFont());
+            if (c instanceof JLabel) {
+                ((JLabel) c).setIcon(null);
+            }
 
             if (!isSelected && table.getModel() instanceof CoverageTableModel) {
                 int modelRow = table.convertRowIndexToModel(row);
@@ -197,6 +244,9 @@ public final class CoverageTableModel extends AbstractTableModel {
                     } else if (column == 1) {
                         fg = AuditTheme.okForeground(dark);
                         c.setFont(table.getFont().deriveFont(Font.BOLD));
+                        if (c instanceof JLabel) {
+                            ((JLabel) c).setIcon(BurpIcons.check(fg));
+                        }
                     }
 
                     if (column == 2) {
@@ -303,14 +353,19 @@ public final class CoverageTableModel extends AbstractTableModel {
         }
 
         @Override
+        public Class<?> getColumnClass(int col) {
+            return (col == 3 || col == 4) ? Integer.class : String.class;
+        }
+
+        @Override
         public Object getValueAt(int row, int col) {
             CapturedApiEntry e = rows.get(row);
             switch (col) {
                 case 0: return e.method;
                 case 1: return e.requestPathWithQuery;
                 case 2: return e.actionPath;
-                case 3: return String.valueOf(e.paramCount());
-                case 4: return String.valueOf(e.statusCode);
+                case 3: return Integer.valueOf(e.paramCount());
+                case 4: return Integer.valueOf(e.statusCode);
                 default: return "";
             }
         }

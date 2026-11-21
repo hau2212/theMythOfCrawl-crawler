@@ -1,10 +1,12 @@
 package com.mythofcrawl.crawler.ui;
 
 import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.core.HighlightColor;
 import com.mythofcrawl.crawler.model.ActionGroup;
 import com.mythofcrawl.crawler.model.ActionGroupStore;
 import com.mythofcrawl.crawler.model.ApiCall;
 import com.mythofcrawl.crawler.model.AuditNote;
+import com.mythofcrawl.crawler.model.ReviewStatus;
 
 import javax.swing.JLabel;
 import javax.swing.JTable;
@@ -174,9 +176,9 @@ public final class GroupTableModel {
         }
         StringBuilder sb = new StringBuilder(depth * 4 + 4);
         for (int i = 0; i < depth - 1; i++) {
-            sb.append("│   ");
+            sb.append("|   ");
         }
-        sb.append(isLast ? "└─ " : "├─ ");
+        sb.append(isLast ? "+-- " : "|-- ");
         return sb.toString();
     }
 
@@ -301,10 +303,10 @@ public final class GroupTableModel {
         }
         List<String> diffs = new ArrayList<>();
         if (!candidate.capture.method.equalsIgnoreCase(baseline.capture.method)) {
-            diffs.add("Method " + candidate.capture.method + " ≠ " + baseline.capture.method);
+            diffs.add("Method " + candidate.capture.method + " != " + baseline.capture.method);
         }
         if (candidate.capture.statusCode != baseline.capture.statusCode) {
-            diffs.add("HTTP " + candidate.capture.statusCode + " ≠ " + baseline.capture.statusCode);
+            diffs.add("HTTP " + candidate.capture.statusCode + " != " + baseline.capture.statusCode);
         }
         List<String> added = new ArrayList<>();
         List<String> removed = new ArrayList<>();
@@ -324,7 +326,7 @@ public final class GroupTableModel {
             diffs.add("Params (" + String.join(", ", pDiff) + ")");
         }
         if (candidate.capture.responseLength != baseline.capture.responseLength) {
-            diffs.add("Size " + candidate.capture.responseLength + "B ≠ " + baseline.capture.responseLength + "B");
+            diffs.add("Size " + candidate.capture.responseLength + "B != " + baseline.capture.responseLength + "B");
         }
         return diffs.isEmpty() ? "Giống hệt 100% (khác vị trí)" : String.join(" | ", diffs);
     }
@@ -570,7 +572,7 @@ public final class GroupTableModel {
 
             boolean collapsed = collapsedFolders.contains(node.fullPath);
             String folderTitle = treeBranchPrefix(depth, isLast)
-                + (collapsed ? "📁 " : "📂 ")
+                + (collapsed ? "[+] " : "[-] ")
                 + label
                 + " (" + node.subtreeGroups.size() + " nhóm)";
             out.add(new GroupRow(
@@ -641,6 +643,17 @@ public final class GroupTableModel {
 
         public GroupRow getRowAt(int modelRow) {
             return modelRow >= 0 && modelRow < visible.size() ? visible.get(modelRow) : null;
+        }
+
+        public String getKeyAt(int modelRow) {
+            GroupRow r = getRowAt(modelRow);
+            if (r == null) {
+                return null;
+            }
+            if (r.directGroup != null) {
+                return "G:" + r.directGroup.id;
+            }
+            return "F:" + r.folderKey;
         }
 
         public ActionGroup getGroupAt(int modelRow) {
@@ -729,7 +742,10 @@ public final class GroupTableModel {
 
         @Override
         public Class<?> getColumnClass(int col) {
-            if (!treeMode && (col == 0 || col == 2 || col == 3 || col == 5)) {
+            if (col == 2 || col == 3 || col == 5) {
+                return Integer.class;
+            }
+            if (!treeMode && col == 0) {
                 return Integer.class;
             }
             return Object.class;
@@ -742,7 +758,7 @@ public final class GroupTableModel {
                 case 0:
                     if (treeMode) {
                         if (r.isFolder) {
-                            return (r.collapsed ? "▶ " : "▼ ") + r.treeNumber;
+                            return (r.collapsed ? "> " : "v ") + r.treeNumber;
                         }
                         return r.treeNumber;
                     }
@@ -759,7 +775,7 @@ public final class GroupTableModel {
 
     public static final class GroupApisModel extends AbstractTableModel {
         private static final String[] COLS = {
-            "#", "Tên / Vị trí tìm thấy (Action Path)", "Method", "Endpoint / Path", "HTTP", "Params", "Hits", "Excel", "NOTE"
+            "#", "Tên / Vị trí tìm thấy (Action Path)", "Method", "Endpoint / Path", "HTTP", "Params", "Hits", "Excel", "NOTE", "Triage"
         };
 
         public static final class ApiDisplayRow {
@@ -828,9 +844,19 @@ public final class GroupTableModel {
         private boolean treeMode = true;
         private String searchQuery = "";
         private boolean onlyWithNotes = false;
+        private BurpFilterBar.FilterCriteria filterCriteria;
+        private int totalSourceCount = 0;
 
         public GroupApisModel(ActionGroupStore store) {
             this.store = store;
+        }
+
+        public int getTotalSourceCount() {
+            return totalSourceCount;
+        }
+
+        public int getFilteredCallCount() {
+            return filteredCalls.size();
         }
 
         public boolean isTreeMode() {
@@ -856,8 +882,20 @@ public final class GroupTableModel {
             boolean onlyWithNotes,
             String searchQuery
         ) {
+            setGroupsAndFilter(groups, showAllWhenEmpty, onlyWithNotes, searchQuery, null);
+        }
+
+        public void setGroupsAndFilter(
+            Collection<ActionGroup> groups,
+            boolean showAllWhenEmpty,
+            boolean onlyWithNotes,
+            String searchQuery,
+            BurpFilterBar.FilterCriteria criteria
+        ) {
             this.onlyWithNotes = onlyWithNotes;
-            this.searchQuery = searchQuery != null ? searchQuery.trim().toLowerCase() : "";
+            this.filterCriteria = criteria;
+            String rawQ = criteria != null ? criteria.rawQuery : searchQuery;
+            this.searchQuery = rawQ != null ? rawQ.trim().toLowerCase() : "";
             List<ApiCall> source = new ArrayList<>();
             if (groups != null && !groups.isEmpty()) {
                 for (ActionGroup g : groups) {
@@ -870,12 +908,37 @@ public final class GroupTableModel {
                     source.addAll(g.getCalls());
                 }
             }
+            this.totalSourceCount = source.size();
             List<ApiCall> filtered = new ArrayList<>();
             for (ApiCall c : source) {
                 if (this.onlyWithNotes && !c.hasNotes()) {
                     continue;
                 }
-                if (!this.searchQuery.isEmpty()) {
+                if (criteria != null) {
+                    boolean interesting = c.getHighlightColor() != HighlightColor.NONE
+                        || c.getReviewStatus() == ReviewStatus.INTERESTING;
+                    boolean hit = criteria.matches(
+                        c.capture.method,
+                        c.capture.statusCode,
+                        c.mimeType,
+                        c.capture.paramCount(),
+                        c.hasNotes(),
+                        c.inExcel,
+                        interesting,
+                        c.displayName(),
+                        c.displayPath(),
+                        normalizeApiGroupPath(c),
+                        c.capture.method,
+                        c.capture.paramSignature(),
+                        c.notesSummary(),
+                        c.excelStt,
+                        c.getUserComment(),
+                        c.getReviewStatus().label
+                    );
+                    if (!hit) {
+                        continue;
+                    }
+                } else if (!this.searchQuery.isEmpty()) {
                     boolean hit = c.displayName().toLowerCase().contains(this.searchQuery)
                         || c.displayPath().toLowerCase().contains(this.searchQuery)
                         || normalizeApiGroupPath(c).toLowerCase().contains(this.searchQuery)
@@ -959,7 +1022,7 @@ public final class GroupTableModel {
 
                 int variantCount = byParamSig.size();
                 boolean hasDiffParams = variantCount > 1;
-                String title = (collapsed ? "📁 " : "📂 ")
+                String title = (collapsed ? "[+] " : "[-] ")
                     + pathKey
                     + " (" + bucket.size() + " API"
                     + (hasDiffParams ? (" • " + variantCount + " kiểu param") : " • cùng param")
@@ -1059,9 +1122,9 @@ public final class GroupTableModel {
                 false,
                 diffFromBaseline,
                 normalizeApiGroupPath(c),
-                "    ↳ " + c.displayName(),
+                "    -> " + c.displayName(),
                 c.capture.method,
-                "    ↳ " + c.displayPath(),
+                "    -> " + c.displayPath(),
                 String.valueOf(c.capture.statusCode),
                 paramText,
                 c.getHits(),
@@ -1224,13 +1287,27 @@ public final class GroupTableModel {
             return -1;
         }
 
+        public String getKeyAt(int modelRow) {
+            ApiDisplayRow r = getRowAt(modelRow);
+            if (r == null) {
+                return null;
+            }
+            if (r.call != null) {
+                return "C:" + r.call.callUid;
+            }
+            return "H:" + r.pathKey;
+        }
+
         @Override public int getRowCount() { return rows.size(); }
         @Override public int getColumnCount() { return COLS.length; }
         @Override public String getColumnName(int col) { return COLS[col]; }
 
         @Override
         public Class<?> getColumnClass(int col) {
-            if (!treeMode && (col == 0 || col == 4 || col == 6)) {
+            if (col == 6) {
+                return Integer.class;
+            }
+            if (!treeMode && (col == 0 || col == 4)) {
                 return Integer.class;
             }
             return Object.class;
@@ -1242,7 +1319,7 @@ public final class GroupTableModel {
             switch (col) {
                 case 0:
                     if (r.isGroupHeader) {
-                        return r.collapsed ? "▶" : "▼";
+                        return r.collapsed ? ">" : "v";
                     }
                     return r.call != null ? Integer.valueOf(r.call.index) : "";
                 case 1: return r.titleDisplay;
@@ -1257,6 +1334,16 @@ public final class GroupTableModel {
                 case 6: return Integer.valueOf(r.hits);
                 case 7: return r.excelDisplay;
                 case 8: return r.noteDisplay;
+                case 9:
+                    if (r.call != null) {
+                        ReviewStatus rs = r.call.getReviewStatus();
+                        String cmt = r.call.getUserComment();
+                        if (!cmt.isEmpty()) {
+                            return rs == ReviewStatus.UNREVIEWED ? cmt : (rs.label + " | " + cmt);
+                        }
+                        return rs == ReviewStatus.UNREVIEWED ? "" : rs.label;
+                    }
+                    return "";
                 default: return "";
             }
         }
@@ -1271,25 +1358,57 @@ public final class GroupTableModel {
         private List<AuditNote> visible = new ArrayList<>();
         private String severityFilter = "ALL"; // ALL | ERROR | WARN | INFO
         private String searchQuery = "";
+        private BurpFilterBar.FilterCriteria filterCriteria;
+        private int totalSourceCount = 0;
 
         public AuditNotesTableModel(ActionGroupStore store) {
             this.store = store;
         }
 
+        public int getTotalSourceCount() {
+            return totalSourceCount;
+        }
+
         public void setFilter(String severityFilter, String searchQuery) {
+            setFilter(severityFilter, searchQuery, null);
+        }
+
+        public void setFilter(String severityFilter, String searchQuery, BurpFilterBar.FilterCriteria criteria) {
             this.severityFilter = severityFilter != null ? severityFilter : "ALL";
-            this.searchQuery = searchQuery != null ? searchQuery.trim().toLowerCase() : "";
+            this.filterCriteria = criteria;
+            String rawQ = criteria != null ? criteria.rawQuery : searchQuery;
+            this.searchQuery = rawQ != null ? rawQ.trim().toLowerCase() : "";
             refresh();
         }
 
         public void refresh() {
             List<AuditNote> all = store != null ? store.snapshotNotes() : Collections.emptyList();
+            this.totalSourceCount = all.size();
             List<AuditNote> out = new ArrayList<>(all.size());
             for (AuditNote n : all) {
                 if (!"ALL".equals(severityFilter) && !n.severity.name().equals(severityFilter)) {
                     continue;
                 }
-                if (!searchQuery.isEmpty()) {
+                if (filterCriteria != null) {
+                    boolean hit = filterCriteria.matches(
+                        n.method,
+                        0,
+                        "",
+                        0,
+                        true,
+                        false,
+                        n.severity == AuditNote.Severity.ERROR || n.severity == AuditNote.Severity.WARN,
+                        n.groupPath,
+                        n.endpoint,
+                        n.message,
+                        n.type.label,
+                        n.method,
+                        n.severity.label
+                    );
+                    if (!hit) {
+                        continue;
+                    }
+                } else if (!searchQuery.isEmpty()) {
                     boolean hit = n.groupPath.toLowerCase().contains(searchQuery)
                         || n.endpoint.toLowerCase().contains(searchQuery)
                         || n.message.toLowerCase().contains(searchQuery)
@@ -1307,6 +1426,14 @@ public final class GroupTableModel {
 
         public AuditNote getNoteAt(int modelRow) {
             return modelRow >= 0 && modelRow < visible.size() ? visible.get(modelRow) : null;
+        }
+
+        public String getKeyAt(int modelRow) {
+            AuditNote n = getNoteAt(modelRow);
+            if (n == null) {
+                return null;
+            }
+            return n.groupId + "#" + n.callIndex + "|" + n.type.name() + "|" + n.timestampMs + "|" + n.endpoint;
         }
 
         @Override public int getRowCount() { return visible.size(); }
@@ -1353,8 +1480,8 @@ public final class GroupTableModel {
                 ActionGroupsModel.GroupRow meta = ((ActionGroupsModel) table.getModel()).getRowAt(mr);
                 if (meta != null) {
                     if (meta.isFolder) {
-                        tooltip = meta.folderKey + " (" + meta.subtreeGroups.size() + " nhóm, " + meta.totalApis + " API) — Double-click hoặc bấm "
-                            + (meta.collapsed ? "▶ để sổ" : "▼ để thu gọn");
+                        tooltip = meta.folderKey + " (" + meta.subtreeGroups.size() + " nhóm, " + meta.totalApis + " API) - Double-click hoặc bấm "
+                            + (meta.collapsed ? "> để sổ" : "v để thu gọn");
                     } else if (meta.directGroup != null && meta.directGroup.actionPath.length() > 30) {
                         tooltip = meta.directGroup.actionPath;
                     }
@@ -1422,6 +1549,9 @@ public final class GroupTableModel {
             setHorizontalAlignment((column == 0 || column == 2 || column == 4 || column == 6 || column == 7)
                 ? SwingConstants.CENTER : SwingConstants.LEFT);
             c.setFont(table.getFont());
+            if (c instanceof JLabel) {
+                ((JLabel) c).setIcon(null);
+            }
 
             String tooltip = null;
             if (table.getModel() instanceof GroupApisModel) {
@@ -1429,13 +1559,18 @@ public final class GroupTableModel {
                 GroupApisModel.ApiDisplayRow meta = ((GroupApisModel) table.getModel()).getRowAt(mr);
                 if (meta != null) {
                     if (meta.isGroupHeader) {
-                        tooltip = meta.pathKey + " (" + meta.groupedCalls.size() + " API — " + meta.paramsDisplay + ") — bấm "
-                            + (meta.collapsed ? "▶ để sổ chi tiết" : "▼ để thu gọn");
-                    } else if (meta.call != null && value != null) {
-                        String s = String.valueOf(value);
-                        if (s.length() > 30 || column == 5) {
-                            tooltip = column == 1 ? meta.call.displayName()
-                                : (column == 3 ? meta.call.displayPath() : s);
+                        tooltip = meta.pathKey + " (" + meta.groupedCalls.size() + " API - " + meta.paramsDisplay + ") - bấm "
+                            + (meta.collapsed ? "> để sổ chi tiết" : "v để thu gọn");
+                    } else if (meta.call != null) {
+                        String cmt = meta.call.getUserComment();
+                        if (!cmt.isEmpty() && (column == 9 || column == 1)) {
+                            tooltip = "Ghi chú: " + cmt;
+                        } else if (value != null) {
+                            String s = String.valueOf(value);
+                            if (s.length() > 30 || column == 5) {
+                                tooltip = column == 1 ? meta.call.displayName()
+                                    : (column == 3 ? meta.call.displayPath() : s);
+                            }
                         }
                     }
                     if (!isSelected) {
@@ -1451,6 +1586,13 @@ public final class GroupTableModel {
                             bg = meta.isGroupHeader
                                 ? AuditTheme.blend(AuditTheme.cardSurface(dark), AuditTheme.severityRowTint(w, table.getBackground(), dark), 0.45f)
                                 : AuditTheme.severityRowTint(w, table.getBackground(), dark);
+                        }
+                        boolean hasExplicitHighlight = !meta.isGroupHeader && meta.call != null
+                            && meta.call.getHighlightColor() != HighlightColor.NONE;
+                        if (hasExplicitHighlight) {
+                            Color badge = AuditTheme.highlightBadgeColor(api, meta.call.getHighlightColor(), dark);
+                            bg = badge != null ? AuditTheme.blend(bg, badge, dark ? 0.55f : 0.72f) : bg;
+                            fg = AuditTheme.contrastForeground(bg);
                         }
 
                         if (meta.isGroupHeader) {
@@ -1483,21 +1625,46 @@ public final class GroupTableModel {
                             }
                         } else if (meta.call != null) {
                             ApiCall call = meta.call;
-                            if (column == 2) {
-                                fg = AuditTheme.methodForeground(call.capture.method, dark);
-                                c.setFont(table.getFont().deriveFont(Font.BOLD));
-                            } else if (column == 4) {
-                                fg = AuditTheme.statusCodeForeground(call.capture.statusCode, dark);
-                                c.setFont(table.getFont().deriveFont(Font.BOLD));
-                            } else if (column == 5 && meta.diffParamVariant) {
-                                fg = AuditTheme.severityForeground(AuditNote.Severity.WARN, dark);
-                                c.setFont(table.getFont().deriveFont(Font.BOLD));
-                            } else if (column == 7 && call.inExcel) {
-                                fg = AuditTheme.okForeground(dark);
-                                c.setFont(table.getFont().deriveFont(Font.BOLD));
-                            } else if (column == 8 && w != null) {
-                                fg = AuditTheme.severityForeground(w, dark);
-                                c.setFont(table.getFont().deriveFont(Font.BOLD));
+                            if (!hasExplicitHighlight) {
+                                if (column == 2) {
+                                    fg = AuditTheme.methodForeground(call.capture.method, dark);
+                                    c.setFont(table.getFont().deriveFont(Font.BOLD));
+                                } else if (column == 4) {
+                                    fg = AuditTheme.statusCodeForeground(call.capture.statusCode, dark);
+                                    c.setFont(table.getFont().deriveFont(Font.BOLD));
+                                } else if (column == 5 && meta.diffParamVariant) {
+                                    fg = AuditTheme.severityForeground(AuditNote.Severity.WARN, dark);
+                                    c.setFont(table.getFont().deriveFont(Font.BOLD));
+                                } else if (column == 7 && call.inExcel) {
+                                    fg = AuditTheme.okForeground(dark);
+                                    c.setFont(table.getFont().deriveFont(Font.BOLD));
+                                    if (c instanceof JLabel) {
+                                        ((JLabel) c).setIcon(BurpIcons.check(fg));
+                                    }
+                                } else if (column == 8 && w != null) {
+                                    fg = AuditTheme.severityForeground(w, dark);
+                                    c.setFont(table.getFont().deriveFont(Font.BOLD));
+                                } else if (column == 9) {
+                                    if (call.getReviewStatus() == ReviewStatus.INTERESTING) {
+                                        fg = AuditTheme.severityForeground(AuditNote.Severity.WARN, dark);
+                                        c.setFont(table.getFont().deriveFont(Font.BOLD));
+                                    } else if (call.getReviewStatus() == ReviewStatus.TESTED) {
+                                        fg = AuditTheme.okForeground(dark);
+                                    } else if (call.getReviewStatus() == ReviewStatus.FALSE_POSITIVE) {
+                                        fg = AuditTheme.mutedForeground(dark);
+                                    }
+                                }
+                            } else {
+                                if (column == 2 || column == 4) {
+                                    c.setFont(table.getFont().deriveFont(Font.BOLD));
+                                } else if (column == 7 && call.inExcel && c instanceof JLabel) {
+                                    ((JLabel) c).setIcon(BurpIcons.check(fg));
+                                } else if (column == 9 && c instanceof JLabel) {
+                                    Color swatch = AuditTheme.highlightBadgeColor(api, call.getHighlightColor(), dark);
+                                    if (swatch != null) {
+                                        ((JLabel) c).setIcon(BurpIcons.dot(swatch));
+                                    }
+                                }
                             }
                         }
                         c.setBackground(bg);

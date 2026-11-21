@@ -14,6 +14,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collections;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -21,7 +23,8 @@ import java.util.Map;
 
 /**
  * Exports Excel coverage, Action Groups + per-API Audit NOTEs, UI action paths,
- * and parameter diffs to CSV (UTF-8 BOM), JSON, and Markdown reports.
+ * parameter diffs, and `theMythOfCrawl.py` handoff target bundles to CSV (formula-safe UTF-8 BOM),
+ * JSON, and Markdown reports.
  */
 public final class ReportExporter {
 
@@ -178,6 +181,7 @@ public final class ReportExporter {
                 List<Map<String, Object>> callList = new ArrayList<>();
                 for (ApiCall c : g.getCalls()) {
                     Map<String, Object> cm = new LinkedHashMap<>();
+                    cm.put("callUid", c.callUid);
                     cm.put("index", c.index);
                     cm.put("apiName", c.displayName());
                     cm.put("method", c.capture.method);
@@ -187,6 +191,9 @@ public final class ReportExporter {
                     cm.put("hits", c.getHits());
                     cm.put("excelStt", c.excelStt);
                     cm.put("paramKeys", new ArrayList<>(c.capture.paramKeys));
+                    cm.put("highlightColor", c.getHighlightColor().name());
+                    cm.put("reviewStatus", c.getReviewStatus().name());
+                    cm.put("userComment", c.getUserComment());
                     cm.put("noteSummary", c.notesSummary());
                     callList.add(cm);
                 }
@@ -240,6 +247,83 @@ public final class ReportExporter {
         }
         root.put("extraCaptures", extraList);
 
+        writeUtf8(file, MiniJson.stringify(root));
+    }
+
+    /**
+     * Exports captured APIs and Excel specs in a clean JSON format directly consumable
+     * by `theMythOfCrawl.py` (`tmoc_core.TargetList.from_json` schema + raw Base64 requests
+     * for multi-role BOLA/IDOR replay).
+     */
+    public static void exportForTheMythOfCrawlJson(
+        File file,
+        ExcelSpecMatcher matcher,
+        ActionGroupStore actionGroups
+    ) throws Exception {
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("extension", "theMythOfCrawl");
+        root.put("version", 1);
+        root.put("source", matcher != null && !matcher.getSourceFileName().isEmpty()
+            ? matcher.getSourceFileName() : "theMythOfCrawl-crawler");
+        root.put("sheet", "CrawlerExport");
+        root.put("headers", List.of("STT", "PROTOCOL", "PATH", "POSITION"));
+
+        List<Map<String, Object>> targetEntries = new ArrayList<>();
+        List<Map<String, Object>> capturedRequests = new ArrayList<>();
+
+        int rowNo = 1;
+        if (actionGroups != null) {
+            for (ActionGroup g : actionGroups.snapshotGroups()) {
+                for (ApiCall call : g.getCalls()) {
+                    CapturedApiEntry cap = call.capture;
+                    if (cap == null || "WS_SEND".equals(cap.method) || "WS_RECV".equals(cap.method)) {
+                        continue;
+                    }
+                    String sttVal = call.inExcel ? call.excelStt : String.valueOf(rowNo);
+                    String pathOnly = cap.requestPathWithQuery != null ? cap.requestPathWithQuery : "/";
+
+                    Map<String, Object> te = new LinkedHashMap<>();
+                    te.put("stt", sttVal);
+                    te.put("methods", Collections.singletonList(cap.method));
+                    te.put("path", pathOnly);
+                    te.put("position", call.displayName());
+                    te.put("row", rowNo);
+                    targetEntries.add(te);
+
+                    Map<String, Object> cr = new LinkedHashMap<>();
+                    cr.put("stt", sttVal);
+                    cr.put("callUid", call.callUid);
+                    cr.put("method", cap.method);
+                    cr.put("url", cap.fullUrl);
+                    cr.put("host", cap.host);
+                    cr.put("port", cap.port);
+                    cr.put("https", cap.https);
+                    cr.put("path", pathOnly);
+                    cr.put("position", call.displayName());
+                    cr.put("status", cap.statusCode);
+                    cr.put("paramKeys", new ArrayList<>(cap.paramKeys));
+                    cr.put("rawRequestBase64", cap.requestBytes != null
+                        ? Base64.getEncoder().encodeToString(cap.requestBytes) : "");
+                    capturedRequests.add(cr);
+                    rowNo++;
+                }
+            }
+        }
+        if (targetEntries.isEmpty() && matcher != null) {
+            for (ApiSpecEntry spec : matcher.getEntries()) {
+                Map<String, Object> te = new LinkedHashMap<>();
+                te.put("stt", spec.stt);
+                te.put("methods", new ArrayList<>(spec.allowedMethods));
+                te.put("path", spec.rawSpecPath);
+                CapturedApiEntry primary = spec.getPrimaryCapture();
+                te.put("position", primary != null ? primary.actionPath : "");
+                te.put("row", rowNo++);
+                targetEntries.add(te);
+            }
+        }
+
+        root.put("entries", targetEntries);
+        root.put("capturedRequests", capturedRequests);
         writeUtf8(file, MiniJson.stringify(root));
     }
 
@@ -384,7 +468,14 @@ public final class ReportExporter {
         if (v == null) {
             return "\"\"";
         }
-        return "\"" + v.replace("\"", "\"\"") + "\"";
+        String safe = v;
+        if (!"-".equals(safe) && !safe.isEmpty()) {
+            char first = safe.charAt(0);
+            if (first == '=' || first == '+' || first == '-' || first == '@' || first == '\t' || first == '\r') {
+                safe = "'" + safe;
+            }
+        }
+        return "\"" + safe.replace("\"", "\"\"") + "\"";
     }
 
     private static void writeUtf8(File file, String content) throws Exception {

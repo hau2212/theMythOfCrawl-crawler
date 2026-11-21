@@ -8,6 +8,13 @@ import burp.api.montoya.proxy.http.InterceptedRequest;
 import burp.api.montoya.proxy.http.ProxyRequestHandler;
 import burp.api.montoya.proxy.http.ProxyRequestReceivedAction;
 import burp.api.montoya.proxy.http.ProxyRequestToBeSentAction;
+import com.mythofcrawl.crawler.core.guardrail.ActionGateAuditLog;
+import com.mythofcrawl.crawler.core.guardrail.GuardrailMode;
+import com.mythofcrawl.crawler.core.guardrail.HttpEncodingGuard;
+import com.mythofcrawl.crawler.core.guardrail.PolicyEvaluator;
+import com.mythofcrawl.crawler.core.guardrail.PolicyLedger;
+import com.mythofcrawl.crawler.core.guardrail.ProxyInterceptQueue;
+import com.mythofcrawl.crawler.core.sync.ChangesBatch;
 import com.mythofcrawl.crawler.model.CrawlConfig;
 import com.mythofcrawl.crawler.model.CrawlState;
 
@@ -15,24 +22,30 @@ import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
 
 /**
  * Intercepts Proxy requests:
- * 1) Redirects same-origin virtual /__myth_crawl/* calls cleanly as HTTP/1.1 requests to the loopback
- *    LocalControlServer (works identically for Chrome HTTP/2, Burp Chromium, and Firefox HTTP/1.1/HTTP/2).
- * 2) Forces uncompressed 200 OK HTML documents (Accept-Encoding: identity, no 304 cache validators)
- *    for allowed hosts while Armed/Running so gzip/br/zstd/304 never prevent agent injection.
- * 3) Captures the active UI action path keyed by Montoya messageId() at request initiation time.
+ * 1) Redirects same-origin virtual /__myth_crawl/* calls (for allowed/loopback hosts while active/armed)
+ *    cleanly as HTTP/1.1 requests to the loopback LocalControlServer.
+ * 2) Rewrites Accept-Encoding: gzip, deflate, br, identity on ALL in-scope requests (stripping zstd)
+ *    and forces identity + no-cache on document navigations so HTML/JS always decode cleanly.
+ * 3) Captures the active UI action path (preferring Referer-correlated context) keyed by
+ *    Montoya messageId() with 60s TTL eviction in CrawlState.
  */
 public final class ControlPlaneHandler implements ProxyRequestHandler {
 
     private final CrawlConfig config;
     private final CrawlState state;
     private final int localControlPort;
-    private final Set<Integer> trackedInFlightIds = ConcurrentHashMap.newKeySet();
     private volatile boolean agentArmed = true;
+    private volatile boolean passiveCapture = false;
+    private volatile PolicyLedger policyLedger;
+    private volatile ProxyInterceptQueue interceptQueue;
+    private volatile ActionGateAuditLog auditLog;
+    private volatile String localControlToken = "";
+    private volatile Supplier<String> uiActionSupplier;
+    private volatile ChangesBatch changesBatch;
 
     public ControlPlaneHandler(CrawlConfig config, CrawlState state, int localControlPort) {
         this.config = config;
@@ -40,49 +53,154 @@ public final class ControlPlaneHandler implements ProxyRequestHandler {
         this.localControlPort = localControlPort;
     }
 
+    public void setGuardrailEngine(
+        PolicyLedger policyLedger,
+        ProxyInterceptQueue interceptQueue,
+        ActionGateAuditLog auditLog,
+        String localControlToken,
+        Supplier<String> uiActionSupplier
+    ) {
+        this.policyLedger = policyLedger;
+        this.interceptQueue = interceptQueue;
+        this.auditLog = auditLog;
+        this.localControlToken = localControlToken != null ? localControlToken : "";
+        this.uiActionSupplier = uiActionSupplier;
+    }
+
+    public void setChangesBatch(ChangesBatch changesBatch) {
+        this.changesBatch = changesBatch;
+    }
+
     public void setAgentArmed(boolean agentArmed) {
         this.agentArmed = agentArmed;
     }
 
+    public void setPassiveCapture(boolean passiveCapture) {
+        this.passiveCapture = passiveCapture;
+    }
+
     public boolean consumeTrackedInFlight(int messageId) {
-        return trackedInFlightIds.remove(messageId);
+        return state.consumeTrackedInFlight(messageId);
     }
 
     @Override
     public ProxyRequestReceivedAction handleRequestReceived(InterceptedRequest interceptedRequest) {
         String path = interceptedRequest.path();
-        if (path != null && path.startsWith("/__myth_crawl/")) {
+        HttpService svc = interceptedRequest.httpService();
+        CrawlState.Status st = state.getStatus();
+
+        if (path != null && path.startsWith("/__myth_crawl/") && shouldHandleControlPath(svc, interceptedRequest, st)) {
             HttpService localService = HttpService.httpService("127.0.0.1", localControlPort, false);
             HttpRequest localReq = buildHttp11ControlRequest(interceptedRequest, localService, path, false);
             return ProxyRequestReceivedAction.doNotIntercept(localReq);
         }
 
-        HttpService svc = interceptedRequest.httpService();
-        if (svc != null && config.isHostAllowed(svc.host())) {
-            CrawlState.Status st = state.getStatus();
-            if (st == CrawlState.Status.RUNNING) {
+        if (svc != null && isTargetOrReplayHost(svc.host())) {
+            String referer = interceptedRequest.headerValue("Referer");
+            CrawlState.ActionContextSnapshot ctx = state.resolveContextForReferer(referer);
+            if (st == CrawlState.Status.RUNNING && config.isHostAllowed(svc.host())) {
                 state.bindMessageContext(
                     interceptedRequest.messageId(),
-                    state.getCurrentActionPath(),
-                    state.getCurrentGroup());
-                if (trackedInFlightIds.size() < 4096) {
-                    trackedInFlightIds.add(interceptedRequest.messageId());
-                    state.incrementInFlight();
+                    ctx.actionPath,
+                    ctx.group,
+                    true);
+            }
+
+            HttpRequest activeRequest = interceptedRequest;
+            if (policyLedger != null && !isLoopbackHost(svc.host())) {
+                String branchPath = ctx.actionPath != null ? ctx.actionPath : "";
+                String uiAction = uiActionSupplier != null ? uiActionSupplier.get() : "";
+                String reqMethod = interceptedRequest.method() != null
+                    ? interceptedRequest.method().toUpperCase() : "GET";
+                String reqPath = path != null ? path : "/";
+                PolicyEvaluator.Decision decision = PolicyEvaluator.evaluate(
+                    policyLedger, branchPath, svc.host(), reqMethod, reqPath, uiAction);
+
+                if (decision.effectiveMode == GuardrailMode.HOLD_AT_PROXY
+                    || decision.effectiveMode == GuardrailMode.LOCK_2XX) {
+                    if (auditLog != null) {
+                        auditLog.record(
+                            decision.effectiveMode == GuardrailMode.LOCK_2XX
+                                ? ActionGateAuditLog.Outcome.LOCK_2XX
+                                : ActionGateAuditLog.Outcome.HOLD_AT_PROXY,
+                            branchPath, svc.host(), reqMethod, reqPath, uiAction,
+                            decision.winningRule, decision.reason);
+                    }
+                    if (changesBatch != null) {
+                        changesBatch.markDirty();
+                    }
+                    String holdPath = "/__myth_crawl/virtual_hold?method=" + urlEncode(reqMethod)
+                        + "&endpoint=" + urlEncode(reqPath)
+                        + "&reason=" + urlEncode(HttpEncodingGuard.asciiSafe(decision.reason));
+                    HttpService localService = HttpService.httpService("127.0.0.1", localControlPort, false);
+                    HttpRequest localReq = buildHttp11ControlRequest(interceptedRequest, localService, holdPath, true);
+                    if (localControlToken != null && !localControlToken.isEmpty()) {
+                        localReq = localReq.withUpdatedHeader("X-Myth-Token", localControlToken);
+                    }
+                    return ProxyRequestReceivedAction.doNotIntercept(localReq);
+                }
+
+                if (decision.effectiveMode == GuardrailMode.INTERCEPT_WAIT && interceptQueue != null) {
+                    if (auditLog != null) {
+                        auditLog.record(
+                            ActionGateAuditLog.Outcome.INTERCEPT_WAIT,
+                            branchPath, svc.host(), reqMethod, reqPath, uiAction,
+                            decision.winningRule, decision.reason);
+                    }
+                    byte[] rawBytes = interceptedRequest.toByteArray().getBytes();
+                    String ruleName = decision.winningRule != null ? decision.winningRule.name : "";
+                    ProxyInterceptQueue.InterceptResolution res = interceptQueue.enqueueAndWait(
+                        branchPath, svc.host(), reqMethod, reqPath, rawBytes,
+                        decision.reason, ruleName, ProxyInterceptQueue.DEFAULT_TIMEOUT_MS);
+                    if (res.action == ProxyInterceptQueue.ResolutionAction.DROP) {
+                        if (auditLog != null) {
+                            auditLog.record(ActionGateAuditLog.Outcome.DROP,
+                                branchPath, svc.host(), reqMethod, reqPath, uiAction,
+                                decision.winningRule, res.note);
+                        }
+                        return ProxyRequestReceivedAction.drop();
+                    }
+                    if (res.action == ProxyInterceptQueue.ResolutionAction.SAVE_DRAFT) {
+                        if (auditLog != null) {
+                            auditLog.record(ActionGateAuditLog.Outcome.SAVE_DRAFT,
+                                branchPath, svc.host(), reqMethod, reqPath, uiAction,
+                                decision.winningRule, res.note);
+                        }
+                        return ProxyRequestReceivedAction.drop();
+                    }
+                    if (res.action == ProxyInterceptQueue.ResolutionAction.FORWARD) {
+                        if (auditLog != null) {
+                            auditLog.record(ActionGateAuditLog.Outcome.FORWARD,
+                                branchPath, svc.host(), reqMethod, reqPath, uiAction,
+                                decision.winningRule, res.note);
+                        }
+                        if (res.editedRawBytes != null && res.editedRawBytes.length > 0) {
+                            activeRequest = HttpRequest.httpRequest(svc, ByteArray.byteArray(res.editedRawBytes));
+                        }
+                    }
+                } else if (decision.winningRule != null && decision.winningRule.allow && auditLog != null) {
+                    auditLog.record(ActionGateAuditLog.Outcome.ALLOW,
+                        branchPath, svc.host(), reqMethod, reqPath, uiAction,
+                        decision.winningRule, decision.reason);
                 }
             }
 
             // Apply custom user HTTP Header Filter rules (e.g., X-Account: a) to target requests
             HttpRequest modified = config.getHeaderFilterProfile()
-                .applyToMontoyaRequest(interceptedRequest, svc.host(), interceptedRequest.url(), false);
+                .applyToMontoyaRequest(activeRequest, svc.host(), activeRequest.url(), false);
 
-            // Ensure browser navigation HTML documents arrive uncompressed & fresh (no br/zstd/304)
-            // whenever agent injection is enabled so both Chrome and Firefox get <script> reliably.
-            boolean shouldInject = (st == CrawlState.Status.RUNNING) || (agentArmed && st != CrawlState.Status.STOPPED);
-            if (shouldInject && isDocumentNavigationRequest(modified)) {
+            // Rewrite Accept-Encoding for ALL in-scope traffic while active/armed/passive/replaying so
+            // zstd is never negotiated and JS bundles + HTML always decode via gzip/deflate/brotli/identity.
+            boolean replayActive = state.hasActiveReplayPlan();
+            boolean shouldInject = (st == CrawlState.Status.RUNNING) || replayActive || (agentArmed && st != CrawlState.Status.STOPPED);
+            boolean shouldNormalizeEncoding = shouldInject || passiveCapture;
+            if (shouldInject && isDocumentOrFrameNavigationRequest(modified)) {
                 modified = modified
                     .withUpdatedHeader("Accept-Encoding", "identity")
                     .withRemovedHeader("If-None-Match")
                     .withRemovedHeader("If-Modified-Since");
+            } else if (shouldNormalizeEncoding) {
+                modified = modified.withUpdatedHeader("Accept-Encoding", "gzip, deflate, br, identity");
             }
             if (modified != interceptedRequest) {
                 return ProxyRequestReceivedAction.continueWith(modified);
@@ -100,15 +218,40 @@ public final class ControlPlaneHandler implements ProxyRequestHandler {
         return ProxyRequestReceivedAction.continueWith(interceptedRequest);
     }
 
+    private boolean isTargetOrReplayHost(String host) {
+        return config.isHostAllowed(host) || state.isReplayHostAllowed(host);
+    }
+
+    private boolean shouldHandleControlPath(HttpService svc, InterceptedRequest req, CrawlState.Status st) {
+        if (svc == null) {
+            return false;
+        }
+        if (st == CrawlState.Status.STOPPED && !agentArmed && !state.hasActiveReplayPlan()) {
+            return false;
+        }
+        String host = svc.host();
+        if (isLoopbackHost(host)) {
+            return true;
+        }
+        if (isTargetOrReplayHost(host)) {
+            return true;
+        }
+        return isRefererHostAllowed(req.headerValue("Referer"));
+    }
+
+    private static boolean isLoopbackHost(String host) {
+        if (host == null) {
+            return false;
+        }
+        String h = host.toLowerCase();
+        return "127.0.0.1".equals(h) || "localhost".equals(h) || "::1".equals(h);
+    }
+
     private boolean shouldInterceptExternalRedirect(InterceptedRequest req, String host) {
         if (state.getStatus() != CrawlState.Status.RUNNING || !config.isAllowAutoRequests()) {
             return false;
         }
-        if (host == null || host.isEmpty()) {
-            return false;
-        }
-        String hostLower = host.toLowerCase();
-        if ("127.0.0.1".equals(hostLower) || "localhost".equals(hostLower) || "::1".equals(hostLower)) {
+        if (host == null || host.isEmpty() || isLoopbackHost(host)) {
             return false;
         }
         String fetchDest = req.headerValue("Sec-Fetch-Dest");
@@ -123,8 +266,12 @@ public final class ControlPlaneHandler implements ProxyRequestHandler {
         if (isRefererHostAllowed(referer)) {
             return true;
         }
-        long elapsed = System.currentTimeMillis() - state.getLastContextActionAtMs();
-        return state.getLastContextActionAtMs() > 0 && elapsed >= 0 && elapsed <= 8000L;
+        // Tightened correlation for rel="noreferrer" redirects: only within 2.5s of an active UI click
+        if (referer == null || referer.trim().isEmpty()) {
+            long clickElapsed = System.currentTimeMillis() - state.getLastClickActionAtMs();
+            return state.getLastClickActionAtMs() > 0 && clickElapsed >= 0 && clickElapsed <= 2500L;
+        }
+        return false;
     }
 
     private boolean isRefererHostAllowed(String referer) {
@@ -152,14 +299,14 @@ public final class ControlPlaneHandler implements ProxyRequestHandler {
         return ProxyRequestToBeSentAction.continueWith(interceptedRequest);
     }
 
-    private static boolean isDocumentNavigationRequest(HttpRequest req) {
+    private static boolean isDocumentOrFrameNavigationRequest(HttpRequest req) {
         String secFetchDest = req.headerValue("Sec-Fetch-Dest");
         if (secFetchDest != null) {
             String d = secFetchDest.trim().toLowerCase();
-            if (d.equals("iframe") || d.equals("frame") || d.equals("object") || d.equals("embed")) {
+            if (d.equals("object") || d.equals("embed")) {
                 return false;
             }
-            if (d.equals("document")) {
+            if (d.equals("document") || d.equals("iframe") || d.equals("frame")) {
                 return true;
             }
         }

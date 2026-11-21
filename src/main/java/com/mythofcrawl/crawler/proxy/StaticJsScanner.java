@@ -6,19 +6,24 @@ import com.mythofcrawl.crawler.model.CrawlState;
 
 import java.net.URI;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Asynchronous Java background scanner that extracts hidden routes and API endpoints
- * from .js bundles / chunks passing through Burp Proxy and cross-references MISSING
- * Excel entries so pentesters know where hidden endpoints live in the frontend code.
+ * Asynchronous Java background scanner that extracts hidden routes, API endpoints,
+ * GraphQL operations, and gRPC-Web service paths from .js bundles passing through Burp Proxy
+ * and cross-references MISSING Excel entries via Aho-Corasick prefix matching.
  */
 public final class StaticJsScanner {
 
     private static final Pattern QUOTED_PATH = Pattern.compile(
         "[\"'`](/(?:[a-zA-Z0-9_\\-.:{}*]+/)*[a-zA-Z0-9_\\-.:{}*]+)[\"'`]");
+
+    private static final Pattern GRAPHQL_OP_DEF = Pattern.compile(
+        "\\b(query|mutation|subscription)\\s+([A-Za-z_][A-Za-z0-9_]{2,48})\\s*[({]");
 
     private static final Pattern STATIC_NOISE = Pattern.compile(
         ".*\\.(png|jpe?g|gif|svg|ico|webp|css|scss|less|woff2?|ttf|eot|map|mp4|mp3|pdf)$",
@@ -38,11 +43,19 @@ public final class StaticJsScanner {
         this.config = config;
         this.state = state;
         this.matcher = matcher;
-        this.executor = Executors.newFixedThreadPool(2, r -> {
-            Thread t = new Thread(r, "MythCrawler-JsScanner");
-            t.setDaemon(true);
-            return t;
-        });
+        this.executor = new ThreadPoolExecutor(
+            1,
+            2,
+            30L,
+            TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(128),
+            r -> {
+                Thread t = new Thread(r, "MythCrawler-JsScanner");
+                t.setDaemon(true);
+                return t;
+            },
+            new ThreadPoolExecutor.DiscardOldestPolicy()
+        );
     }
 
     public void setMatcher(ExcelSpecMatcher matcher) {
@@ -59,7 +72,7 @@ public final class StaticJsScanner {
         }
         // Cap single bundle scan at 3MB to keep memory predictable on huge vendor chunks
         String slice = jsBody.length() > 3_000_000 ? jsBody.substring(0, 3_000_000) : jsBody;
-        executor.submit(() -> scanBody(jsUrl, slice));
+        executor.execute(() -> scanBody(jsUrl, slice));
     }
 
     private void scanBody(String jsUrl, String jsBody) {
@@ -70,6 +83,7 @@ public final class StaticJsScanner {
             }
 
             String origin = extractOrigin(jsUrl);
+            String shortName = shortJsName(jsUrl);
             Matcher m = QUOTED_PATH.matcher(jsBody);
             boolean changed = false;
             int count = 0;
@@ -83,19 +97,32 @@ public final class StaticJsScanner {
                     continue;
                 }
                 if (path.startsWith("/api/") || path.contains("/v1/") || path.contains("/v2/")
-                    || path.contains("/v3/") || path.contains("/graphql")) {
-                    state.addDiscoveredJsEndpoint(path + "  (from " + shortJsName(jsUrl) + ")");
+                    || path.contains("/v3/") || path.contains("/graphql") || path.contains("/rest/")
+                    || path.matches("^/[a-zA-Z0-9_.]+\\.[A-Z][a-zA-Z0-9_]+/[A-Z][a-zA-Z0-9_]+$")) {
+                    state.addDiscoveredJsEndpoint(path + "  (from " + shortName + ")");
                     changed = true;
                 } else if (!origin.isEmpty() && !path.contains("{") && !path.contains(":")
                     && !path.contains("*") && !path.contains("..") && !path.endsWith(".js")) {
-                    // Candidate UI route discovered in frontend router/bundle
-                    if (state.enqueueUrl(origin + path, config)) {
+                    if (config.isDeepCrawlMode() && state.enqueueJsRouteIfEligible(path, jsUrl, config)) {
                         changed = true;
                     }
-                    state.addDiscoveredJsEndpoint(path + "  [route] (from " + shortJsName(jsUrl) + ")");
+                    state.addDiscoveredJsEndpoint(path + "  [route] (from " + shortName + ")");
                 }
                 count++;
             }
+
+            // Extract GraphQL operation definitions embedded in JS bundles
+            if (jsBody.contains("query ") || jsBody.contains("mutation ") || jsBody.contains("subscription ")) {
+                Matcher gm = GRAPHQL_OP_DEF.matcher(jsBody);
+                int gCount = 0;
+                while (gm.find() && gCount < 100) {
+                    state.addDiscoveredJsEndpoint(
+                        "[GraphQL " + gm.group(1) + "] " + gm.group(2) + "  (from " + shortName + ")");
+                    changed = true;
+                    gCount++;
+                }
+            }
+
             if (changed && onUpdateCallback != null) {
                 onUpdateCallback.run();
             }
