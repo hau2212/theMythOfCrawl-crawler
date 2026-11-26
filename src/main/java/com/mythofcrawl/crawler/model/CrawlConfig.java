@@ -1,11 +1,15 @@
 package com.mythofcrawl.crawler.model;
 
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Runtime configuration for the Browser + Excel Burp Auto-Crawler.
@@ -21,8 +25,36 @@ public final class CrawlConfig {
     public static final String DEFAULT_DANGER_KEYWORDS =
         "logout,log out,sign out,signout,đăng xuất";
 
+    private static final Pattern MARKDOWN_LINK_RX = Pattern.compile("\\[[^\\]]*\\]\\((https?://[^)\\s]+)\\)");
+
+    /**
+     * Parsed scope rule supporting both host-wide scope ({@code vnexpress.net}) and
+     * sub-path URL prefix scope ({@code vnexpress.net/the-gioi} or {@code https://vnexpress.net/the-gioi}),
+     * where {@code https://vnexpress.net/} and sibling paths are strictly out-of-scope and blocked.
+     */
+    public static final class ScopeRule {
+        public final String hostPattern;
+        public final String pathPrefix;
+        public final boolean wildcardSuffix;
+
+        public ScopeRule(String hostPattern, String pathPrefix, boolean wildcardSuffix) {
+            this.hostPattern = hostPattern != null ? hostPattern.trim().toLowerCase(Locale.ROOT) : "";
+            this.pathPrefix = pathPrefix != null ? pathPrefix : "";
+            this.wildcardSuffix = wildcardSuffix;
+        }
+
+        public Map<String, Object> toAgentMap() {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("host", hostPattern);
+            m.put("pathPrefix", pathPrefix);
+            m.put("wildcardSuffix", wildcardSuffix);
+            return m;
+        }
+    }
+
     private volatile String allowedHostsCsv = "";
     private volatile String seedUrl = "";
+    private volatile boolean strictSeedPathScope = false;
     private volatile String apiBasePrefix = "";
     private volatile String routeRootLabel = "/";
     private volatile boolean strictExcelOnly = true;
@@ -106,32 +138,114 @@ public final class CrawlConfig {
     }
 
     public void setAllowedHostsCsv(String allowedHostsCsv) {
-        this.allowedHostsCsv = allowedHostsCsv != null ? allowedHostsCsv.trim() : "";
+        this.allowedHostsCsv = allowedHostsCsv != null ? unwrapMarkdownLinks(allowedHostsCsv).trim() : "";
+    }
+
+    public boolean isStrictSeedPathScope() {
+        return strictSeedPathScope;
+    }
+
+    public void setStrictSeedPathScope(boolean strictSeedPathScope) {
+        this.strictSeedPathScope = strictSeedPathScope;
+    }
+
+    public static String unwrapMarkdownLinks(String raw) {
+        if (raw == null || !raw.contains("](")) {
+            return raw != null ? raw : "";
+        }
+        Matcher m = MARKDOWN_LINK_RX.matcher(raw);
+        StringBuffer sb = new StringBuffer();
+        while (m.find()) {
+            m.appendReplacement(sb, Matcher.quoteReplacement(m.group(1)));
+        }
+        m.appendTail(sb);
+        return sb.toString();
+    }
+
+    /**
+     * Parses configured scope rules (Host + optional Path Prefix), applying {@code seedUrl}'s
+     * sub-path prefix as well whenever {@link #isStrictSeedPathScope()} is enabled.
+     */
+    public List<ScopeRule> getEffectiveScopeRules() {
+        List<ScopeRule> parsed = new ArrayList<>();
+        String cleanedCsv = unwrapMarkdownLinks(allowedHostsCsv);
+        if (cleanedCsv != null && !cleanedCsv.trim().isEmpty()) {
+            for (String part : cleanedCsv.split("[,;\\s]+")) {
+                ScopeRule r = parseSingleScopeToken(part);
+                if (r != null && !r.hostPattern.isEmpty()) {
+                    parsed.add(r);
+                }
+            }
+        }
+
+        ScopeRule seedRule = strictSeedPathScope ? parseSingleScopeToken(seedUrl) : null;
+        if (seedRule != null && !seedRule.hostPattern.isEmpty() && !seedRule.pathPrefix.isEmpty()) {
+            if (parsed.isEmpty()) {
+                parsed.add(seedRule);
+            } else {
+                List<ScopeRule> merged = new ArrayList<>(parsed.size());
+                boolean matchedHost = false;
+                for (ScopeRule r : parsed) {
+                    if (r.pathPrefix.isEmpty() && hostMatchesPattern(seedRule.hostPattern, r.hostPattern)) {
+                        merged.add(new ScopeRule(r.hostPattern, seedRule.pathPrefix, seedRule.wildcardSuffix));
+                        matchedHost = true;
+                    } else {
+                        merged.add(r);
+                    }
+                }
+                if (!matchedHost && !isHostInRuleList(seedRule.hostPattern, merged)) {
+                    merged.add(seedRule);
+                }
+                return merged;
+            }
+        }
+        return parsed;
+    }
+
+    public List<Map<String, Object>> getEffectiveScopeRulesForAgent() {
+        List<ScopeRule> rules = getEffectiveScopeRules();
+        List<Map<String, Object>> out = new ArrayList<>(rules.size());
+        for (ScopeRule r : rules) {
+            out.add(r.toAgentMap());
+        }
+        return out;
+    }
+
+    public boolean hasPathScopeRestriction() {
+        for (ScopeRule r : getEffectiveScopeRules()) {
+            if (!r.pathPrefix.isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Resolves a safe in-scope entry URL (preferring {@code seedUrl} if in scope, or synthesizing
+     * {@code https://<host><pathPrefix>} from the first concrete path-scoped rule).
+     */
+    public String getPrimaryAllowedEntryUrl() {
+        String s = seedUrl != null ? seedUrl.trim() : "";
+        if (!s.isEmpty()) {
+            String fullSeed = (s.startsWith("http://") || s.startsWith("https://")) ? s : ("https://" + s);
+            if (isUrlAllowedForCrawl(fullSeed)) {
+                return fullSeed;
+            }
+        }
+        for (ScopeRule r : getEffectiveScopeRules()) {
+            if (!r.hostPattern.isEmpty() && !r.hostPattern.contains("*")) {
+                String path = r.pathPrefix.isEmpty() ? "/" : r.pathPrefix;
+                return "https://" + r.hostPattern + path;
+            }
+        }
+        return "";
     }
 
     public Set<String> getAllowedHostsSet() {
         LinkedHashSet<String> set = new LinkedHashSet<>();
-        if (allowedHostsCsv != null && !allowedHostsCsv.trim().isEmpty()) {
-            for (String part : allowedHostsCsv.split("[,;\\s]+")) {
-                String h = part.trim().toLowerCase();
-                if (!h.isEmpty()) {
-                    if (h.startsWith("http://")) {
-                        h = h.substring(7);
-                    } else if (h.startsWith("https://")) {
-                        h = h.substring(8);
-                    }
-                    int slash = h.indexOf('/');
-                    if (slash >= 0) {
-                        h = h.substring(0, slash);
-                    }
-                    int colon = h.indexOf(':');
-                    if (colon >= 0) {
-                        h = h.substring(0, colon);
-                    }
-                    if (!h.isEmpty()) {
-                        set.add(h);
-                    }
-                }
+        for (ScopeRule r : getEffectiveScopeRules()) {
+            if (!r.hostPattern.isEmpty()) {
+                set.add(r.hostPattern);
             }
         }
         return set;
@@ -141,34 +255,206 @@ public final class CrawlConfig {
         if (host == null || host.trim().isEmpty()) {
             return false;
         }
-        String h = host.trim().toLowerCase();
-        Set<String> allowed = getAllowedHostsSet();
-        if (allowed.isEmpty()) {
+        String h = host.trim().toLowerCase(Locale.ROOT);
+        List<ScopeRule> rules = getEffectiveScopeRules();
+        if (rules.isEmpty()) {
             return false;
         }
-        for (String pattern : allowed) {
-            if ("*".equals(pattern)) {
-                return true;
-            }
-            if (pattern.startsWith("*.")) {
-                String suffix = pattern.substring(1);
-                if (h.endsWith(suffix) || h.equals(pattern.substring(2))) {
-                    return true;
-                }
-            } else if (pattern.startsWith("*") && pattern.length() > 1) {
-                // Support "*example.com" shorthand the same as "*.example.com"
-                String root = pattern.substring(1);
-                if (root.startsWith(".")) {
-                    root = root.substring(1);
-                }
-                if (h.equals(root) || h.endsWith("." + root)) {
-                    return true;
-                }
-            } else if (h.equals(pattern)) {
+        for (ScopeRule rule : rules) {
+            if (hostMatchesPattern(h, rule.hostPattern)) {
                 return true;
             }
         }
         return false;
+    }
+
+    /**
+     * Checks BOTH host scope AND URL sub-path scope (e.g. when configured with
+     * {@code https://vnexpress.net/the-gioi}, {@code https://vnexpress.net/the-gioi} and
+     * {@code https://vnexpress.net/the-gioi/quan-su} return {@code true}, while
+     * {@code https://vnexpress.net/} and {@code https://vnexpress.net/the-thao} return {@code false}).
+     */
+    public boolean isUrlAllowedForCrawl(String rawUrl) {
+        if (rawUrl == null || rawUrl.trim().isEmpty()) {
+            return false;
+        }
+        String trimmed = unwrapMarkdownLinks(rawUrl).trim();
+        try {
+            URI u = URI.create(trimmed);
+            String scheme = u.getScheme();
+            if (scheme != null && !"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
+                return false;
+            }
+            String host = u.getHost();
+            if (host == null || host.isEmpty()) {
+                return false;
+            }
+            String hLower = host.toLowerCase(Locale.ROOT);
+            String rawPath = (u.getRawPath() == null || u.getRawPath().isEmpty()) ? "/" : u.getRawPath();
+            String frag = u.getRawFragment();
+            String spaHashRoute = "";
+            if (frag != null && (frag.startsWith("/") || frag.startsWith("!/"))) {
+                spaHashRoute = frag.startsWith("!/") ? frag.substring(1) : frag;
+                int qInHash = spaHashRoute.indexOf('?');
+                if (qInHash >= 0) {
+                    spaHashRoute = spaHashRoute.substring(0, qInHash);
+                }
+            }
+
+            List<ScopeRule> rules = getEffectiveScopeRules();
+            if (rules.isEmpty()) {
+                return false;
+            }
+            for (ScopeRule r : rules) {
+                if (!hostMatchesPattern(hLower, r.hostPattern)) {
+                    continue;
+                }
+                if (r.pathPrefix.isEmpty()) {
+                    return true;
+                }
+                if (pathMatchesPrefix(rawPath, r.pathPrefix, r.wildcardSuffix)) {
+                    return true;
+                }
+                if (!spaHashRoute.isEmpty() && ("/".equals(rawPath) || rawPath.isEmpty())
+                    && pathMatchesPrefix(spaHashRoute, r.pathPrefix, r.wildcardSuffix)) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    public static boolean pathMatchesPrefix(String candidatePath, String requiredPrefix, boolean wildcardSuffix) {
+        if (requiredPrefix == null || requiredPrefix.isEmpty() || "/".equals(requiredPrefix)) {
+            return true;
+        }
+        String p = (candidatePath == null || candidatePath.isEmpty()) ? "/" : candidatePath;
+        if (!p.startsWith("/")) {
+            p = "/" + p;
+        }
+        String pLower = p.toLowerCase(Locale.ROOT);
+        String prefLower = requiredPrefix.toLowerCase(Locale.ROOT);
+        if (prefLower.length() > 1 && prefLower.endsWith("/")) {
+            prefLower = prefLower.substring(0, prefLower.length() - 1);
+        }
+        if (pLower.equals(prefLower) || pLower.startsWith(prefLower + "/")) {
+            return true;
+        }
+        if (wildcardSuffix && pLower.startsWith(prefLower)) {
+            return true;
+        }
+        // Support CMS numeric pagination suffixes such as /the-gioi-p2 while rejecting /the-gioi-moi
+        if (pLower.startsWith(prefLower + "-p") && pLower.length() > prefLower.length() + 2) {
+            int idx = prefLower.length() + 2;
+            int digits = 0;
+            while (idx < pLower.length() && Character.isDigit(pLower.charAt(idx))) {
+                idx++;
+                digits++;
+            }
+            if (digits > 0 && (idx == pLower.length() || pLower.charAt(idx) == '/' || pLower.charAt(idx) == '.')) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isHostInRuleList(String hostLower, List<ScopeRule> list) {
+        for (ScopeRule r : list) {
+            if (hostMatchesPattern(hostLower, r.hostPattern)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hostMatchesPattern(String h, String pattern) {
+        if (h == null || pattern == null || h.isEmpty() || pattern.isEmpty()) {
+            return false;
+        }
+        if ("*".equals(pattern)) {
+            return true;
+        }
+        if (pattern.startsWith("*.")) {
+            String suffix = pattern.substring(1);
+            return h.endsWith(suffix) || h.equals(pattern.substring(2));
+        }
+        if (pattern.startsWith("*") && pattern.length() > 1) {
+            String root = pattern.substring(1);
+            if (root.startsWith(".")) {
+                root = root.substring(1);
+            }
+            return h.equals(root) || h.endsWith("." + root);
+        }
+        return h.equals(pattern);
+    }
+
+    private static ScopeRule parseSingleScopeToken(String rawToken) {
+        if (rawToken == null) {
+            return null;
+        }
+        String tok = unwrapMarkdownLinks(rawToken).trim();
+        if (tok.isEmpty()) {
+            return null;
+        }
+        if ("*".equals(tok)) {
+            return new ScopeRule("*", "", false);
+        }
+        String working = tok;
+        if (working.regionMatches(true, 0, "http://", 0, 7)) {
+            working = working.substring(7);
+        } else if (working.regionMatches(true, 0, "https://", 0, 8)) {
+            working = working.substring(8);
+        }
+
+        int hashIdx = working.indexOf('#');
+        String fragPart = "";
+        if (hashIdx >= 0) {
+            fragPart = working.substring(hashIdx + 1).trim();
+            working = working.substring(0, hashIdx);
+        }
+        int qIdx = working.indexOf('?');
+        if (qIdx >= 0) {
+            working = working.substring(0, qIdx);
+        }
+
+        int slashIdx = working.indexOf('/');
+        String hostPart = slashIdx >= 0 ? working.substring(0, slashIdx) : working;
+        String pathPart = slashIdx >= 0 ? working.substring(slashIdx) : "";
+
+        int colon = hostPart.indexOf(':');
+        if (colon >= 0) {
+            hostPart = hostPart.substring(0, colon);
+        }
+        hostPart = hostPart.trim().toLowerCase(Locale.ROOT);
+        if (hostPart.isEmpty()) {
+            return null;
+        }
+
+        // If SPA hash route was specified on root (e.g. app.com/#/the-gioi), use hash route as prefix
+        if ((pathPart.isEmpty() || "/".equals(pathPart))
+            && (fragPart.startsWith("/") || fragPart.startsWith("!/"))) {
+            pathPart = fragPart.startsWith("!/") ? fragPart.substring(1) : fragPart;
+            int qh = pathPart.indexOf('?');
+            if (qh >= 0) {
+                pathPart = pathPart.substring(0, qh);
+            }
+        }
+
+        boolean wild = false;
+        pathPart = pathPart.trim();
+        if (pathPart.endsWith("*") && pathPart.length() > 1) {
+            wild = true;
+            pathPart = pathPart.substring(0, pathPart.length() - 1);
+        }
+        if (pathPart.length() > 1 && pathPart.endsWith("/")) {
+            pathPart = pathPart.substring(0, pathPart.length() - 1);
+        }
+        if ("/".equals(pathPart)) {
+            pathPart = "";
+        }
+        return new ScopeRule(hostPart, pathPart, wild);
     }
 
     public String getApiBasePrefix() {
@@ -303,7 +589,7 @@ public final class CrawlConfig {
     }
 
     public void setSeedUrl(String seedUrl) {
-        this.seedUrl = seedUrl != null ? seedUrl.trim() : "";
+        this.seedUrl = seedUrl != null ? unwrapMarkdownLinks(seedUrl).trim() : "";
     }
 
     public int getMaxPaginationSamples() {
@@ -327,6 +613,7 @@ public final class CrawlConfig {
         m.put("pathStyleV2", true);
         m.put("allowedHostsCsv", allowedHostsCsv);
         m.put("seedUrl", seedUrl);
+        m.put("strictSeedPathScope", strictSeedPathScope);
         m.put("apiBasePrefix", apiBasePrefix);
         m.put("routeRootLabel", routeRootLabel);
         m.put("strictExcelOnly", strictExcelOnly);
@@ -361,6 +648,7 @@ public final class CrawlConfig {
             Map<String, Object> m = MiniJson.parseObject(json);
             if (m.containsKey("allowedHostsCsv")) setAllowedHostsCsv(MiniJson.asString(m, "allowedHostsCsv", ""));
             if (m.containsKey("seedUrl")) setSeedUrl(MiniJson.asString(m, "seedUrl", ""));
+            strictSeedPathScope = MiniJson.asBoolean(m, "strictSeedPathScope", strictSeedPathScope);
             if (m.containsKey("apiBasePrefix")) setApiBasePrefix(MiniJson.asString(m, "apiBasePrefix", ""));
             if (m.containsKey("routeRootLabel")) {
                 String savedRoot = MiniJson.asString(m, "routeRootLabel", "/");

@@ -74,8 +74,8 @@ public final class CrawlSessionController {
         Runnable onStrictDisabled,
         Runnable onStarted
     ) {
-        String hosts = hostsInput != null ? hostsInput.trim() : "";
-        String seed = seedInput != null ? seedInput.trim() : "";
+        String hosts = hostsInput != null ? CrawlConfig.unwrapMarkdownLinks(hostsInput).trim() : "";
+        String seed = seedInput != null ? CrawlConfig.unwrapMarkdownLinks(seedInput).trim() : "";
 
         if (hosts.isEmpty() && !seed.isEmpty()) {
             try {
@@ -88,9 +88,14 @@ public final class CrawlSessionController {
         }
 
         config.setAllowedHostsCsv(hosts);
+        if (!seed.isEmpty()) {
+            config.setSeedUrl(seed);
+        } else {
+            seed = config.getPrimaryAllowedEntryUrl();
+        }
         if (config.getAllowedHostsSet().isEmpty()) {
             JOptionPane.showMessageDialog(parent,
-                "Vui lòng nhập Target Host (ví dụ: target.example.com hoặc *) hoặc Seed URL đầy đủ.",
+                "Vui lòng nhập Target Host / URL nhánh (ví dụ: vnexpress.net/the-gioi hoặc *) hoặc Seed URL đầy đủ.",
                 "Thiếu Target Host", JOptionPane.WARNING_MESSAGE);
             return false;
         }
@@ -129,13 +134,16 @@ public final class CrawlSessionController {
 
         if (!seed.isEmpty() && api != null) {
             if (config.isAllowAutoRequests()) {
-                SeedDiscoveryHelper.fetchSeedsAsync(api, seed, config, state, logger);
+                SeedDiscoveryHelper.fetchSeedsAsync(api, seed, config, state, matcher, logger);
             } else {
                 log("Tạm giữ Seed URL (chế độ Khóa tự gửi): Extension KHÔNG tự gửi /robots.txt hay /sitemap.xml cho tới khi bạn BẬT 'Tự gửi Request'.");
             }
         }
 
-        log("Crawl RUNNING trên Host(s): " + config.getAllowedHostsCsv()
+        log("Crawl RUNNING trên Scope: " + config.getAllowedHostsCsv()
+            + (config.hasPathScopeRestriction()
+                ? (" [Khóa nhánh URL -> " + config.getPrimaryAllowedEntryUrl() + "]")
+                : "")
             + (config.isAllowAutoRequests()
                 ? " | Tự gửi Request ĐANG BẬT: Agent tự click & duyệt."
                 : " | Khóa tự gửi ĐANG BẬT: Bạn tự bấm trên trình duyệt để gom nhóm API an toàn."));
@@ -279,13 +287,13 @@ public final class CrawlSessionController {
             @Override
             protected Void doInBackground() throws Exception {
                 if ("csv".equals(fmt)) {
-                    ReportExporter.exportCsv(out, snapMatcher, extras, store);
+                    ReportExporter.exportCsv(out, snapMatcher, extras, store, state);
                 } else if ("json".equals(fmt)) {
-                    ReportExporter.exportJson(out, snapMatcher, extras, store);
+                    ReportExporter.exportJson(out, snapMatcher, extras, store, state);
                 } else if ("tmoc".equals(fmt)) {
                     ReportExporter.exportForTheMythOfCrawlJson(out, snapMatcher, store);
                 } else {
-                    ReportExporter.exportMarkdown(out, snapMatcher, extras, store);
+                    ReportExporter.exportMarkdown(out, snapMatcher, extras, store, state);
                 }
                 return null;
             }

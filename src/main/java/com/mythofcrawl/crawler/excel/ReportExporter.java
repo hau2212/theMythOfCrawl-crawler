@@ -5,6 +5,7 @@ import com.mythofcrawl.crawler.model.ActionGroupStore;
 import com.mythofcrawl.crawler.model.ApiCall;
 import com.mythofcrawl.crawler.model.AuditNote;
 import com.mythofcrawl.crawler.model.CapturedApiEntry;
+import com.mythofcrawl.crawler.model.CrawlState;
 import com.mythofcrawl.crawler.model.MiniJson;
 
 import java.io.File;
@@ -40,6 +41,16 @@ public final class ReportExporter {
         ExcelSpecMatcher matcher,
         List<CapturedApiEntry> extras,
         ActionGroupStore actionGroups
+    ) throws Exception {
+        exportCsv(file, matcher, extras, actionGroups, null);
+    }
+
+    public static void exportCsv(
+        File file,
+        ExcelSpecMatcher matcher,
+        List<CapturedApiEntry> extras,
+        ActionGroupStore actionGroups,
+        CrawlState state
     ) throws Exception {
         StringBuilder sb = new StringBuilder();
         sb.append('\uFEFF');
@@ -133,11 +144,31 @@ public final class ReportExporter {
             }
         }
 
+        if (state != null) {
+            java.util.Set<String> calledPaths = collectCalledNormalizedPaths(actionGroups);
+            for (String ghost : state.getDiscoveredJsEndpoints()) {
+                boolean wasCalled = isGhostTriggered(ghost, calledPaths);
+                sb.append(csvCell("GHOST_DISCOVERY")).append(',')
+                  .append(csvCell("JS/OPENAPI")).append(',')
+                  .append(csvCell(wasCalled ? "CALLED" : "UNTRIGGERED_GHOST")).append(',')
+                  .append(csvCell(inferGhostMethod(ghost))).append(',')
+                  .append(csvCell(ghost)).append(',')
+                  .append(csvCell("Static JS / OpenAPI Discovery")).append(',')
+                  .append(csvCell("")).append(',')
+                  .append(csvCell("")).append(',')
+                  .append(csvCell("0")).append(',')
+                  .append(csvCell("")).append(',')
+                  .append(csvCell("0")).append(',')
+                  .append(csvCell(wasCalled ? "Đã được kích hoạt qua UI" : "Chưa được kích hoạt trên UI (cần kiểm thử thêm)")).append(',')
+                  .append(csvCell("")).append('\n');
+            }
+        }
+
         writeUtf8(file, sb.toString());
     }
 
     public static void exportJson(File file, ExcelSpecMatcher matcher, List<CapturedApiEntry> extras) throws Exception {
-        exportJson(file, matcher, extras, null);
+        exportJson(file, matcher, extras, null, null);
     }
 
     public static void exportJson(
@@ -145,6 +176,16 @@ public final class ReportExporter {
         ExcelSpecMatcher matcher,
         List<CapturedApiEntry> extras,
         ActionGroupStore actionGroups
+    ) throws Exception {
+        exportJson(file, matcher, extras, actionGroups, null);
+    }
+
+    public static void exportJson(
+        File file,
+        ExcelSpecMatcher matcher,
+        List<CapturedApiEntry> extras,
+        ActionGroupStore actionGroups,
+        CrawlState state
     ) throws Exception {
         Map<String, Object> root = new LinkedHashMap<>();
         root.put("exportedAt", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
@@ -160,10 +201,20 @@ public final class ReportExporter {
         statsMap.put("withParamDiffNotes", stats.withNotes);
         if (actionGroups != null) {
             statsMap.put("actionGroups", actionGroups.groupCount());
+            statsMap.put("uniqueEndpoints", actionGroups.endpointCount());
             statsMap.put("totalGroupedCalls", actionGroups.totalCalls());
             statsMap.put("auditErrorNotes", actionGroups.noteCount(AuditNote.Severity.ERROR));
             statsMap.put("auditWarnNotes", actionGroups.noteCount(AuditNote.Severity.WARN));
             statsMap.put("auditInfoNotes", actionGroups.noteCount(AuditNote.Severity.INFO));
+        }
+        if (state != null) {
+            CrawlState.CrawlCoverageSummary cov = state.getCoverageSummary(stats.matched, stats.total, 0);
+            statsMap.put("discoveredRoutes", cov.discoveredRoutes);
+            statsMap.put("visitedPages", cov.visitedPages);
+            statsMap.put("completedPages", cov.completedPages);
+            statsMap.put("routeCompletionPercent", cov.routeCompletionPercent());
+            statsMap.put("domActionsClicked", cov.domActionsClicked);
+            statsMap.put("discoveredGhostEndpoints", cov.discoveredGhostEndpoints);
         }
         root.put("stats", statsMap);
 
@@ -247,6 +298,18 @@ public final class ReportExporter {
         }
         root.put("extraCaptures", extraList);
 
+        if (state != null) {
+            java.util.Set<String> calledPaths = collectCalledNormalizedPaths(actionGroups);
+            List<Map<String, Object>> ghostList = new ArrayList<>();
+            for (String g : state.getDiscoveredJsEndpoints()) {
+                Map<String, Object> gm = new LinkedHashMap<>();
+                gm.put("endpoint", g);
+                gm.put("status", isGhostTriggered(g, calledPaths) ? "CALLED" : "UNTRIGGERED_GHOST");
+                ghostList.add(gm);
+            }
+            root.put("ghostAndOpenApiEndpoints", ghostList);
+        }
+
         writeUtf8(file, MiniJson.stringify(root));
     }
 
@@ -328,7 +391,7 @@ public final class ReportExporter {
     }
 
     public static void exportMarkdown(File file, ExcelSpecMatcher matcher, List<CapturedApiEntry> extras) throws Exception {
-        exportMarkdown(file, matcher, extras, null);
+        exportMarkdown(file, matcher, extras, null, null);
     }
 
     public static void exportMarkdown(
@@ -336,6 +399,16 @@ public final class ReportExporter {
         ExcelSpecMatcher matcher,
         List<CapturedApiEntry> extras,
         ActionGroupStore actionGroups
+    ) throws Exception {
+        exportMarkdown(file, matcher, extras, actionGroups, null);
+    }
+
+    public static void exportMarkdown(
+        File file,
+        ExcelSpecMatcher matcher,
+        List<CapturedApiEntry> extras,
+        ActionGroupStore actionGroups,
+        CrawlState state
     ) throws Exception {
         StringBuilder sb = new StringBuilder();
         ExcelSpecMatcher.CoverageStats stats = matcher != null
@@ -349,11 +422,19 @@ public final class ReportExporter {
           .append(" (Missing: ").append(stats.missing).append(", Param Diff Notes: ").append(stats.withNotes).append(")\n");
         if (actionGroups != null) {
             sb.append("- **Action Groups:** ").append(actionGroups.groupCount())
+              .append(" | **Unique Endpoints:** ").append(actionGroups.endpointCount())
               .append(" | **API Calls:** ").append(actionGroups.totalCalls())
               .append(" | **NOTE (Lỗi/Cảnh báo/Info):** ")
               .append(actionGroups.noteCount(AuditNote.Severity.ERROR)).append(" / ")
               .append(actionGroups.noteCount(AuditNote.Severity.WARN)).append(" / ")
               .append(actionGroups.noteCount(AuditNote.Severity.INFO)).append('\n');
+        }
+        if (state != null) {
+            CrawlState.CrawlCoverageSummary cov = state.getCoverageSummary(stats.matched, stats.total, 0);
+            sb.append("- **Crawl Coverage:** ").append(cov.completedPages).append('/').append(cov.discoveredRoutes)
+              .append(" routes completed (").append(cov.routeCompletionPercent()).append("%)")
+              .append(" | **DOM Actions Clicked:** ").append(cov.domActionsClicked)
+              .append(" | **Ghost JS/OpenAPI Endpoints:** ").append(cov.discoveredGhostEndpoints).append('\n');
         }
         sb.append('\n');
 
@@ -455,9 +536,87 @@ public final class ReportExporter {
                 sb.append("- `").append(ex.method).append(' ').append(ex.fullUrl)
                   .append("` từ **").append(ex.actionPath).append("**\n");
             }
+            sb.append('\n');
+        }
+
+        if (state != null && !state.getDiscoveredJsEndpoints().isEmpty()) {
+            java.util.Set<String> calledPaths = collectCalledNormalizedPaths(actionGroups);
+            List<String> ghosts = state.getDiscoveredJsEndpoints();
+            sb.append("## 6. Ghost APIs & OpenAPI Endpoints phát hiện tĩnh (`").append(ghosts.size()).append("`)\n\n");
+            sb.append("| Trạng thái | Endpoint / Route phát hiện |\n| --- | --- |\n");
+            for (String g : ghosts) {
+                boolean called = isGhostTriggered(g, calledPaths);
+                sb.append("| ").append(called ? "`CALLED`" : "**`UNTRIGGERED_GHOST`**")
+                  .append(" | `").append(escMd(g)).append("` |\n");
+            }
+            sb.append('\n');
         }
 
         writeUtf8(file, sb.toString());
+    }
+
+    private static java.util.Set<String> collectCalledNormalizedPaths(ActionGroupStore store) {
+        java.util.Set<String> out = new java.util.LinkedHashSet<>();
+        if (store == null) {
+            return out;
+        }
+        for (ActionGroup g : store.snapshotGroups()) {
+            for (ApiCall c : g.getCalls()) {
+                if (c.capture != null && c.capture.requestPathWithQuery != null) {
+                    out.add(ExcelSpecMatcher.normalizeSpecPath(c.capture.requestPathWithQuery, true).toLowerCase(java.util.Locale.ROOT));
+                }
+                if (c.endpointKey != null) {
+                    int sp = c.endpointKey.indexOf(' ');
+                    String epPath = sp > 0 ? c.endpointKey.substring(sp + 1).trim() : c.endpointKey;
+                    int opIdx = epPath.indexOf(" [op:");
+                    if (opIdx > 0) {
+                        epPath = epPath.substring(0, opIdx).trim();
+                    }
+                    out.add(epPath.toLowerCase(java.util.Locale.ROOT));
+                }
+            }
+        }
+        return out;
+    }
+
+    private static boolean isGhostTriggered(String ghostEntry, java.util.Set<String> calledPaths) {
+        if (ghostEntry == null || calledPaths.isEmpty()) {
+            return false;
+        }
+        String clean = ghostEntry.trim();
+        if (clean.startsWith("[OpenAPI] ")) {
+            clean = clean.substring("[OpenAPI] ".length()).trim();
+            int sp = clean.indexOf(' ');
+            if (sp > 0) {
+                clean = clean.substring(sp + 1).trim();
+            }
+        }
+        int paren = clean.indexOf("  (");
+        if (paren > 0) {
+            clean = clean.substring(0, paren).trim();
+        }
+        int routeTag = clean.indexOf("  [route]");
+        if (routeTag > 0) {
+            clean = clean.substring(0, routeTag).trim();
+        }
+        if (!clean.startsWith("/")) {
+            return false;
+        }
+        String norm = ExcelSpecMatcher.normalizeSpecPath(clean, true).toLowerCase(java.util.Locale.ROOT)
+            .replaceAll("\\{[^}]+\\}", "{id}")
+            .replaceAll(":[a-z0-9_]+", "{id}");
+        return calledPaths.contains(norm);
+    }
+
+    private static String inferGhostMethod(String ghostEntry) {
+        if (ghostEntry != null && ghostEntry.startsWith("[OpenAPI] ")) {
+            String rest = ghostEntry.substring("[OpenAPI] ".length()).trim();
+            int sp = rest.indexOf(' ');
+            if (sp > 0) {
+                return rest.substring(0, sp).trim();
+            }
+        }
+        return "DISCOVERED";
     }
 
     private static String escMd(String s) {

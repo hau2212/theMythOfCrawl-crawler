@@ -123,6 +123,7 @@ public final class CrawlerExtension implements BurpExtension, ExtensionUnloading
             };
 
             jsScanner = new StaticJsScanner(config, state, matcher);
+            jsScanner.setLiveIdPool(liveIdPool);
             controlServer = new LocalControlServer(
                 config,
                 state,
@@ -131,6 +132,7 @@ public final class CrawlerExtension implements BurpExtension, ExtensionUnloading
                 true
             );
             controlServer.setInterceptQueue(interceptQueue);
+            controlServer.setLiveIdPool(liveIdPool);
             controlServer.start();
 
             ControlPlaneHandler reqHandler = new ControlPlaneHandler(config, state, controlServer.getPort());
@@ -152,6 +154,7 @@ public final class CrawlerExtension implements BurpExtension, ExtensionUnloading
                 notifyUi,
                 unifiedLogger
             );
+            respHandler.setLiveIdPool(liveIdPool);
 
             wsHandler = new WebSocketCaptureHandler(
                 config,

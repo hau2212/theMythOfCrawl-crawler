@@ -77,14 +77,87 @@ public final class CrawlState {
     }
 
     public static final class ActionContextSnapshot {
+        public final long contextSeq;
         public final String actionPath;
         public final ActionGroup group;
         public final long updatedAtMs;
+        public final boolean explicitMythCtx;
 
         public ActionContextSnapshot(String actionPath, ActionGroup group, long updatedAtMs) {
+            this(0L, actionPath, group, updatedAtMs, false);
+        }
+
+        public ActionContextSnapshot(long contextSeq, String actionPath, ActionGroup group, long updatedAtMs) {
+            this(contextSeq, actionPath, group, updatedAtMs, false);
+        }
+
+        public ActionContextSnapshot(
+            long contextSeq,
+            String actionPath,
+            ActionGroup group,
+            long updatedAtMs,
+            boolean explicitMythCtx
+        ) {
+            this.contextSeq = contextSeq;
             this.actionPath = actionPath;
             this.group = group;
             this.updatedAtMs = updatedAtMs;
+            this.explicitMythCtx = explicitMythCtx;
+        }
+    }
+
+    public static final class CrawlCoverageSummary {
+        public final int discoveredRoutes;
+        public final int visitedPages;
+        public final int completedPages;
+        public final int pendingQueue;
+        public final int domActionsClicked;
+        public final int uniqueEndpoints;
+        public final int totalApiCalls;
+        public final int discoveredGhostEndpoints;
+        public final int liveIdsHarvested;
+        public final int excelMatched;
+        public final int excelTotal;
+
+        public CrawlCoverageSummary(
+            int discoveredRoutes,
+            int visitedPages,
+            int completedPages,
+            int pendingQueue,
+            int domActionsClicked,
+            int uniqueEndpoints,
+            int totalApiCalls,
+            int discoveredGhostEndpoints,
+            int liveIdsHarvested,
+            int excelMatched,
+            int excelTotal
+        ) {
+            this.discoveredRoutes = Math.max(0, discoveredRoutes);
+            this.visitedPages = Math.max(0, visitedPages);
+            this.completedPages = Math.max(0, completedPages);
+            this.pendingQueue = Math.max(0, pendingQueue);
+            this.domActionsClicked = Math.max(0, domActionsClicked);
+            this.uniqueEndpoints = Math.max(0, uniqueEndpoints);
+            this.totalApiCalls = Math.max(0, totalApiCalls);
+            this.discoveredGhostEndpoints = Math.max(0, discoveredGhostEndpoints);
+            this.liveIdsHarvested = Math.max(0, liveIdsHarvested);
+            this.excelMatched = Math.max(0, excelMatched);
+            this.excelTotal = Math.max(0, excelTotal);
+        }
+
+        public int routeCompletionPercent() {
+            int denom = Math.max(discoveredRoutes, visitedPages + pendingQueue);
+            if (denom <= 0) {
+                return 0;
+            }
+            return Math.min(100, (int) Math.round((completedPages * 100.0) / denom));
+        }
+
+        public int excelCoveragePercent() {
+            if (excelTotal <= 0) {
+                return 0;
+            }
+            return Math.min(100, (int) Math.round((excelMatched * 100.0) / excelTotal));
         }
     }
 
@@ -129,13 +202,15 @@ public final class CrawlState {
         final String actionPath;
         final ActionGroup group;
         final long createdAtMs;
+        final boolean explicitMythCtx;
         volatile boolean trackedInFlight;
 
-        PendingMessageContext(String actionPath, ActionGroup group, boolean trackedInFlight) {
+        PendingMessageContext(String actionPath, ActionGroup group, boolean trackedInFlight, boolean explicitMythCtx) {
             this.actionPath = actionPath;
             this.group = group;
             this.createdAtMs = System.currentTimeMillis();
             this.trackedInFlight = trackedInFlight;
+            this.explicitMythCtx = explicitMythCtx;
         }
     }
 
@@ -151,6 +226,15 @@ public final class CrawlState {
     private static final Pattern STATIC_PAGE_EXT = Pattern.compile(
         ".*\\.(css|js|mjs|map|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|eot|pdf|zip|mp4|mp3|webm)(\\?.*)?$",
         Pattern.CASE_INSENSITIVE);
+    private static final Pattern LOW_PRIORITY_QUERY = Pattern.compile(
+        "(?i)(?:^|&)(?:page|p|offset|cursor|sort|order|dir|per_page|pagesize|limit)=");
+    private static final Pattern ARCHIVE_DATE_PATH = Pattern.compile(
+        ".*/20\\d{2}/\\d{1,2}(?:/.*|$)");
+    private static final Pattern HIGH_VALUE_ROUTE_SEGMENT = Pattern.compile(
+        "(?i).*/(?:admin|dashboard|manage|manager|setting|settings|config|user|users|account|accounts|"
+        + "profile|role|roles|permission|permissions|order|orders|invoice|invoices|payment|payments|billing|"
+        + "report|reports|export|import|upload|create|new|edit|approval|approve|workflow|audit|security|auth)(?:/.*|$)");
+    private static final int MAX_INCOMPLETE_REVISITS = 3;
 
     private final Object statusLock = new Object();
     private final Object frontierLock = new Object();
@@ -174,6 +258,8 @@ public final class CrawlState {
     private volatile ReplayPlan activeReplayPlan = null;
 
     // Trail & current action context (guarded by trailLock; volatile mirrors for lock-free reads)
+    private final AtomicLong contextSeqGen = new AtomicLong(0);
+    private volatile long latestContextSeq = 0L;
     private volatile String currentActionPath = "/ > page load";
     private volatile String currentPageUrl = "";
     private volatile ActionGroup currentGroup;
@@ -189,14 +275,27 @@ public final class CrawlState {
             return size() > 64;
         }
     };
+    private final LinkedHashMap<Long, ActionContextSnapshot> contextByIdCache = new LinkedHashMap<>(256, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<Long, ActionContextSnapshot> eldest) {
+            return size() > 512;
+        }
+    };
     private final List<ActionStep> activeSessionTrail = new ArrayList<>();
 
-    // Frontier (guarded by frontierLock)
+    // Priority Frontier (guarded by frontierLock): P0 (High) > P1 (Normal) > P2 (Pagination/Sort/Archive)
     private volatile int pagesVisitedCount = 0;
-    private final Deque<String> urlQueue = new ArrayDeque<>();
+    private final Deque<String> urlQueueHigh = new ArrayDeque<>();
+    private final Deque<String> urlQueueNormal = new ArrayDeque<>();
+    private final Deque<String> urlQueueLow = new ArrayDeque<>();
     private final Set<String> seenQueueUrls = new LinkedHashSet<>();
+    private final Set<String> currentlyQueuedNorms = new LinkedHashSet<>();
     private final Set<String> visitedUrls = new LinkedHashSet<>();
+    private final Set<String> uniqueVisitedUrls = new LinkedHashSet<>();
     private final Map<String, Integer> patternSampleCounts = new HashMap<>();
+    private final Map<String, Integer> incompleteRevisitCounts = new HashMap<>();
+    private final Set<String> missingExcelPrefixes = new LinkedHashSet<>();
+    private final AtomicInteger totalDomActionsClicked = new AtomicInteger(0);
 
     // Auth reject counter (guarded by authLock)
     private volatile int consecutiveAuthRejects = 0;
@@ -265,6 +364,10 @@ public final class CrawlState {
         return setCurrentContext(actionPath, kind, label, pageUrl, null);
     }
 
+    public long getLatestContextSeq() {
+        return latestContextSeq;
+    }
+
     public ActionGroup setCurrentContext(
         String actionPath,
         String kind,
@@ -272,7 +375,18 @@ public final class CrawlState {
         String pageUrl,
         ActionStep stepLocator
     ) {
+        return setCurrentContextSnapshot(actionPath, kind, label, pageUrl, stepLocator).group;
+    }
+
+    public ActionContextSnapshot setCurrentContextSnapshot(
+        String actionPath,
+        String kind,
+        String label,
+        String pageUrl,
+        ActionStep stepLocator
+    ) {
         long now = System.currentTimeMillis();
+        long seqId = contextSeqGen.incrementAndGet();
         String trimmedAction = actionPath != null ? actionPath.trim() : "";
         String resolvedPath = !trimmedAction.isEmpty() ? trimmedAction : this.currentActionPath;
         boolean isPageLoad = "page load".equalsIgnoreCase(kind)
@@ -287,9 +401,11 @@ public final class CrawlState {
             ? pageUrl.trim()
             : this.currentPageUrl;
         ActionGroup g = actionGroups.openGroup(resolvedPath, kind, label, effectivePage);
+        ActionContextSnapshot snapshot = new ActionContextSnapshot(seqId, resolvedPath, g, now);
 
         List<ActionStep> trailSnapshot;
         synchronized (trailLock) {
+            this.latestContextSeq = seqId;
             this.lastContextActionAtMs = now;
             if (!isPageLoad) {
                 this.lastClickActionAtMs = now;
@@ -303,15 +419,16 @@ public final class CrawlState {
                 }
             }
             if (!normPage.isEmpty()) {
-                pageContextCache.put(normPage, new ActionContextSnapshot(resolvedPath, g, now));
+                pageContextCache.put(normPage, snapshot);
             }
+            contextByIdCache.put(seqId, snapshot);
             trailSnapshot = appendTrailStepLocked(
                 isPageLoad, effectivePage, normPage, kind, label, resolvedPath, stepLocator);
         }
         if (g != null && trailSnapshot != null && !trailSnapshot.isEmpty()) {
             g.setActionTrail(trailSnapshot);
         }
-        return g;
+        return snapshot;
     }
 
     private List<ActionStep> appendTrailStepLocked(
@@ -411,6 +528,31 @@ public final class CrawlState {
     }
 
     /**
+     * Resolves exact action context using the agent's {@code X-Myth-Ctx} header when present
+     * (100% deterministic across async callbacks, delayed timers, and no-referrer policies),
+     * falling back to Referer correlation and global context.
+     */
+    public ActionContextSnapshot resolveContextForRequest(String mythCtxHeader, String referer) {
+        if (mythCtxHeader != null && !mythCtxHeader.trim().isEmpty()) {
+            try {
+                long seq = Long.parseLong(mythCtxHeader.trim());
+                if (seq > 0L) {
+                    long now = System.currentTimeMillis();
+                    synchronized (trailLock) {
+                        ActionContextSnapshot exact = contextByIdCache.get(seq);
+                        if (exact != null && (now - exact.updatedAtMs) <= MESSAGE_TTL_MS) {
+                            return new ActionContextSnapshot(
+                                exact.contextSeq, exact.actionPath, exact.group, exact.updatedAtMs, true);
+                        }
+                    }
+                }
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return resolveContextForReferer(referer);
+    }
+
+    /**
      * Resolves the best matching action context for an incoming proxy request, preferring
      * a recent context recorded for the request's Referer page (within 4s) to reduce
      * cross-tab misattribution, falling back to the global current context.
@@ -425,7 +567,7 @@ public final class CrawlState {
                     return snap;
                 }
             }
-            return new ActionContextSnapshot(currentActionPath, currentGroup, lastContextActionAtMs);
+            return new ActionContextSnapshot(latestContextSeq, currentActionPath, currentGroup, lastContextActionAtMs);
         }
     }
 
@@ -450,11 +592,21 @@ public final class CrawlState {
     }
 
     public void bindMessageContext(int messageId, String actionPath, ActionGroup group, boolean trackInFlight) {
+        bindMessageContext(messageId, actionPath, group, trackInFlight, false);
+    }
+
+    public void bindMessageContext(
+        int messageId,
+        String actionPath,
+        ActionGroup group,
+        boolean trackInFlight,
+        boolean explicitMythCtx
+    ) {
         if ((bindSweepCounter.incrementAndGet() & 0x7F) == 0 || pendingMessages.size() > MAX_PENDING_MESSAGES) {
             sweepExpiredPendingMessages();
         }
         String resolvedPath = actionPath != null ? actionPath : currentActionPath;
-        PendingMessageContext ctx = new PendingMessageContext(resolvedPath, group, trackInFlight);
+        PendingMessageContext ctx = new PendingMessageContext(resolvedPath, group, trackInFlight, explicitMythCtx);
         PendingMessageContext prev = pendingMessages.put(messageId, ctx);
         if (prev != null && prev.trackedInFlight) {
             decrementInFlight();
@@ -502,9 +654,11 @@ public final class CrawlState {
                 decrementInFlight();
             }
             return new ActionContextSnapshot(
+                0L,
                 ctx.actionPath != null ? ctx.actionPath : currentActionPath,
                 ctx.group,
-                ctx.createdAtMs);
+                ctx.createdAtMs,
+                ctx.explicitMythCtx);
         }
         return new ActionContextSnapshot(currentActionPath, currentGroup, 0L);
     }
@@ -556,19 +710,26 @@ public final class CrawlState {
         resetGeneration.incrementAndGet();
         pendingMessages.clear();
         inFlightTargetRequests.set(0);
+        totalDomActionsClicked.set(0);
         actionGroups.clear();
 
         synchronized (frontierLock) {
-            urlQueue.clear();
+            urlQueueHigh.clear();
+            urlQueueNormal.clear();
+            urlQueueLow.clear();
             seenQueueUrls.clear();
+            currentlyQueuedNorms.clear();
             visitedUrls.clear();
+            uniqueVisitedUrls.clear();
             patternSampleCounts.clear();
+            incompleteRevisitCounts.clear();
             pagesVisitedCount = 0;
             if (seedUrl != null && !seedUrl.trim().isEmpty()) {
                 String norm = normalizeCrawlUrl(seedUrl);
                 if (!norm.isEmpty()) {
                     seenQueueUrls.add(norm);
-                    urlQueue.add(seedUrl.trim());
+                    currentlyQueuedNorms.add(norm);
+                    urlQueueHigh.addLast(seedUrl.trim());
                 }
             }
         }
@@ -588,7 +749,9 @@ public final class CrawlState {
             completedUrls.clear();
             redirectCountsByNorm.clear();
             pageContextCache.clear();
+            contextByIdCache.clear();
             activeSessionTrail.clear();
+            latestContextSeq = 0L;
             lastContextActionAtMs = 0L;
             lastClickActionAtMs = 0L;
             currentActionPath = "/ > page load";
@@ -600,7 +763,32 @@ public final class CrawlState {
         }
     }
 
+    /**
+     * Updates route prefix hints derived from unmatched Excel API specs so the priority frontier
+     * promotes pages most likely to trigger missing checklist endpoints.
+     */
+    public void updateMissingExcelRouteHints(java.util.Collection<String> prefixes) {
+        synchronized (frontierLock) {
+            missingExcelPrefixes.clear();
+            if (prefixes != null) {
+                for (String p : prefixes) {
+                    if (p != null && p.length() >= 2) {
+                        missingExcelPrefixes.add(p.toLowerCase());
+                    }
+                }
+            }
+        }
+    }
+
     public boolean enqueueUrl(String rawUrl, CrawlConfig config) {
+        return enqueueUrlWithPriority(rawUrl, config, false);
+    }
+
+    public boolean enqueuePriorityUrl(String rawUrl, CrawlConfig config) {
+        return enqueueUrlWithPriority(rawUrl, config, true);
+    }
+
+    public boolean enqueueUrlWithPriority(String rawUrl, CrawlConfig config, boolean forceHighPriority) {
         if (rawUrl == null || rawUrl.trim().isEmpty()) {
             return false;
         }
@@ -615,7 +803,7 @@ public final class CrawlState {
         try {
             URI uri = URI.create(trimmed);
             String host = uri.getHost();
-            if (host == null || (config != null && !config.isHostAllowed(host))) {
+            if (host == null || (config != null && !config.isUrlAllowedForCrawl(trimmed))) {
                 return false;
             }
             if (config != null && config.isDangerGuardEnabled() && isDangerousUrl(trimmed, config)) {
@@ -623,19 +811,36 @@ public final class CrawlState {
             }
             String norm = normalizeCrawlUrl(trimmed);
             boolean isDeferred;
+            int completedCount;
             synchronized (trailLock) {
                 isDeferred = deferredUrls.contains(norm);
+                completedCount = completedUrls.size();
             }
             if (isDeferred) {
                 return false;
             }
+            int maxPages = config != null ? config.getMaxPages() : 350;
+            if (completedCount >= maxPages) {
+                return false;
+            }
             synchronized (frontierLock) {
-                if (seenQueueUrls.contains(norm) || visitedUrls.contains(norm)) {
+                if (seenQueueUrls.contains(norm) || visitedUrls.contains(norm) || currentlyQueuedNorms.contains(norm)) {
                     return false;
                 }
-                int maxPages = config != null ? config.getMaxPages() : 350;
-                if (seenQueueUrls.size() >= maxPages) {
+                if (uniqueVisitedUrls.size() >= maxPages) {
                     return false;
+                }
+                int tier = classifyFrontierTierLocked(uri, norm, forceHighPriority);
+                int queueCap = Math.max(maxPages * 4, 2000);
+                if (totalQueuedLocked() >= queueCap) {
+                    if (tier == 0 && !urlQueueLow.isEmpty()) {
+                        String evicted = urlQueueLow.pollLast();
+                        if (evicted != null) {
+                            currentlyQueuedNorms.remove(normalizeCrawlUrl(evicted));
+                        }
+                    } else {
+                        return false;
+                    }
                 }
                 String patternKey = generalizeUrlPattern(norm, config == null || config.isNormalizeRouteIds());
                 int cap = config != null ? config.getMaxPaginationSamples() : 3;
@@ -645,12 +850,102 @@ public final class CrawlState {
                 }
                 patternSampleCounts.put(patternKey, cnt + 1);
                 seenQueueUrls.add(norm);
-                urlQueue.addLast(trimmed);
+                currentlyQueuedNorms.add(norm);
+                if (tier == 0) {
+                    urlQueueHigh.addLast(trimmed);
+                } else if (tier == 2) {
+                    urlQueueLow.addLast(trimmed);
+                } else {
+                    urlQueueNormal.addLast(trimmed);
+                }
                 return true;
             }
         } catch (Exception ignored) {
             return false;
         }
+    }
+
+    /**
+     * Re-queues an in-scope page at high priority if an action triggered navigation before
+     * all interactive controls on that page were explored (capped at 3 revisits per URL).
+     */
+    public boolean requeueIncompletePage(String rawUrl, CrawlConfig config) {
+        if (rawUrl == null || rawUrl.trim().isEmpty()) {
+            return false;
+        }
+        String trimmed = rawUrl.trim();
+        try {
+            URI uri = URI.create(trimmed);
+            String host = uri.getHost();
+            if (host == null || (config != null && !config.isUrlAllowedForCrawl(trimmed))) {
+                return false;
+            }
+            String norm = normalizeCrawlUrl(trimmed);
+            if (norm.isEmpty()) {
+                return false;
+            }
+            synchronized (trailLock) {
+                if (deferredUrls.contains(norm) || completedUrls.contains(norm)) {
+                    return false;
+                }
+            }
+            synchronized (frontierLock) {
+                if (currentlyQueuedNorms.contains(norm)) {
+                    return false;
+                }
+                int revisits = incompleteRevisitCounts.getOrDefault(norm, 0);
+                if (revisits >= MAX_INCOMPLETE_REVISITS) {
+                    return false;
+                }
+                incompleteRevisitCounts.put(norm, revisits + 1);
+                visitedUrls.remove(norm);
+                currentlyQueuedNorms.add(norm);
+                urlQueueHigh.addFirst(trimmed);
+                return true;
+            }
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private int classifyFrontierTierLocked(URI uri, String normUrl, boolean forceHigh) {
+        if (forceHigh) {
+            return 0;
+        }
+        String query = uri.getRawQuery() != null ? uri.getRawQuery() : "";
+        String path = uri.getRawPath() != null ? uri.getRawPath() : "/";
+        String frag = uri.getRawFragment() != null ? uri.getRawFragment() : "";
+        String effectivePath = (!frag.isEmpty() && (frag.startsWith("/") || frag.startsWith("!/")))
+            ? (frag.startsWith("!/") ? frag.substring(1) : frag)
+            : path;
+
+        if ((!query.isEmpty() && LOW_PRIORITY_QUERY.matcher(query).find())
+            || ARCHIVE_DATE_PATH.matcher(effectivePath).matches()) {
+            return 2;
+        }
+        String lowerPath = effectivePath.toLowerCase();
+        for (String hint : missingExcelPrefixes) {
+            if (lowerPath.contains(hint)) {
+                return 0;
+            }
+        }
+        if (HIGH_VALUE_ROUTE_SEGMENT.matcher(effectivePath).matches()) {
+            return 0;
+        }
+        int depth = 0;
+        for (String seg : effectivePath.split("/")) {
+            if (!seg.isEmpty()) {
+                depth++;
+            }
+        }
+        if (depth <= 2 && query.isEmpty()) {
+            return 0;
+        }
+        return 1;
+    }
+
+    private int totalQueuedLocked() {
+        return urlQueueHigh.size() + urlQueueNormal.size() + urlQueueLow.size();
     }
 
     public void markUrlVisited(String rawUrl) {
@@ -662,27 +957,41 @@ public final class CrawlState {
             return;
         }
         synchronized (frontierLock) {
-            if (visitedUrls.add(norm)) {
-                pagesVisitedCount++;
+            visitedUrls.add(norm);
+            if (uniqueVisitedUrls.add(norm)) {
+                pagesVisitedCount = uniqueVisitedUrls.size();
             }
         }
     }
 
     public String pollNextUnvisitedUrl() {
-        synchronized (frontierLock) {
-            while (!urlQueue.isEmpty()) {
-                String candidate = urlQueue.pollFirst();
-                String norm = normalizeCrawlUrl(candidate);
-                boolean deferred;
-                synchronized (trailLock) {
-                    deferred = deferredUrls.contains(norm);
-                }
-                if (!visitedUrls.contains(norm) && !deferred) {
-                    return candidate;
-                }
-            }
-            return null;
+        Set<String> deferredSnap;
+        synchronized (trailLock) {
+            deferredSnap = deferredUrls.isEmpty() ? Collections.emptySet() : new LinkedHashSet<>(deferredUrls);
         }
+        synchronized (frontierLock) {
+            String next = pollFromTierLocked(urlQueueHigh, deferredSnap);
+            if (next != null) {
+                return next;
+            }
+            next = pollFromTierLocked(urlQueueNormal, deferredSnap);
+            if (next != null) {
+                return next;
+            }
+            return pollFromTierLocked(urlQueueLow, deferredSnap);
+        }
+    }
+
+    private String pollFromTierLocked(Deque<String> tierQueue, Set<String> deferredSnap) {
+        while (!tierQueue.isEmpty()) {
+            String candidate = tierQueue.pollFirst();
+            String norm = normalizeCrawlUrl(candidate);
+            currentlyQueuedNorms.remove(norm);
+            if (!visitedUrls.contains(norm) && !deferredSnap.contains(norm)) {
+                return candidate;
+            }
+        }
+        return null;
     }
 
     public void markUrlDeferred(String rawUrl) {
@@ -708,8 +1017,9 @@ public final class CrawlState {
             completedUrls.add(norm);
         }
         synchronized (frontierLock) {
-            if (visitedUrls.add(norm)) {
-                pagesVisitedCount++;
+            visitedUrls.add(norm);
+            if (uniqueVisitedUrls.add(norm)) {
+                pagesVisitedCount = uniqueVisitedUrls.size();
             }
         }
     }
@@ -738,6 +1048,16 @@ public final class CrawlState {
         }
         synchronized (trailLock) {
             return deferredUrls.contains(norm);
+        }
+    }
+
+    public boolean isUrlCompleted(String rawUrl) {
+        String norm = normalizeCrawlUrl(rawUrl);
+        if (norm.isEmpty()) {
+            return false;
+        }
+        synchronized (trailLock) {
+            return completedUrls.contains(norm);
         }
     }
 
@@ -875,7 +1195,7 @@ public final class CrawlState {
 
     public int getPendingQueueSize() {
         synchronized (frontierLock) {
-            return urlQueue.size();
+            return totalQueuedLocked();
         }
     }
 
@@ -883,17 +1203,62 @@ public final class CrawlState {
         return pagesVisitedCount;
     }
 
+    public int getCompletedPagesCount() {
+        synchronized (trailLock) {
+            return completedUrls.size();
+        }
+    }
+
+    public int getTotalDomActionsClicked() {
+        return totalDomActionsClicked.get();
+    }
+
+    public CrawlCoverageSummary getCoverageSummary(int excelMatched, int excelTotal, int liveIdsCount) {
+        int discoveredRoutes;
+        int pending;
+        synchronized (frontierLock) {
+            discoveredRoutes = seenQueueUrls.size();
+            pending = totalQueuedLocked();
+        }
+        int completed;
+        synchronized (trailLock) {
+            completed = completedUrls.size();
+        }
+        int ghosts;
+        synchronized (discoveryLock) {
+            ghosts = discoveredJsEndpoints.size();
+        }
+        return new CrawlCoverageSummary(
+            discoveredRoutes,
+            pagesVisitedCount,
+            completed,
+            pending,
+            totalDomActionsClicked.get(),
+            actionGroups.endpointCount(),
+            actionGroups.totalCalls(),
+            ghosts,
+            liveIdsCount,
+            excelMatched,
+            excelTotal
+        );
+    }
+
     public boolean markActionClicked(String routeKey, String signature) {
         if (routeKey == null || signature == null || signature.isEmpty()) {
             return false;
         }
+        boolean added;
         synchronized (clicksLock) {
             Set<String> set = clickedSignaturesByRoute.computeIfAbsent(routeKey, k -> new LinkedHashSet<>());
             if (set.size() >= MAX_SIGS_PER_ROUTE) {
                 return false;
             }
-            return set.add(signature);
+            added = set.add(signature);
         }
+        if (added) {
+            totalDomActionsClicked.incrementAndGet();
+        }
+        return added;
     }
 
     public List<String> getClickedSignatures(String routeKey) {
@@ -1222,6 +1587,15 @@ public final class CrawlState {
      * and enqueues it into the crawl frontier when {@code deepCrawlMode} is enabled.
      */
     public boolean enqueueJsRouteIfEligible(String discoveredPath, String sourceJsUrl, CrawlConfig cfg) {
+        return enqueueJsRouteIfEligible(discoveredPath, sourceJsUrl, cfg, null);
+    }
+
+    public boolean enqueueJsRouteIfEligible(
+        String discoveredPath,
+        String sourceJsUrl,
+        CrawlConfig cfg,
+        com.mythofcrawl.crawler.core.guardrail.LiveIdPool liveIdPool
+    ) {
         if (cfg == null || !cfg.isDeepCrawlMode() || discoveredPath == null || sourceJsUrl == null) {
             return false;
         }
@@ -1235,9 +1609,19 @@ public final class CrawlState {
         String lower = p.toLowerCase();
         if (lower.startsWith("/api/") || lower.contains("/v1/") || lower.contains("/v2/")
             || lower.contains("/v3/") || lower.contains("/graphql") || lower.contains("/rest/")
-            || p.contains("{") || p.contains(":") || p.contains("*") || p.contains("..")
+            || p.contains("*") || p.contains("..")
             || JS_ROUTE_STATIC_EXT.matcher(p).matches()) {
             return false;
+        }
+        if (p.contains("{") || p.contains(":")) {
+            if (liveIdPool == null) {
+                return false;
+            }
+            String concretized = liveIdPool.concretizeRouteTemplate(p, false);
+            if (concretized == null || concretized.contains("{") || concretized.contains(":")) {
+                return false;
+            }
+            p = concretized;
         }
         try {
             URI src = URI.create(sourceJsUrl.trim());

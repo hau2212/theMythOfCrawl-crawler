@@ -97,16 +97,43 @@ public final class ControlPlaneHandler implements ProxyRequestHandler {
 
         if (svc != null && isTargetOrReplayHost(svc.host())) {
             String referer = interceptedRequest.headerValue("Referer");
-            CrawlState.ActionContextSnapshot ctx = state.resolveContextForReferer(referer);
-            if (st == CrawlState.Status.RUNNING && config.isHostAllowed(svc.host())) {
+            if (st == CrawlState.Status.RUNNING
+                && config.isAllowAutoRequests()
+                && config.hasPathScopeRestriction()
+                && !state.hasActiveReplayPlan()
+                && config.isHostAllowed(svc.host())
+                && isStrictTopLevelDocumentNavigation(interceptedRequest)) {
+                String fullDocUrl = resolveFullRequestUrl(interceptedRequest, svc, path);
+                if (!config.isUrlAllowedForCrawl(fullDocUrl)) {
+                    String fromUrl = (referer != null && !referer.trim().isEmpty() && config.isUrlAllowedForCrawl(referer))
+                        ? referer.trim() : "";
+                    String bouncePath = "/__myth_crawl/bounce_back?dest=" + urlEncode(fullDocUrl)
+                        + "&from=" + urlEncode(fromUrl);
+                    HttpService localService = HttpService.httpService("127.0.0.1", localControlPort, false);
+                    HttpRequest localReq = buildHttp11ControlRequest(interceptedRequest, localService, bouncePath, true);
+                    return ProxyRequestReceivedAction.doNotIntercept(localReq);
+                }
+            }
+            String mythCtx = interceptedRequest.headerValue("X-Myth-Ctx");
+            CrawlState.ActionContextSnapshot ctx = state.resolveContextForRequest(mythCtx, referer);
+            boolean outOfScopeReferer = config.hasPathScopeRestriction()
+                && !ctx.explicitMythCtx
+                && referer != null && !referer.trim().isEmpty()
+                && !config.isUrlAllowedForCrawl(referer);
+            if (st == CrawlState.Status.RUNNING && config.isHostAllowed(svc.host()) && !outOfScopeReferer) {
                 state.bindMessageContext(
                     interceptedRequest.messageId(),
                     ctx.actionPath,
                     ctx.group,
-                    true);
+                    true,
+                    ctx.explicitMythCtx);
             }
 
             HttpRequest activeRequest = interceptedRequest;
+            if (mythCtx != null) {
+                // Always strip internal correlation header before evaluating or forwarding to target server
+                activeRequest = activeRequest.withRemovedHeader("X-Myth-Ctx");
+            }
             if (policyLedger != null && !isLoopbackHost(svc.host())) {
                 String branchPath = ctx.actionPath != null ? ctx.actionPath : "";
                 String uiAction = uiActionSupplier != null ? uiActionSupplier.get() : "";
@@ -297,6 +324,38 @@ public final class ControlPlaneHandler implements ProxyRequestHandler {
     @Override
     public ProxyRequestToBeSentAction handleRequestToBeSent(InterceptedRequest interceptedRequest) {
         return ProxyRequestToBeSentAction.continueWith(interceptedRequest);
+    }
+
+    private static String resolveFullRequestUrl(InterceptedRequest req, HttpService svc, String path) {
+        String rawUrl = req.url();
+        if (rawUrl != null && (rawUrl.startsWith("http://") || rawUrl.startsWith("https://"))) {
+            return rawUrl;
+        }
+        String scheme = svc.secure() ? "https://" : "http://";
+        int port = svc.port();
+        boolean defaultPort = (svc.secure() && port == 443) || (!svc.secure() && port == 80) || port <= 0;
+        String portPart = defaultPort ? "" : (":" + port);
+        String p = (path != null && !path.isEmpty()) ? path : "/";
+        return scheme + svc.host() + portPart + p;
+    }
+
+    private static boolean isStrictTopLevelDocumentNavigation(InterceptedRequest req) {
+        if (req.headerValue("X-Myth-Ctx") != null || req.headerValue("X-Requested-With") != null) {
+            return false;
+        }
+        String fetchMode = req.headerValue("Sec-Fetch-Mode");
+        if (fetchMode != null && !fetchMode.trim().isEmpty() && !"navigate".equalsIgnoreCase(fetchMode.trim())) {
+            return false;
+        }
+        String fetchDest = req.headerValue("Sec-Fetch-Dest");
+        if (fetchDest != null && !fetchDest.trim().isEmpty()) {
+            return "document".equalsIgnoreCase(fetchDest.trim());
+        }
+        if (!"GET".equalsIgnoreCase(req.method())) {
+            return false;
+        }
+        String accept = req.headerValue("Accept");
+        return accept != null && accept.toLowerCase().contains("text/html");
     }
 
     private static boolean isDocumentOrFrameNavigationRequest(HttpRequest req) {

@@ -193,6 +193,39 @@ public final class ExcelSpecMatcher {
     }
 
     /**
+     * Computes lowercase route segment hints (e.g. {@code "/orders"}, {@code "/invoices"})
+     * from currently unmatched Excel API entries so the priority frontier visits screens
+     * most likely to trigger missing checklist endpoints first.
+     */
+    public Set<String> computeMissingRouteHints() {
+        Set<String> hints = new LinkedHashSet<>();
+        for (ApiSpecEntry e : entries) {
+            if (e.isMatched()) {
+                continue;
+            }
+            String p = e.normalizedSpecPath;
+            if (p == null || p.length() <= 1) {
+                continue;
+            }
+            for (String seg : p.substring(1).split("/")) {
+                String clean = seg.trim().toLowerCase(Locale.ROOT);
+                if (clean.length() < 3 || clean.startsWith("{") || clean.startsWith(":")
+                    || clean.contains("*") || "api".equals(clean) || "rest".equals(clean)
+                    || "graphql".equals(clean) || clean.matches("^v\\d+$")
+                    || PathNamer.isDynamicIdSegment(clean)) {
+                    continue;
+                }
+                hints.add("/" + clean);
+                if (hints.size() >= 128) {
+                    return hints;
+                }
+                break; // first meaningful domain resource segment per unmatched API
+            }
+        }
+        return hints;
+    }
+
+    /**
      * Replaces the 0-based path segment at {@code segmentIndex} with {@code {placeholderName}}
      * (for example: {@code replaceSegmentWithPlaceholder("/api/a/sess_91/c", 2, "session")} -> {@code "/api/a/{session}/c"}).
      */

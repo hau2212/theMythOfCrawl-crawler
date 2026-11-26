@@ -21,6 +21,9 @@ public final class LiveIdPool {
     private static final Pattern UUID_RX = Pattern.compile(
         "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
     private static final Pattern DIGITS_RX = Pattern.compile("^\\d+$");
+    private static final Pattern CODE_ID_RX = Pattern.compile("^[A-Za-z0-9_-]{3,36}$");
+    private static final Pattern ROUTE_PARAM_SEG = Pattern.compile(
+        "^(?:\\$\\{([^}]+)\\}|\\{([^}]+)\\}|:([A-Za-z_][A-Za-z0-9_]*)|<([^>]+)>)$");
 
     private final Object lock = new Object();
     private final Map<String, Deque<String>> pool = new LinkedHashMap<>();
@@ -152,6 +155,117 @@ public final class LiveIdPool {
         }
     }
 
+    public int totalHarvestedIds() {
+        synchronized (lock) {
+            int sum = 0;
+            for (Deque<String> q : pool.values()) {
+                sum += q.size();
+            }
+            return sum;
+        }
+    }
+
+    /**
+     * Returns a bounded map of {@code resourceKey -> latestId} so the browser agent
+     * can populate foreign-key inputs and parameterized routes with real harvested IDs.
+     */
+    public Map<String, String> snapshotLatestIds(int maxResources) {
+        int cap = Math.max(1, maxResources);
+        Map<String, String> out = new LinkedHashMap<>();
+        synchronized (lock) {
+            for (Map.Entry<String, Deque<String>> e : pool.entrySet()) {
+                Deque<String> q = e.getValue();
+                if (q != null && !q.isEmpty()) {
+                    out.put(e.getKey(), q.peekFirst());
+                    if (out.size() >= cap) {
+                        break;
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Concretizes a parameterized route template (such as {@code /orders/{orderId}/detail},
+     * {@code /users/:id}, or {@code /projects/${projectId}/settings}) using harvested IDs from
+     * this pool, or {@code "1"} when {@code fallbackNumeric} is true. Returns {@code null} if
+     * any placeholder remains unresolved.
+     */
+    public String concretizeRouteTemplate(String routeTemplate, boolean fallbackNumeric) {
+        if (routeTemplate == null || routeTemplate.trim().isEmpty()) {
+            return null;
+        }
+        int q = routeTemplate.indexOf('?');
+        String pathOnly = q >= 0 ? routeTemplate.substring(0, q).trim() : routeTemplate.trim();
+        String query = q >= 0 ? routeTemplate.substring(q) : "";
+        if (!pathOnly.startsWith("/")) {
+            pathOnly = "/" + pathOnly;
+        }
+        String[] segs = pathOnly.split("/", -1);
+        String prevStatic = "";
+        for (int i = 0; i < segs.length; i++) {
+            String seg = segs[i];
+            if (seg.isEmpty()) {
+                continue;
+            }
+            java.util.regex.Matcher m = ROUTE_PARAM_SEG.matcher(seg);
+            if (m.matches()) {
+                String rawName = m.group(1) != null ? m.group(1)
+                    : (m.group(2) != null ? m.group(2)
+                    : (m.group(3) != null ? m.group(3) : m.group(4)));
+                String resolved = resolveIdForParam(rawName, prevStatic);
+                if (resolved == null && fallbackNumeric) {
+                    resolved = "1";
+                }
+                if (resolved == null) {
+                    return null;
+                }
+                segs[i] = resolved;
+            } else if (seg.contains("${") || seg.contains("{") || seg.contains("*")) {
+                return null;
+            } else {
+                prevStatic = normalizeResourceName(seg);
+            }
+        }
+        return String.join("/", segs) + query;
+    }
+
+    private String resolveIdForParam(String paramName, String prevStaticSegment) {
+        if (paramName != null && !paramName.isEmpty()) {
+            String lower = paramName.trim().toLowerCase(Locale.ROOT);
+            String derived = deriveResourceForField(lower, prevStaticSegment);
+            String hit = getLatestId(derived);
+            if (hit != null) {
+                return hit;
+            }
+            String norm = normalizeResourceName(lower);
+            hit = getLatestId(norm);
+            if (hit != null) {
+                return hit;
+            }
+            if (!norm.endsWith("s")) {
+                hit = getLatestId(norm + "s");
+                if (hit != null) {
+                    return hit;
+                }
+            }
+        }
+        if (prevStaticSegment != null && !prevStaticSegment.isEmpty()) {
+            String hit = getLatestId(prevStaticSegment);
+            if (hit != null) {
+                return hit;
+            }
+            if (prevStaticSegment.endsWith("s") && prevStaticSegment.length() > 2) {
+                hit = getLatestId(prevStaticSegment.substring(0, prevStaticSegment.length() - 1));
+                if (hit != null) {
+                    return hit;
+                }
+            }
+        }
+        return null;
+    }
+
     public void clear() {
         synchronized (lock) {
             pool.clear();
@@ -193,11 +307,25 @@ public final class LiveIdPool {
     }
 
     private static boolean isCandidateIdField(String kl) {
-        return "id".equals(kl) || kl.endsWith("id") || kl.endsWith("_id");
+        return "id".equals(kl) || "uuid".equals(kl) || kl.endsWith("id") || kl.endsWith("_id") || kl.endsWith("uuid");
     }
 
     private static boolean isValidIdLiteral(String s) {
-        return DIGITS_RX.matcher(s).matches() || UUID_RX.matcher(s).matches();
+        if (s == null || s.isEmpty() || "null".equalsIgnoreCase(s) || "undefined".equalsIgnoreCase(s)) {
+            return false;
+        }
+        return DIGITS_RX.matcher(s).matches()
+            || UUID_RX.matcher(s).matches()
+            || (s.length() >= 8 && s.length() <= 32 && CODE_ID_RX.matcher(s).matches() && containsDigit(s));
+    }
+
+    private static boolean containsDigit(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            if (Character.isDigit(s.charAt(i))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean isIdLikeSegment(String seg) {

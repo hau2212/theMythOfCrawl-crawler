@@ -609,7 +609,7 @@ public final class BlueprintGuardTests {
             assertNotNull("version.properties exists on classpath", in);
             Properties props = new Properties();
             props.load(in);
-            assertEquals("Version is V_1.0_beta", "V_1.0_beta", props.getProperty("version"));
+            assertEquals("Version is V_1.1_beta", "V_1.1_beta", props.getProperty("version"));
         }
 
         InstantEventBus bus = new InstantEventBus();

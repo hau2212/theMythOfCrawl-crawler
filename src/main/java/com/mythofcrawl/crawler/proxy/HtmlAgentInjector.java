@@ -13,6 +13,7 @@ import burp.api.montoya.proxy.http.ProxyResponseHandler;
 import burp.api.montoya.proxy.http.ProxyResponseReceivedAction;
 import burp.api.montoya.proxy.http.ProxyResponseToBeSentAction;
 import burp.api.montoya.utilities.CompressionType;
+import com.mythofcrawl.crawler.core.guardrail.LiveIdPool;
 import com.mythofcrawl.crawler.excel.ApiSpecEntry;
 import com.mythofcrawl.crawler.excel.ExcelSpecMatcher;
 import com.mythofcrawl.crawler.excel.ParamExtractor;
@@ -91,6 +92,7 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
     private final ControlPlaneHandler controlPlaneHandler;
     private final StaticJsScanner jsScanner;
     private volatile ExcelSpecMatcher matcher;
+    private volatile LiveIdPool liveIdPool;
     private volatile boolean agentArmed = true;
     private volatile boolean passiveCapture = false;
     private volatile Consumer<ExcelSpecMatcher> onMatcherUpdated;
@@ -151,10 +153,20 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
         this.onMatcherUpdated = onMatcherUpdated;
     }
 
+    public void setLiveIdPool(LiveIdPool liveIdPool) {
+        this.liveIdPool = liveIdPool;
+        if (jsScanner != null) {
+            jsScanner.setLiveIdPool(liveIdPool);
+        }
+    }
+
     public void setMatcher(ExcelSpecMatcher matcher) {
         this.matcher = matcher;
         if (jsScanner != null) {
             jsScanner.setMatcher(matcher);
+        }
+        if (matcher != null && state != null) {
+            state.updateMissingExcelRouteHints(matcher.computeMissingRouteHints());
         }
         Consumer<ExcelSpecMatcher> cb = this.onMatcherUpdated;
         if (cb != null) {
@@ -259,6 +271,10 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
         if (shouldInject && !isNonHtmlEmbed && interceptedResponse.statusCode() >= 200 && interceptedResponse.statusCode() < 300) {
             DecodedBody htmlDecoded = decodeBodyTextIfHtml(mime, inferred, ct, ctLower, interceptedResponse);
             if (htmlDecoded != null) {
+                if (hostAllowed && jsScanner != null && config.isCaptureJsEndpoints()
+                    && (!config.hasPathScopeRestriction() || config.isUrlAllowedForCrawl(req.url()))) {
+                    jsScanner.submitHtmlInlineScan(req.url(), htmlDecoded.text);
+                }
                 HttpResponse injected = injectAgentIntoHtml(interceptedResponse, htmlDecoded);
                 if (injected != null) {
                     log("[Agent] Đã bơm script vào trang: " + req.url());
@@ -301,7 +317,23 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
         }
         String fullUrl = req.url() != null ? req.url() : pathWithQuery;
         String referer = req.headerValue("Referer");
+        if (config.hasPathScopeRestriction()) {
+            boolean hasProvenAgentCtx = boundCtx != null && boundCtx.explicitMythCtx
+                && boundCtx.group != null && boundCtx.group.pageUrl != null && !boundCtx.group.pageUrl.isEmpty()
+                && config.isUrlAllowedForCrawl(boundCtx.group.pageUrl);
+            if (!hasProvenAgentCtx) {
+                if (referer != null && !referer.trim().isEmpty()) {
+                    if (!config.isUrlAllowedForCrawl(referer)) {
+                        return;
+                    }
+                } else if (isTopLevelDocumentNavigation(req, pathWithQuery) && !config.isUrlAllowedForCrawl(fullUrl)) {
+                    return;
+                }
+            }
+        }
         String reqCt = req.headerValue("Content-Type");
+        String respCt = resp.headerValue("Content-Type");
+        String respEncoding = resp.headerValue("Content-Encoding");
         String httpVer = req.httpVersion();
         HttpMode httpMode = (httpVer != null && httpVer.contains("2")) ? HttpMode.HTTP_2 : HttpMode.HTTP_1;
         int status = resp.statusCode();
@@ -313,6 +345,7 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
         byte[] reqPreview = copyBoundedBytes(req.toByteArray(), CapturedApiEntry.MAX_INLINE_REQUEST_BYTES);
         byte[] reqBodyForParams = copyBoundedBytes(req.body(), MAX_PARAM_BODY_BYTES);
         byte[] respPreview = copyBoundedBytes(resp.toByteArray(), CapturedApiEntry.MAX_INLINE_RESPONSE_BYTES);
+        byte[] respBodyBounded = copyBoundedBytes(resp.body(), CapturedApiEntry.MAX_INLINE_RESPONSE_BYTES);
         HttpRequestResponse tempStore = null;
         if (api != null) {
             try {
@@ -334,8 +367,8 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
             }
             processApiCaptureWorker(
                 currentMatcher, excelLoaded, method, fullUrl, pathWithQuery,
-                host, port, https, referer, reqCt,
-                reqPreview, reqBodyForParams, respPreview,
+                host, port, https, referer, reqCt, respCt, respEncoding,
+                reqPreview, reqBodyForParams, respPreview, respBodyBounded,
                 finalTempStore, httpMode, status, respLen, mimeLabel,
                 boundCtx, statusAtCapture, capturedAt
             );
@@ -353,9 +386,12 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
         boolean https,
         String referer,
         String reqCt,
+        String respCt,
+        String respEncoding,
         byte[] reqPreview,
         byte[] reqBodyForParams,
         byte[] respPreview,
+        byte[] respBodyBounded,
         HttpRequestResponse tempStore,
         HttpMode httpMode,
         int status,
@@ -398,6 +434,7 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
                 excelUpgraded = (excelMatch.outcome == ApiSpecEntry.RecordOutcome.UPGRADED_SUPERSET);
                 switch (excelMatch.outcome) {
                     case FIRST_MATCH:
+                        state.updateMissingExcelRouteHints(currentMatcher.computeMissingRouteHints());
                         log(String.format("[STT %s] MATCHED %s %s  <--  %s (%d params)",
                             excelMatch.entry.stt, method, excelMatch.entry.normalizedSpecPath, actionPath,
                             excelMatch.entry.getPrimaryCapture().paramCount()));
@@ -418,7 +455,7 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
         }
 
         Set<String> params = ParamExtractor.extractParameterKeys(pathWithQuery, reqCt, reqBodyForParams);
-        String graphqlOp = ParamExtractor.extractGraphqlOperation(reqCt, reqBodyForParams);
+        String graphqlOp = ParamExtractor.extractGraphqlOperation(pathWithQuery, reqCt, reqBodyForParams);
         String endpointKey = buildEndpointKey(method, pathWithQuery, graphqlOp, excelMatch, config);
         String sha = CapturedApiEntry.sha256Hex(respPreview);
 
@@ -431,6 +468,9 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
         ApiCall recordedCall = state.getActionGroups().recordCall(
             group, cap, endpointKey, graphqlOp, excelStt, excelSpecPath, excelLoaded, excelUpgraded, mimeLabel);
 
+        // Harvest Live IDs & inspect 200 OK JSON bodies for GraphQL errors / soft-auth envelopes
+        inspectJsonResponseAndHarvestIds(pathWithQuery, respCt, respEncoding, respBodyBounded, status, recordedCall);
+
         if (excelMatch == null && !config.isStrictExcelOnly()) {
             state.addExtraCapture(cap);
             if (recordedCall != null && recordedCall.getHits() == 1) {
@@ -439,6 +479,112 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
             }
         }
         notifyUi();
+    }
+
+    private void inspectJsonResponseAndHarvestIds(
+        String pathWithQuery,
+        String respCt,
+        String respEncoding,
+        byte[] respBodyBounded,
+        int status,
+        ApiCall recordedCall
+    ) {
+        if (respBodyBounded == null || respBodyBounded.length == 0) {
+            return;
+        }
+        try {
+            byte[] decoded = decompressBody(respBodyBounded, respEncoding);
+            if (decoded == null || decoded.length == 0) {
+                return;
+            }
+            String ctLower = respCt != null ? respCt.toLowerCase(Locale.ROOT) : "";
+            boolean looksJson = ctLower.contains("json")
+                || (decoded[0] == '{' || decoded[0] == '[' || decoded[0] == ' ' || decoded[0] == '\n' || decoded[0] == '\r');
+            if (!looksJson) {
+                return;
+            }
+            String jsonText = new String(decoded, StandardCharsets.UTF_8).trim();
+            if (!(jsonText.startsWith("{") || jsonText.startsWith("["))) {
+                return;
+            }
+
+            // 1. Auto-harvest real server IDs on 2xx responses into LiveIdPool & concretize pending JS routes
+            LiveIdPool pool = this.liveIdPool;
+            if (pool != null && status >= 200 && status < 300) {
+                int harvested = pool.harvestFromJson(pathWithQuery, jsonText);
+                if (harvested > 0 && jsScanner != null) {
+                    jsScanner.tryConcretizePendingRoutes();
+                }
+            }
+
+            // 2. Detect GraphQL errors or disguised 401/403/500 JSON envelopes inside HTTP 200 OK
+            if (status == 200 && recordedCall != null) {
+                java.util.List<String> gqlErrors = ParamExtractor.extractGraphqlResponseErrors(respCt, decoded);
+                if (!gqlErrors.isEmpty()) {
+                    state.getActionGroups().attachCallNoteIfAbsent(
+                        recordedCall,
+                        AuditNote.Severity.WARN,
+                        AuditNote.Type.GRAPHQL_ERROR,
+                        "GraphQL trả HTTP 200 nhưng có lỗi: " + String.join(" | ", gqlErrors)
+                    );
+                } else if (jsonText.startsWith("{") && jsonText.length() <= 65536) {
+                    String softErr = detectDisguisedJsonError(jsonText);
+                    if (!softErr.isEmpty()) {
+                        AuditNote.Severity sev = softErr.contains("401") || softErr.contains("403")
+                            ? AuditNote.Severity.ERROR : AuditNote.Severity.WARN;
+                        state.getActionGroups().attachCallNoteIfAbsent(
+                            recordedCall,
+                            sev,
+                            AuditNote.Type.SOFT_AUTH_OR_ERROR,
+                            softErr
+                        );
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    static String detectDisguisedJsonError(String jsonObjectText) {
+        if (jsonObjectText == null || !jsonObjectText.startsWith("{")) {
+            return "";
+        }
+        // Quick substring pre-filter before parsing
+        String low = jsonObjectText.toLowerCase(Locale.ROOT);
+        if (!(low.contains("\"code\"") || low.contains("\"status\"") || low.contains("\"error\"") || low.contains("\"success\":false") || low.contains("\"success\": false"))) {
+            return "";
+        }
+        try {
+            java.util.Map<String, Object> obj = com.mythofcrawl.crawler.model.MiniJson.parseObject(jsonObjectText);
+            Object codeObj = obj.get("code") != null ? obj.get("code") : obj.get("statusCode");
+            if (codeObj == null) {
+                codeObj = obj.get("status");
+            }
+            if (codeObj != null) {
+                String cs = String.valueOf(codeObj).trim();
+                if ("401".equals(cs) || "403".equals(cs) || "500".equals(cs)
+                    || "UNAUTHORIZED".equalsIgnoreCase(cs) || "FORBIDDEN".equalsIgnoreCase(cs)
+                    || "UNAUTHENTICATED".equalsIgnoreCase(cs)) {
+                    String msg = com.mythofcrawl.crawler.model.MiniJson.asString(obj, "message",
+                        com.mythofcrawl.crawler.model.MiniJson.asString(obj, "msg",
+                        com.mythofcrawl.crawler.model.MiniJson.asString(obj, "error", "")));
+                    return "HTTP 200 chứa mã lỗi ứng dụng [" + cs + "]" + (msg.isEmpty() ? "" : (": " + msg));
+                }
+            }
+            Object successObj = obj.get("success");
+            if (Boolean.FALSE.equals(successObj)) {
+                String errMsg = com.mythofcrawl.crawler.model.MiniJson.asString(obj, "message",
+                    com.mythofcrawl.crawler.model.MiniJson.asString(obj, "error", ""));
+                if (errMsg.toLowerCase(Locale.ROOT).contains("unauthoriz")
+                    || errMsg.toLowerCase(Locale.ROOT).contains("unauthenticat")
+                    || errMsg.toLowerCase(Locale.ROOT).contains("token expired")
+                    || errMsg.toLowerCase(Locale.ROOT).contains("hết hạn")) {
+                    return "HTTP 200 báo mất phiên/quyền (success=false): " + errMsg;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return "";
     }
 
     private static byte[] copyBoundedBytes(ByteArray ba, int maxBytes) {
@@ -780,10 +926,11 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
                 return null;
             }
             String targetHost = resolved.getHost();
-            if (targetHost == null || config.isHostAllowed(targetHost)) {
+            String destUrl = resolved.toString();
+            if (targetHost == null || config.isUrlAllowedForCrawl(destUrl)) {
                 return null;
             }
-            String destUrl = resolved.toString();
+            boolean sameHostOutOfScope = config.isHostAllowed(targetHost);
             ActionGroup grp = state.getCurrentGroup();
             if (grp == null) {
                 grp = state.getActionGroups().openGroup(
@@ -795,25 +942,45 @@ public final class HtmlAgentInjector implements ProxyResponseHandler {
                 AuditNote.Type.EXTERNAL_REDIRECT,
                 "NAV",
                 destUrl,
-                "HTTP " + statusCode + " chuyển hướng ngoài host: " + destUrl
+                "HTTP " + statusCode + (sameHostOutOfScope
+                    ? " chuyển hướng ngoài nhánh URL cho phép: "
+                    : " chuyển hướng ngoài host: ") + destUrl
             );
             CrawlState.BacktrackResult bt = state.recordRedirectBounce(reqUrl, destUrl, true);
             String backUrl = bt.targetUrl;
+            if (bt.exhausted || backUrl.isEmpty() || !config.isUrlAllowedForCrawl(backUrl)) {
+                String fallbackEntry = config.getPrimaryAllowedEntryUrl();
+                if (!fallbackEntry.isEmpty()
+                    && config.isUrlAllowedForCrawl(fallbackEntry)
+                    && !state.isUrlDeferred(fallbackEntry)
+                    && !state.isUrlCompleted(fallbackEntry)) {
+                    backUrl = fallbackEntry;
+                } else {
+                    backUrl = "";
+                }
+            }
             String html;
-            if (bt.exhausted || backUrl.isEmpty()) {
+            if (backUrl.isEmpty()) {
                 state.setStatus(CrawlState.Status.STOPPED);
-                log("[Redirect Guard] HTTP " + statusCode + " -> " + destUrl + " (Hết URL an toàn, dừng crawl)");
+                log("[Scope Guard] HTTP " + statusCode + " -> " + destUrl + " (Hết URL an toàn, dừng crawl)");
                 html = "<!doctype html><html><meta charset=\"utf-8\"><body>"
-                    + "<p>Đã chặn chuyển hướng ngoài host và hoàn tất hàng đợi.</p></body></html>";
+                    + "<p>Đã chặn điều hướng ngoài phạm vi crawl và hoàn tất hàng đợi.</p></body></html>";
             } else {
-                log("[Redirect Guard] HTTP " + statusCode + " -> " + destUrl
-                    + ", lùi " + bt.levelsBack + " cấp -> " + backUrl);
+                log("[Scope Guard] HTTP " + statusCode + " -> " + destUrl
+                    + ", quay về URL hợp lệ -> " + backUrl);
                 html = LocalControlServer.buildBounceHtml(backUrl, destUrl);
             }
             notifyUi();
-            return HttpResponse.httpResponse(ByteArray.byteArray(html.getBytes(StandardCharsets.UTF_8)))
-                .withUpdatedHeader("Content-Type", "text/html; charset=utf-8")
-                .withUpdatedHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+            byte[] htmlBytes = html.getBytes(StandardCharsets.UTF_8);
+            byte[] headBytes = ("HTTP/1.1 200 OK\r\n"
+                + "Content-Type: text/html; charset=utf-8\r\n"
+                + "Content-Length: " + htmlBytes.length + "\r\n"
+                + "Cache-Control: no-store, no-cache, must-revalidate\r\n"
+                + "Connection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII);
+            byte[] fullResp = new byte[headBytes.length + htmlBytes.length];
+            System.arraycopy(headBytes, 0, fullResp, 0, headBytes.length);
+            System.arraycopy(htmlBytes, 0, fullResp, headBytes.length, htmlBytes.length);
+            return HttpResponse.httpResponse(ByteArray.byteArray(fullResp));
         } catch (Exception ignored) {
             return null;
         }

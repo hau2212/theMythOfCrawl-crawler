@@ -27,7 +27,9 @@ public final class AuditNote {
         NOT_IN_EXCEL("Ngoài Excel"),
         EXCEL_UPGRADE("Nâng cấp bản Excel"),
         EXTERNAL_REDIRECT("Chuyển hướng ngoài"),
-        REDIRECT_DEFERRED("Tạm NOTE chuyển hướng");
+        REDIRECT_DEFERRED("Tạm NOTE chuyển hướng"),
+        GRAPHQL_ERROR("Lỗi GraphQL (HTTP 200)"),
+        SOFT_AUTH_OR_ERROR("Lỗi ẩn trong JSON 200");
 
         public final String label;
 

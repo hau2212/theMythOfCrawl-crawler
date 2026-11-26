@@ -14,6 +14,7 @@
   var pendingNet = 0;
   var runningLoop = false;
   var currentConfig = null;
+  var activeContextId = 0;
   var lastContextErrorAt = 0;
   var domMutationEpoch = 0;
   var lastDomMutationAt = Date.now();
@@ -205,13 +206,73 @@
         } catch (e) {}
       }
 
+      function isSameOriginApiUrl(rawUrl) {
+        if (!rawUrl || typeof rawUrl !== "string") return false;
+        if (rawUrl.indexOf(CONTROL + "/") >= 0) return false;
+        try {
+          var resolved = new URL(rawUrl, win.location.href);
+          return resolved.origin === win.location.origin;
+        } catch (e) {
+          return false;
+        }
+      }
+
+      function attachMythCtxToFetchArgs(args) {
+        if (!activeContextId || !args || !args.length) return args;
+        try {
+          var first = args[0];
+          var urlStr = typeof first === "string"
+            ? first
+            : (first && typeof first.url === "string" ? first.url : (first instanceof URL ? first.href : ""));
+          if (!isSameOriginApiUrl(urlStr)) return args;
+          var ctxVal = String(activeContextId);
+          var init = args.length > 1 && args[1] && typeof args[1] === "object" ? args[1] : null;
+          if (typeof first === "string" || (typeof URL !== "undefined" && first instanceof URL)) {
+            var nextInit = {};
+            if (init) {
+              var ikeys = Object.keys(init);
+              for (var k = 0; k < ikeys.length; k++) nextInit[ikeys[k]] = init[ikeys[k]];
+            }
+            if (win.Headers && init && init.headers instanceof win.Headers) {
+              var hCopy = new win.Headers(init.headers);
+              if (!hCopy.has("X-Myth-Ctx")) hCopy.set("X-Myth-Ctx", ctxVal);
+              nextInit.headers = hCopy;
+            } else if (init && Array.isArray(init.headers)) {
+              nextInit.headers = init.headers.concat([["X-Myth-Ctx", ctxVal]]);
+            } else {
+              var hObj = {};
+              if (init && init.headers && typeof init.headers === "object") {
+                var hk = Object.keys(init.headers);
+                for (var hi = 0; hi < hk.length; hi++) hObj[hk[hi]] = init.headers[hk[hi]];
+              }
+              if (!hObj["X-Myth-Ctx"]) hObj["X-Myth-Ctx"] = ctxVal;
+              nextInit.headers = hObj;
+            }
+            var clonedArgs = Array.prototype.slice.call(args);
+            clonedArgs[1] = nextInit;
+            return clonedArgs;
+          } else if (win.Request && first instanceof win.Request) {
+            var reqHeaders = new win.Headers(init && init.headers ? init.headers : first.headers);
+            if (!reqHeaders.has("X-Myth-Ctx")) {
+              reqHeaders.set("X-Myth-Ctx", ctxVal);
+              var reqClone = new win.Request(first, Object.assign({}, init || {}, { headers: reqHeaders }));
+              var reqArgs = Array.prototype.slice.call(args);
+              reqArgs[0] = reqClone;
+              return reqArgs;
+            }
+          }
+        } catch (e) {}
+        return args;
+      }
+
       if (win.fetch) {
         var wOrigFetch = win.fetch;
         win.fetch = function (input) {
           var urlStr = typeof input === "string" ? input : (input && input.url ? input.url : "");
           var isControl = urlStr.indexOf(CONTROL + "/") >= 0;
+          var callArgs = isControl ? arguments : attachMythCtxToFetchArgs(arguments);
           if (!isControl) pendingNet++;
-          return wOrigFetch.apply(this, arguments).then(
+          return wOrigFetch.apply(this, callArgs).then(
             function (res) {
               if (!isControl) {
                 pendingNet = Math.max(0, pendingNet - 1);
@@ -245,12 +306,16 @@
         var origSend = win.XMLHttpRequest.prototype.send;
         win.XMLHttpRequest.prototype.open = function (m, u) {
           this.__mythUrl = u || "";
+          this.__mythSameOrigin = isSameOriginApiUrl(String(u || ""));
           return origOpen.apply(this, arguments);
         };
         win.XMLHttpRequest.prototype.send = function () {
           var self = this;
           var isControl = (self.__mythUrl || "").indexOf(CONTROL + "/") >= 0;
           if (!isControl) {
+            if (self.__mythSameOrigin && activeContextId > 0) {
+              try { self.setRequestHeader("X-Myth-Ctx", String(activeContextId)); } catch (e) {}
+            }
             pendingNet++;
             self.addEventListener("loadend", function () {
               pendingNet = Math.max(0, pendingNet - 1);
@@ -423,6 +488,11 @@
     return topFetch(path, opts).then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
+    }).then(function (data) {
+      if (data && typeof data.contextId === "number" && data.contextId > 0) {
+        activeContextId = data.contextId;
+      }
+      return data;
     });
   }
 
@@ -432,6 +502,64 @@
   var origPrompt = window.prompt;
   var origPrint = window.print;
   var origWindowOpen = window.open;
+
+  function hostMatchesPatternJs(host, pattern) {
+    if (!host || !pattern) return false;
+    var h = String(host).trim().toLowerCase();
+    var r = String(pattern).trim().toLowerCase();
+    if (!r) return false;
+    if (r === "*") return true;
+    if (r.indexOf("*.") === 0) {
+      var suffix = r.slice(2);
+      return h === suffix || h.endsWith("." + suffix);
+    }
+    if (r.charAt(0) === "*" && r.length > 1) {
+      var root = r.slice(1);
+      if (root.charAt(0) === ".") root = root.slice(1);
+      return h === root || h.endsWith("." + root);
+    }
+    return h === r;
+  }
+
+  function normalizePathPrefixJs(rawPath) {
+    if (!rawPath) return "/";
+    var p = String(rawPath).trim();
+    var q = p.indexOf("?");
+    if (q >= 0) p = p.slice(0, q);
+    var hash = p.indexOf("#");
+    if (hash >= 0) p = p.slice(0, hash);
+    if (!p) return "/";
+    if (p.charAt(0) !== "/") p = "/" + p;
+    while (p.length > 1 && p.charAt(p.length - 1) === "/") {
+      p = p.slice(0, -1);
+    }
+    return p;
+  }
+
+  function pathMatchesPrefixJs(candidatePath, requiredPrefix, wildcardSuffix) {
+    var pref = normalizePathPrefixJs(requiredPrefix);
+    if (pref === "/") return true;
+    var cand = normalizePathPrefixJs(candidatePath);
+    if (cand.toLowerCase() === pref.toLowerCase()) return true;
+    if (cand.length <= pref.length) return false;
+    if (cand.slice(0, pref.length).toLowerCase() !== pref.toLowerCase()) return false;
+    if (wildcardSuffix) return true;
+    var nextCh = cand.charAt(pref.length);
+    if (nextCh === "/") return true;
+    if (nextCh === "-" && (cand.charAt(pref.length + 1) === "p" || cand.charAt(pref.length + 1) === "P")
+      && cand.length > pref.length + 2) {
+      var digitsOnly = true;
+      for (var i = pref.length + 2; i < cand.length; i++) {
+        var c = cand.charCodeAt(i);
+        if (c < 48 || c > 57) {
+          digitsOnly = false;
+          break;
+        }
+      }
+      if (digitsOnly) return true;
+    }
+    return false;
+  }
 
   function isAllowedUrl(rawUrl, stateObj) {
     if (!rawUrl || typeof rawUrl !== "string") return false;
@@ -444,25 +572,32 @@
     try {
       var u = new URL(rawUrl, location.href);
       if (u.protocol !== "http:" && u.protocol !== "https:") return false;
-      if (u.origin === location.origin) return true;
-      var hosts = (stateObj && Array.isArray(stateObj.allowedHosts)) ? stateObj.allowedHosts : [];
       var h = (u.hostname || "").toLowerCase();
-      for (var i = 0; i < hosts.length; i++) {
-        var r = String(hosts[i] || "").trim().toLowerCase();
-        if (!r) continue;
-        if (r === "*") return true;
-        if (r.indexOf("*.") === 0) {
-          var suffix = r.slice(2);
-          if (h === suffix || h.endsWith("." + suffix)) return true;
-        } else if (r.charAt(0) === "*" && r.length > 1) {
-          var root = r.slice(1);
-          if (root.charAt(0) === ".") root = root.slice(1);
-          if (h === root || h.endsWith("." + root)) return true;
-        } else if (h === r) {
-          return true;
+      var scopeRules = (stateObj && Array.isArray(stateObj.scopeRules)) ? stateObj.scopeRules : [];
+      if (scopeRules.length > 0) {
+        var rawPath = u.pathname || "/";
+        var hashFrag = u.hash ? u.hash.slice(1) : "";
+        var spaHashPath = "";
+        if (hashFrag.indexOf("/") === 0) spaHashPath = hashFrag;
+        else if (hashFrag.indexOf("!/") === 0) spaHashPath = hashFrag.slice(1);
+        for (var srIdx = 0; srIdx < scopeRules.length; srIdx++) {
+          var rule = scopeRules[srIdx];
+          if (!rule || !hostMatchesPatternJs(h, rule.hostPattern)) continue;
+          var reqPref = rule.pathPrefix || "/";
+          var wild = !!rule.wildcardSuffix;
+          if (reqPref === "/" || pathMatchesPrefixJs(rawPath, reqPref, wild)) return true;
+          if (spaHashPath && pathMatchesPrefixJs(spaHashPath, reqPref, wild)) return true;
         }
+        return false;
       }
-      return false;
+      var hosts = (stateObj && Array.isArray(stateObj.allowedHosts)) ? stateObj.allowedHosts : [];
+      if (hosts.length > 0) {
+        for (var i = 0; i < hosts.length; i++) {
+          if (hostMatchesPatternJs(h, hosts[i])) return true;
+        }
+        return false;
+      }
+      return u.origin === location.origin;
     } catch (e) {
       return false;
     }
@@ -499,7 +634,7 @@
             apiCall(CONTROL + "/discovered", "POST", { pageUrl: location.href, urls: [abs], skipped: [] }).catch(function () {});
           } else {
             var curPath = formatActionPath(location.href, "window.open", sanitizeLabel(abs), currentConfig);
-            postExternalRedirectNote(curPath, abs, "Đã chặn window.open ngoài host: " + abs, "window.open", sanitizeLabel(abs));
+            postExternalRedirectNote(curPath, abs, "Đã chặn window.open ngoài phạm vi crawl: " + abs, "window.open", sanitizeLabel(abs));
           }
         } catch (e) {}
       }
@@ -786,6 +921,38 @@
     "summary"
   ].join(",");
 
+  function hasFrameworkDelegatedAction(el) {
+    if (!el || el.nodeType !== 1) return false;
+    try {
+      if (el.hasAttribute("x-on:click") || el.hasAttribute("@click") || el.hasAttribute("v-on:click")
+        || el.hasAttribute("(click)") || el.hasAttribute("ng-reflect-router-link")
+        || el.hasAttribute("data-action") || el.hasAttribute("data-bs-toggle")
+        || el.hasAttribute("data-toggle") || el.hasAttribute("hx-trigger")) {
+        return true;
+      }
+      // Vue 3 (_vei) / Vue 2 (__vue__)
+      if (el._vei && (el._vei.onClick || el._vei.onMousedown || el._vei.onPointerdown || el._vei.onChange)) {
+        return true;
+      }
+      // React 17/18/19 root-delegated props (__reactProps$<rand> / __reactEvents$<rand>)
+      var ownKeys = Object.keys(el);
+      for (var i = 0; i < ownKeys.length; i++) {
+        var k = ownKeys[i];
+        if (k.indexOf("__reactProps$") === 0) {
+          var rp = el[k];
+          if (rp && (typeof rp.onClick === "function" || typeof rp.onMouseDown === "function"
+            || typeof rp.onPointerDown === "function" || typeof rp.onDoubleClick === "function"
+            || typeof rp.onSubmit === "function")) {
+            return true;
+          }
+        } else if (k.indexOf("__reactEvents$") === 0 && el[k] && el[k].size > 0) {
+          return true;
+        }
+      }
+    } catch (e) {}
+    return false;
+  }
+
   function isAtomicInteractiveNode(el) {
     if (!el || el.nodeType !== 1) return false;
     var tag = (el.tagName || "").toUpperCase();
@@ -793,7 +960,10 @@
     if (tag === "A" && el.hasAttribute("href")) return true;
     if (tag === "INPUT") {
       var tp = (el.type || "text").toLowerCase();
-      if (tp === "submit" || tp === "button" || tp === "image" || tp === "reset" || tp === "search") return true;
+      if (tp === "submit" || tp === "button" || tp === "image" || tp === "reset" || tp === "search"
+        || tp === "checkbox" || tp === "radio") {
+        return true;
+      }
       if (el.readOnly && isDatepickerInput(el)) return true;
     }
     var role = (el.getAttribute("role") || "").toLowerCase();
@@ -803,7 +973,7 @@
       return true;
     }
     var hasPopup = (el.getAttribute("aria-haspopup") || "").toLowerCase();
-    if (hasPopup === "listbox" || hasPopup === "menu" || el.hasAttribute("aria-expanded")) return true;
+    if (hasPopup === "listbox" || hasPopup === "menu" || hasPopup === "dialog" || el.hasAttribute("aria-expanded")) return true;
     if (el.hasAttribute("onclick") || el.hasAttribute("ng-click") || el.hasAttribute("hx-get")
       || el.hasAttribute("hx-post") || el.hasAttribute("hx-put") || el.hasAttribute("hx-delete")
       || el.hasAttribute("hx-patch") || el.hasAttribute("wire:click")
@@ -1442,7 +1612,7 @@
         || tag === "HEADER" || tag === "FOOTER" || tag === "NAV" || tag === "ASIDE") {
         return false;
       }
-      var hasListener = clickableNodes.has(node);
+      var hasListener = clickableNodes.has(node) || hasFrameworkDelegatedAction(node);
       if (!hasListener) {
         var cs = view.getComputedStyle(node);
         if (!cs || cs.cursor !== "pointer") return false;
@@ -1461,6 +1631,48 @@
       return true;
     } catch (e) {}
     return false;
+  }
+
+  function computeExplorationTier(el, inModal, baseHref) {
+    try {
+      if (inModal === 0) {
+        return isModalCloseButton(el, null) ? 5 : 0;
+      }
+      var tag = (el.tagName || "").toUpperCase();
+      var role = (el.getAttribute("role") || "").toLowerCase();
+      var hasPopup = (el.getAttribute("aria-haspopup") || "").toLowerCase();
+      var bsToggle = (el.getAttribute("data-bs-toggle") || el.getAttribute("data-toggle") || "").toLowerCase();
+
+      // Tier 1: In-page state expanders (Tabs, Accordions, Menus, Modal triggers)
+      if (role === "tab" || tag === "SUMMARY"
+        || el.getAttribute("aria-expanded") === "false"
+        || hasPopup === "menu" || hasPopup === "dialog"
+        || bsToggle === "tab" || bsToggle === "pill" || bsToggle === "collapse"
+        || bsToggle === "dropdown" || bsToggle === "modal") {
+        return 1;
+      }
+
+      // Links: distinguish same-route query/hash switches vs cross-route page navigations
+      if (tag === "A" || role === "link") {
+        var rawHref = (el.getAttribute("href") || "").trim();
+        if (!rawHref || rawHref === "#" || rawHref.toLowerCase().indexOf("javascript:") === 0) {
+          return 2;
+        }
+        try {
+          var curU = new URL(baseHref || location.href, location.href);
+          var dstU = new URL(rawHref, curU.href);
+          if (dstU.origin === curU.origin && dstU.pathname === curU.pathname) {
+            return 3; // Same-route filter/tab/pagination query
+          }
+        } catch (e) {}
+        return 4; // Cross-route navigation LAST after in-page controls
+      }
+
+      // Tier 2: Forms, filters, selects, comboboxes, toggles, and in-page AJAX buttons
+      return 2;
+    } catch (e) {
+      return 2;
+    }
   }
 
   function measureDocCoords(el, frameOffsetX, frameOffsetY) {
@@ -1530,11 +1742,13 @@
       if (isCompositeInteractiveContainer(el)) return;
       seenEls.add(el);
       var coords = measureDocCoords(el, offX, offY);
+      var mFlag = modalEl ? 0 : 1;
       out.push({
         el: el,
         framePrefix: framePrefix || "",
         frameHref: effectiveHref,
-        inModal: modalEl ? 0 : 1,
+        inModal: mFlag,
+        tier: computeExplorationTier(el, mFlag, effectiveHref),
         docTop: coords.docTop,
         docLeft: coords.docLeft,
         rowBand: Math.round(coords.docTop / 16),
@@ -1585,17 +1799,37 @@
     if (frameDepth === 0 && shadowDepth === 0) {
       out.sort(function (a, b) {
         if (a.inModal !== b.inModal) return a.inModal - b.inModal;
-        if (a.inModal === 0) {
-          var aClose = isModalCloseButton(a.el, null) ? 1 : 0;
-          var bClose = isModalCloseButton(b.el, null) ? 1 : 0;
-          if (aClose !== bClose) return aClose - bClose;
-        }
+        if (a.tier !== b.tier) return a.tier - b.tier;
         if (a.rowBand !== b.rowBand) return a.rowBand - b.rowBand;
         if (a.docLeft !== b.docLeft) return a.docLeft - b.docLeft;
         if (a.docTop !== b.docTop) return a.docTop - b.docTop;
         return a.domOrder - b.domOrder;
       });
     }
+  }
+
+  function discoverSpaFrameworkRoutes(outUrls, stateObj) {
+    try {
+      // Next.js client build manifest
+      if (window.__BUILD_MANIFEST && Array.isArray(window.__BUILD_MANIFEST.sortedPages)) {
+        var pages = window.__BUILD_MANIFEST.sortedPages;
+        for (var i = 0; i < pages.length && i < 200; i++) {
+          var p = String(pages[i] || "");
+          if (!p || p.indexOf("/_") === 0 || p.indexOf("/api/") === 0 || p.indexOf("[") >= 0) continue;
+          var abs = new URL(p, location.origin).href;
+          if (isAllowedUrl(abs, stateObj || currentConfig)) outUrls.push(abs);
+        }
+      }
+      // Next.js SSR __NEXT_DATA__ page & query hints
+      var nextScript = document.getElementById("__NEXT_DATA__");
+      if (nextScript && nextScript.textContent && nextScript.textContent.length < 250000) {
+        var parsed = JSON.parse(nextScript.textContent);
+        if (parsed && typeof parsed.page === "string" && parsed.page.indexOf("[") < 0 && parsed.page.indexOf("/_") !== 0) {
+          var np = new URL(parsed.page, location.origin).href;
+          if (isAllowedUrl(np, stateObj || currentConfig)) outUrls.push(np);
+        }
+      }
+    } catch (e) {}
   }
 
   function discoverLinks(root, outUrls, frameDepth, shadowDepth, stateObj, baseHref) {
@@ -1778,18 +2012,89 @@
     return isoDate;
   }
 
-  function resolveValueForInput(inp, formFill) {
+  function resolveLiveIdForInput(inp, hayLower) {
+    try {
+      var liveIds = currentConfig && currentConfig.liveIds;
+      if (!liveIds || typeof liveIds !== "object") return null;
+      var rawKey = ((inp.name || "") + " " + (inp.getAttribute("data-field") || "") + " " + (isVolatileId(inp.id) ? "" : (inp.id || ""))).trim().toLowerCase();
+      if (!rawKey && !/\b(id|uuid|mã)\b/.test(hayLower)) return null;
+      var m = /([a-z0-9]+?)(?:_?id|_?uuid)$/i.exec(inp.name || inp.id || "");
+      if (m && m[1]) {
+        var base = m[1].toLowerCase();
+        if (liveIds[base]) return String(liveIds[base]);
+        if (liveIds[base + "s"]) return String(liveIds[base + "s"]);
+      }
+      if (/^(id|uuid|item_?id|record_?id)$/i.test(inp.name || inp.id || "")) {
+        var routeSegs = routeSegments(location.href, true);
+        for (var i = routeSegs.length - 1; i >= 0; i--) {
+          var rs = routeSegs[i].toLowerCase();
+          if (rs !== "{id}" && liveIds[rs]) return String(liveIds[rs]);
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function pickDatalistOption(inp) {
+    try {
+      var listId = inp.getAttribute && inp.getAttribute("list");
+      if (!listId) return null;
+      var doc = inp.ownerDocument || document;
+      var dl = doc.getElementById(listId);
+      if (!dl || !dl.options) return null;
+      for (var i = 0; i < dl.options.length; i++) {
+        var v = String(dl.options[i].value || "").trim();
+        if (v) return v;
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function applyHtml5Constraints(inp, candidateVal) {
+    var val = String(candidateVal !== undefined && candidateVal !== null ? candidateVal : "");
+    try {
+      var pat = inp.getAttribute && inp.getAttribute("pattern");
+      if (pat) {
+        var rx = new RegExp("^(?:" + pat + ")$");
+        if (!rx.test(val)) {
+          var fallbacks = ["123456", "0901234567", "100", "2026-01-01", "TEST001", "test@example.com", "550e8400-e29b-41d4-a716-446655440000", "ABC12345"];
+          for (var i = 0; i < fallbacks.length; i++) {
+            if (rx.test(fallbacks[i])) {
+              val = fallbacks[i];
+              break;
+            }
+          }
+        }
+      }
+      var minL = inp.minLength;
+      var maxL = inp.maxLength;
+      if (typeof minL === "number" && minL > 0 && val.length < minL) {
+        var padChar = /^\d+$/.test(val) ? "1" : "a";
+        while (val.length < minL) val += padChar;
+      }
+      if (typeof maxL === "number" && maxL > 0 && val.length > maxL) {
+        val = val.slice(0, maxL);
+      }
+    } catch (e) {}
+    return val;
+  }
+
+  function resolveValueForInput(inp, formFill, scopePasswordRef) {
     var cfg = formFill || {};
     var defText = cfg.text !== undefined ? String(cfg.text) : "TEXT";
 
     var ruleMatch = matchCustomRule(inp, cfg);
-    if (ruleMatch !== null) return ruleMatch;
+    if (ruleMatch !== null) return applyHtml5Constraints(inp, ruleMatch);
+
+    var dlVal = pickDatalistOption(inp);
+    if (dlVal !== null) return applyHtml5Constraints(inp, dlVal);
 
     var tag = inp.tagName;
-    if (tag === "TEXTAREA") return cfg.textarea !== undefined ? String(cfg.textarea) : defText;
+    if (tag === "TEXTAREA") return applyHtml5Constraints(inp, cfg.textarea !== undefined ? String(cfg.textarea) : defText);
 
     var type = (inp.type || "text").toLowerCase();
     var ph = inp.getAttribute("placeholder") || "";
+    var inputMode = (inp.getAttribute("inputmode") || "").toLowerCase();
     var hay = findInputContextText(inp).toLowerCase();
 
     if (type === "date") return cfg.date || "2026-01-01";
@@ -1799,8 +2104,17 @@
     if (type === "week") return cfg.week || "2026-W01";
     if (type === "color") return cfg.color || "#000000";
     if (type === "email") return cfg.email || "text@example.com";
-    if (type === "password") return cfg.password || "TEXT@123456";
-    if (type === "tel") return cfg.tel || "0900000000";
+    if (type === "password") {
+      var pwd = cfg.password || "TEXT@123456";
+      if (scopePasswordRef) {
+        if (/confirm|re[-_]?type|re[-_]?pass|verify|repeat|nhập\s*lại|xác\s*nhận/.test(hay) && scopePasswordRef.primary) {
+          return scopePasswordRef.primary;
+        }
+        if (!scopePasswordRef.primary) scopePasswordRef.primary = pwd;
+      }
+      return pwd;
+    }
+    if (type === "tel") return applyHtml5Constraints(inp, cfg.tel || "0901234567");
     if (type === "url") return cfg.url || "https://example.com";
     if (type === "number" || type === "range") {
       var n = cfg.number || "1";
@@ -1809,17 +2123,47 @@
       return String(n);
     }
     if (type === "search" || hay.indexOf("search") >= 0 || hay.indexOf("tìm") >= 0) {
-      return cfg.search !== undefined ? String(cfg.search) : defText;
+      return applyHtml5Constraints(inp, cfg.search !== undefined ? String(cfg.search) : defText);
     }
+
+    // LiveIdPool foreign-key injection for *_id / uuid fields
+    var liveId = resolveLiveIdForInput(inp, hay);
+    if (liveId !== null) return applyHtml5Constraints(inp, liveId);
 
     if (/dd\/mm\/yyyy|mm\/dd\/yyyy|yyyy-mm-dd|dd-mm-yyyy/i.test(ph)) {
       return formatDateForPlaceholder(cfg.date || "2026-01-01", ph);
     }
     if (/\b(email|e-mail)\b/.test(hay)) return cfg.email || "text@example.com";
-    if (/\b(phone|tel|mobile|sdt|điện thoại)\b/.test(hay)) return cfg.tel || "0900000000";
-    if (/\b(website|homepage)\b/.test(hay)) return cfg.url || "https://example.com";
+    if (/\b(phone|tel|mobile|sdt|sđt|điện\s*thoại|di\s*động)\b/.test(hay)) return applyHtml5Constraints(inp, cfg.tel || "0901234567");
+    if (/\b(website|homepage|link|url|trang\s*web)\b/.test(hay)) return cfg.url || "https://example.com";
 
-    return defText;
+    // Semantic synthesis when default text is generic ("TEXT") so numeric/code validations succeed
+    if (defText === "TEXT") {
+      if (/\b(otp|pin|passcode|verification\s*code|mã\s*xác\s*thực|mã\s*otp)\b/.test(hay)) {
+        return applyHtml5Constraints(inp, "123456");
+      }
+      if (/\b(cccd|cmnd|citizen|national\s*id|mã\s*số\s*thuế|mst|tax\s*code)\b/.test(hay)) {
+        return applyHtml5Constraints(inp, "001099001234");
+      }
+      if (/\b(year|năm\s*sinh|năm)\b/.test(hay)) {
+        return applyHtml5Constraints(inp, "2026");
+      }
+      if (/\b(price|amount|total|cost|fee|salary|budget|đơn\s*giá|thành\s*tiền|số\s*tiền|giá|chi\s*phí|lương)\b/.test(hay)) {
+        return applyHtml5Constraints(inp, "100000");
+      }
+      if (inputMode === "numeric" || inputMode === "decimal"
+        || /\b(qty|quantity|count|age|port|zip|postal|số\s*lượng|tuổi|mã\s*bưu\s*điện)\b/.test(hay)) {
+        return applyHtml5Constraints(inp, cfg.number || "1");
+      }
+      if (/\b(username|user_name|login_id|tài\s*khoản|tên\s*đăng\s*nhập)\b/.test(hay)) {
+        return applyHtml5Constraints(inp, "test_user_01");
+      }
+      if (/\b(code|sku|voucher|coupon|slug|mã)\b/.test(hay)) {
+        return applyHtml5Constraints(inp, "CODE001");
+      }
+    }
+
+    return applyHtml5Constraints(inp, defText);
   }
 
   function dispatchInputEvent(el, view, val) {
@@ -1899,10 +2243,11 @@
     } catch (e) {}
   }
 
-  function fillScope(scope, formFill, shadowDepth) {
+  function fillScope(scope, formFill, shadowDepth, sharedPasswordRef) {
     if (!scope || (shadowDepth || 0) > 8) return;
     var overwrite = !!(formFill && formFill.overwrite);
     var blurredInputs = [];
+    var pwdRef = sharedPasswordRef || { primary: "" };
 
     if (scope.querySelectorAll) {
       var inputs = scope.querySelectorAll("input, textarea, select");
@@ -1929,7 +2274,7 @@
 
         if (inp.readOnly) {
           if (isDatepickerInput(inp) && (!inp.value || overwrite)) {
-            setNativeInputValue(inp, resolveValueForInput(inp, formFill), true);
+            setNativeInputValue(inp, resolveValueForInput(inp, formFill, pwdRef), true);
             blurredInputs.push(inp);
           }
           continue;
@@ -1956,8 +2301,11 @@
           continue;
         }
 
-        if (!overwrite && inp.value && String(inp.value).trim() !== "") continue;
-        setNativeInputValue(inp, resolveValueForInput(inp, formFill), true);
+        if (!overwrite && inp.value && String(inp.value).trim() !== "") {
+          if (type === "password" && !pwdRef.primary) pwdRef.primary = String(inp.value);
+          continue;
+        }
+        setNativeInputValue(inp, resolveValueForInput(inp, formFill, pwdRef), true);
         blurredInputs.push(inp);
       }
 
@@ -1991,7 +2339,7 @@
       while (node && cnt < 8000) {
         cnt++;
         var sr = getShadowRoot(node);
-        if (sr) fillScope(sr, formFill, (shadowDepth || 0) + 1);
+        if (sr) fillScope(sr, formFill, (shadowDepth || 0) + 1, pwdRef);
         node = walker.nextNode();
       }
     } catch (e) {}
@@ -2162,13 +2510,81 @@
     el.click();
   }
 
-  async function triggerElementAction(targetEl, targetInfo) {
+  function pickUnvisitedSelectOption(selectEl, baseSig, clickedSet) {
+    if (!selectEl || selectEl.tagName !== "SELECT" || !selectEl.options || selectEl.options.length <= 1) {
+      return null;
+    }
+    var validCount = 0;
+    for (var o = 0; o < selectEl.options.length && validCount < 4; o++) {
+      var opt = selectEl.options[o];
+      if (!opt || opt.disabled || opt.value === "") continue;
+      validCount++;
+      var optSig = baseSig + "|opt:" + o;
+      if (!clickedSet.has(optSig)) {
+        return {
+          optIndex: o,
+          optSignature: optSig,
+          optLabel: sanitizeLabel(opt.text || opt.value, 28)
+        };
+      }
+    }
+    return null;
+  }
+
+  function pickUnvisitedComboboxPass(el, baseSig, clickedSet) {
+    var role = (el.getAttribute && (el.getAttribute("role") || "")).toLowerCase();
+    var isCb = role === "combobox" || ((el.getAttribute && (el.getAttribute("aria-haspopup") || "")).toLowerCase() === "listbox");
+    if (!isCb) return null;
+    for (var pass = 0; pass < 3; pass++) {
+      var cbSig = baseSig + "|cbopt:" + pass;
+      if (!clickedSet.has(cbSig)) {
+        return { passIndex: pass, optSignature: cbSig };
+      }
+    }
+    return null;
+  }
+
+  function getRepeatingRowTemplateKey(el, info, routeKey) {
+    if (!el || !info) return "";
+    try {
+      var rowEl = closestAcrossShadow(el, "tbody > tr, [role='row'], ul > li, ol > li");
+      if (!rowEl || !rowEl.parentNode || !rowEl.parentNode.children) return "";
+      var parent = rowEl.parentNode;
+      var pTag = (parent.tagName || "").toUpperCase();
+      // Never cap navigation menus (nav > ul > li or role=menubar/tablist)
+      if (closestAcrossShadow(rowEl, "nav, [role='navigation'], [role='tablist'], [role='menubar'], [role='menu']")) {
+        return "";
+      }
+      var sibs = parent.children;
+      var sameRowCount = 0;
+      var rTag = rowEl.tagName;
+      for (var i = 0; i < sibs.length && sameRowCount < 4; i++) {
+        if (sibs[i].tagName === rTag) sameRowCount++;
+      }
+      if (sameRowCount < 3) return "";
+      var containerKey = buildStructuralPath(parent) || pTag;
+      return [
+        routeKey || "",
+        "ROW_TPL",
+        containerKey,
+        info.tag || "",
+        info.kind || "",
+        normalizeSigText(info.label || "")
+      ].join("|");
+    } catch (e) {
+      return "";
+    }
+  }
+
+  async function triggerElementAction(targetEl, targetInfo, targetMeta) {
     var view = getDocView(targetEl);
     var doc = targetEl.ownerDocument || document;
 
     if (targetInfo.kind === "select" && targetEl.tagName === "SELECT" && targetEl.options && targetEl.options.length > 1) {
-      var nextIdx = (targetEl.selectedIndex + 1) % targetEl.options.length;
-      if (targetEl.options[nextIdx].disabled || targetEl.options[nextIdx].value === "") {
+      var nextIdx = (targetMeta && typeof targetMeta.selectOptIdx === "number")
+        ? targetMeta.selectOptIdx
+        : ((targetEl.selectedIndex + 1) % targetEl.options.length);
+      if (targetEl.options[nextIdx] && (targetEl.options[nextIdx].disabled || targetEl.options[nextIdx].value === "")) {
         for (var o = 0; o < targetEl.options.length; o++) {
           if (o !== targetEl.selectedIndex && !targetEl.options[o].disabled && targetEl.options[o].value !== "") {
             nextIdx = o;
@@ -2203,17 +2619,24 @@
 
     await dispatchRealisticClick(targetEl, view);
 
-    // Custom Combobox / MUI / AntD / Radix portal listbox option picking
+    // Custom Combobox / MUI / AntD / Radix portal listbox multi-option picking
     if (isCombobox) {
-      await sleep(140);
+      await sleep(150);
       try {
         var listbox = doc.querySelector(
           "[role='listbox'], .ant-select-dropdown:not(.ant-select-dropdown-hidden), .MuiMenu-paper, .select2-results__options"
         );
         if (listbox && isVisible(listbox)) {
-          var opt = listbox.querySelector("[role='option']:not([aria-disabled='true']), .ant-select-item-option:not(.ant-select-item-option-disabled), .select2-results__option");
-          if (opt && isVisible(opt)) {
-            await dispatchRealisticClick(opt, view);
+          var opts = listbox.querySelectorAll("[role='option']:not([aria-disabled='true']), .ant-select-item-option:not(.ant-select-item-option-disabled), .select2-results__option");
+          var visibleOpts = [];
+          for (var oi = 0; oi < opts.length; oi++) {
+            if (isVisible(opts[oi])) visibleOpts.push(opts[oi]);
+          }
+          if (visibleOpts.length > 0) {
+            var desiredIdx = (targetMeta && typeof targetMeta.comboboxPassIdx === "number")
+              ? Math.min(targetMeta.comboboxPassIdx, visibleOpts.length - 1)
+              : 0;
+            await dispatchRealisticClick(visibleOpts[desiredIdx], view);
           }
         }
       } catch (e) {}
@@ -2315,6 +2738,28 @@
         return;
       }
 
+      if (!isAllowedUrl(location.href, state)) {
+        if (state.seedUrl && isAllowedUrl(state.seedUrl, state) && state.seedUrl !== location.href) {
+          reportTelemetry("NAVIGATING", 0, 0, true);
+          updateBadge("Ngoài phạm vi -> chuyển tới " + state.seedUrl, "#b45309");
+          location.replace(state.seedUrl);
+          return;
+        }
+        var btInit = await apiCall(CONTROL + "/backtrack", "POST", {
+          url: location.href,
+          defer: "1",
+          dest: location.href,
+          reason: "Trang hiện tại nằm ngoài phạm vi crawl cho phép: " + location.href
+        }).catch(function () { return null; });
+        if (btInit && !btInit.done && btInit.targetUrl && isAllowedUrl(btInit.targetUrl, state)) {
+          location.replace(btInit.targetUrl);
+          return;
+        }
+        reportTelemetry("IDLE", 0, 0, true);
+        updateBadge("Chặn crawl: URL ngoài phạm vi cho phép", "#b91c1c");
+        return;
+      }
+
       var captchaReason = detectCaptchaOrChallenge();
       if (captchaReason) {
         reportTelemetry("PAUSED", 0, 0, true);
@@ -2362,10 +2807,13 @@
 
       var links = [];
       discoverLinks(document, links, 0, 0, state, location.href);
+      discoverSpaFrameworkRoutes(links, state);
       await apiCall(CONTROL + "/discovered", "POST", { pageUrl: location.href, urls: links, skipped: [] });
 
       // Route-partitioned clickedSet cache: routeKey -> Set<signature>
       var clickedByRoute = new Map();
+      var rowTemplateCounts = new Map();
+      var maxRowSamples = 2;
       function getClickedSetForRoute(rk, seedArray) {
         var s = clickedByRoute.get(rk);
         if (!s) {
@@ -2392,6 +2840,20 @@
       while (actionsDone < maxActions) {
         if (spaRouteDirty && location.href !== passRouteUrl) {
           spaRouteDirty = false;
+          if (!isAllowedUrl(location.href, currentConfig)) {
+            var disallowedSpa = location.href;
+            await postExternalRedirectNote(
+              formatActionPath(passRouteUrl, "spa navigate", "", currentConfig),
+              disallowedSpa,
+              "Chặn SPA điều hướng ra ngoài phạm vi crawl: " + disallowedSpa,
+              "spa navigate",
+              ""
+            );
+            var btSpa = await apiCall(CONTROL + "/backtrack", "POST", { url: disallowedSpa, defer: "1", dest: disallowedSpa });
+            var retSpa = (btSpa && btSpa.targetUrl && isAllowedUrl(btSpa.targetUrl, currentConfig)) ? btSpa.targetUrl : passRouteUrl;
+            location.replace(retSpa);
+            return;
+          }
           passRouteUrl = location.href;
           pendingSpaSimHashCheck = true;
           var spaLoadPath = formatActionPath(passRouteUrl, "page load", "", currentConfig);
@@ -2475,6 +2937,8 @@
         var targetItem = null;
         var targetInfo = null;
         var targetGlobalSig = "";
+        var targetEffectiveSig = "";
+        var remainingUnclickedAfterTarget = 0;
 
         for (var i = 0; i < items.length; i++) {
           var item = items[i];
@@ -2487,7 +2951,24 @@
           if (clickedSet.has("CHEAP:" + cheapKey)) continue;
 
           var info = extractElementInfo(el, fp, itemRouteKey);
-          if (clickedSet.has(info.signature)) {
+          var selChoice = (info.kind === "select" && el.tagName === "SELECT")
+            ? pickUnvisitedSelectOption(el, info.signature, clickedSet)
+            : null;
+          var cbChoice = (!selChoice && info.kind === "select")
+            ? pickUnvisitedComboboxPass(el, info.signature, clickedSet)
+            : null;
+
+          if (el.tagName === "SELECT" && el.options && el.options.length > 1) {
+            if (!selChoice) {
+              clickedSet.add(info.signature);
+              clickedSet.add("CHEAP:" + cheapKey);
+              continue;
+            }
+          } else if (cbChoice === null && (el.getAttribute("role") || "").toLowerCase() === "combobox") {
+            clickedSet.add(info.signature);
+            clickedSet.add("CHEAP:" + cheapKey);
+            continue;
+          } else if (clickedSet.has(info.signature)) {
             clickedSet.add("CHEAP:" + cheapKey);
             continue;
           }
@@ -2497,6 +2978,17 @@
             clickedSet.add(info.signature);
             clickedSet.add("CHEAP:" + cheapKey);
             continue;
+          }
+
+          // Cap identical actions across 100+ repeating table rows / list items to maxRowSamples (2)
+          var rowTplKey = getRepeatingRowTemplateKey(el, info, itemRouteKey);
+          if (rowTplKey) {
+            var tplUsed = rowTemplateCounts.get(rowTplKey) || 0;
+            if (tplUsed >= maxRowSamples) {
+              clickedSet.add(info.signature);
+              clickedSet.add("CHEAP:" + cheapKey);
+              continue;
+            }
           }
 
           if (freshState.dangerGuardEnabled) {
@@ -2522,12 +3014,23 @@
             continue;
           }
 
-          targetItem = item;
-          targetInfo = info;
-          targetGlobalSig = gSig;
-          targetItem._cheapKey = cheapKey;
-          targetItem._isPagination = isPaginationControl(el, info);
-          break;
+          if (!targetItem) {
+            targetItem = item;
+            targetInfo = info;
+            targetGlobalSig = gSig;
+            targetEffectiveSig = selChoice ? selChoice.optSignature : (cbChoice ? cbChoice.optSignature : info.signature);
+            targetItem._cheapKey = (selChoice || cbChoice) ? "" : cheapKey;
+            targetItem._isPagination = isPaginationControl(el, info);
+            targetItem._rowTplKey = rowTplKey;
+            targetItem._selectOptIdx = selChoice ? selChoice.optIndex : undefined;
+            targetItem._selectOptLabel = selChoice ? selChoice.optLabel : "";
+            targetItem._comboboxPassIdx = cbChoice ? cbChoice.passIndex : undefined;
+          } else {
+            remainingUnclickedAfterTarget++;
+            if (remainingUnclickedAfterTarget >= 3) {
+              break; // Enough to know page still has unclicked actions if navigation happens
+            }
+          }
         }
 
         if (skippedDonePromises.length > 0) {
@@ -2559,12 +3062,19 @@
         }
 
         var targetEl = targetItem.el;
-        clickedSet.add(targetInfo.signature);
+        var sigToRecord = targetEffectiveSig || targetInfo.signature;
+        clickedSet.add(sigToRecord);
         if (targetItem._cheapKey) clickedSet.add("CHEAP:" + targetItem._cheapKey);
+        if (targetItem._rowTplKey) {
+          rowTemplateCounts.set(targetItem._rowTplKey, (rowTemplateCounts.get(targetItem._rowTplKey) || 0) + 1);
+        }
 
         var beforeUrl = location.href;
         var itemDocUrl = targetItem.frameHref || beforeUrl;
         var actionLabel = targetInfo.label;
+        if (targetItem._selectOptLabel) {
+          actionLabel = sanitizeLabel(actionLabel + " [" + targetItem._selectOptLabel + "]", 56);
+        }
         var actionPath = formatActionPath(itemDocUrl, targetInfo.kindLabel, actionLabel, freshState, targetInfo.regionSegments, targetItem.framePrefix);
 
         var linkEl = (targetEl.tagName === "A" || (targetEl.getAttribute && targetEl.getAttribute("href")))
@@ -2601,15 +3111,16 @@
                 pageUrl: itemDocUrl,
                 stepLocator: buildStepLocator(targetEl, targetInfo, targetItem.framePrefix)
               });
-              await postExternalRedirectNote(actionPath, dest, "Đã chặn link trỏ ra ngoài host: " + dest, targetInfo.kindLabel, actionLabel);
+              await postExternalRedirectNote(actionPath, dest, "Đã chặn link ngoài phạm vi crawl: " + dest, targetInfo.kindLabel, actionLabel);
               await apiCall(CONTROL + "/done_action", "POST", { pageUrl: itemDocUrl, signature: targetInfo.signature });
               actionsDone++;
               continue;
             }
             if (dest !== itemDocUrl) {
               await apiCall(CONTROL + "/discovered", "POST", { pageUrl: itemDocUrl, urls: [dest], skipped: [] });
-              if (targetInfo.kind === "link" && !clickableNodes.has(targetEl) && !targetEl.hasAttribute("onclick")) {
-                await apiCall(CONTROL + "/done_action", "POST", { pageUrl: itemDocUrl, signature: targetInfo.signature });
+              var hasJsClick = clickableNodes.has(targetEl) || targetEl.hasAttribute("onclick") || hasFrameworkDelegatedAction(targetEl);
+              if (targetInfo.kind === "link" && (!hasJsClick || remainingUnclickedAfterTarget > 0) && targetItem.tier === 4) {
+                await apiCall(CONTROL + "/done_action", "POST", { pageUrl: itemDocUrl, signature: sigToRecord });
                 actionsDone++;
                 continue;
               }
@@ -2642,7 +3153,7 @@
         }
         await apiCall(CONTROL + "/done_action", "POST", {
           pageUrl: itemDocUrl,
-          signature: targetInfo.signature,
+          signature: sigToRecord,
           globalSignature: targetGlobalSig || ""
         });
         actionsDone++;
@@ -2652,7 +3163,10 @@
         } catch (e) {}
 
         try {
-          await triggerElementAction(targetEl, targetInfo);
+          await triggerElementAction(targetEl, targetInfo, {
+            selectOptIdx: targetItem._selectOptIdx,
+            comboboxPassIdx: targetItem._comboboxPassIdx
+          });
         } catch (e) {}
 
         await waitForNetworkSettle(freshState.actionWaitMs || 550, 3200, 180);
@@ -2685,19 +3199,24 @@
         if (location.href !== beforeUrl) {
           var jumpedUrl = location.href;
           if (!isAllowedUrl(jumpedUrl, freshState)) {
-            await postExternalRedirectNote(actionPath, jumpedUrl, "Chặn nhảy ra ngoài host: " + jumpedUrl, targetInfo.kindLabel, actionLabel);
+            await postExternalRedirectNote(actionPath, jumpedUrl, "Chặn nhảy ra ngoài phạm vi crawl: " + jumpedUrl, targetInfo.kindLabel, actionLabel);
             var btExt = await apiCall(CONTROL + "/backtrack", "POST", { url: jumpedUrl, defer: "1", dest: jumpedUrl });
-            var retExt = (btExt && btExt.targetUrl) ? btExt.targetUrl : beforeUrl;
+            var retExt = (btExt && btExt.targetUrl && isAllowedUrl(btExt.targetUrl, freshState)) ? btExt.targetUrl : beforeUrl;
             location.replace(retExt);
             return;
           }
           // In-scope SPA transition (pushState / replaceState / hashchange):
-          // Record route transition and continue exploring the new view without destructive history.back()
+          // Record route transition, re-queue beforeUrl if it still had unclicked controls, and continue exploring
           spaTransitions++;
           spaRouteDirty = false;
           pendingSpaSimHashCheck = true;
           passRouteUrl = jumpedUrl;
-          await apiCall(CONTROL + "/discovered", "POST", { pageUrl: beforeUrl, urls: [jumpedUrl], skipped: [] });
+          await apiCall(CONTROL + "/discovered", "POST", {
+            pageUrl: beforeUrl,
+            incompletePageUrl: remainingUnclickedAfterTarget > 0 ? beforeUrl : "",
+            urls: [jumpedUrl],
+            skipped: []
+          });
           var newSpaLoadPath = formatActionPath(jumpedUrl, "page load", "", freshState);
           await apiCall(CONTROL + "/context", "POST", {
             actionPath: newSpaLoadPath,
@@ -2836,6 +3355,12 @@
         headers: { "Content-Type": "application/json" },
         body: bodyStr,
         keepalive: true
+      }).then(function (r) {
+        return r && r.ok ? r.json() : null;
+      }).then(function (d) {
+        if (d && typeof d.contextId === "number" && d.contextId > 0) {
+          activeContextId = d.contextId;
+        }
       }).catch(function () {});
     } catch (e) {}
   }

@@ -94,6 +94,7 @@ public final class BurpSettingsPanel extends JPanel {
     private final JTextField tfHosts = new JTextField(24);
     private final JComboBox<String> cbRootLabel = new JComboBox<>(new String[]{"/", "toppage"});
     private final JTextField tfApiPrefix = new JTextField(22);
+    private final JCheckBox cbStrictSeedPath = new JCheckBox("Khóa phạm vi theo nhánh đường dẫn Seed URL (chặn trang gốc '/' và nhánh khác cùng domain)");
     private final JCheckBox cbStrictExcel = new JCheckBox("Strict Excel Mode (chỉ ghi bảng Excel; HTTP History vẫn ghi đủ)");
     private final JCheckBox cbIgnoreTrailingSlash = new JCheckBox("Bỏ qua dấu '/' cuối path khi khớp Excel");
     private final JCheckBox cbNormalizeIds = new JCheckBox("Gộp ID động trong Route URL (/users/123 -> /users/{id})");
@@ -367,6 +368,8 @@ public final class BurpSettingsPanel extends JPanel {
         scopeCard.setBorder(BorderFactory.createEmptyBorder(12, 16, 12, 16));
         GridBagConstraints gc = baseConstraints();
         cbRootLabel.setEditable(true);
+        tfHosts.setToolTipText("Hỗ trợ domain hoặc URL kèm đường dẫn nhánh (ví dụ: vnexpress.net/the-gioi hoặc https://vnexpress.net/the-gioi)");
+        cbStrictSeedPath.setOpaque(false);
         cbStrictExcel.setOpaque(false);
         cbIgnoreTrailingSlash.setOpaque(false);
         cbNormalizeIds.setOpaque(false);
@@ -386,7 +389,8 @@ public final class BurpSettingsPanel extends JPanel {
         gc.gridx = 0; gc.gridy = r; gc.weightx = 0; scopeCard.add(new JLabel("API Base Prefix:"), gc);
         gc.gridx = 1; gc.weightx = 1.0; scopeCard.add(tfApiPrefix, gc); r++;
 
-        gc.gridx = 0; gc.gridy = r++; gc.gridwidth = 2; scopeCard.add(cbStrictExcel, gc);
+        gc.gridx = 0; gc.gridy = r++; gc.gridwidth = 2; scopeCard.add(cbStrictSeedPath, gc);
+        gc.gridy = r++; scopeCard.add(cbStrictExcel, gc);
         gc.gridy = r++; scopeCard.add(cbIgnoreTrailingSlash, gc);
         gc.gridy = r++; scopeCard.add(cbNormalizeIds, gc);
         gc.gridy = r++; scopeCard.add(cbDangerGuard, gc);
@@ -580,6 +584,7 @@ public final class BurpSettingsPanel extends JPanel {
         Object rootObj = config.getRouteRootLabel();
         cbRootLabel.setSelectedItem(rootObj);
         tfApiPrefix.setText(config.getApiBasePrefix());
+        cbStrictSeedPath.setSelected(config.isStrictSeedPathScope());
         cbStrictExcel.setSelected(config.isStrictExcelOnly());
         cbIgnoreTrailingSlash.setSelected(config.isIgnoreTrailingSlash());
         cbNormalizeIds.setSelected(config.isNormalizeRouteIds());
@@ -620,6 +625,7 @@ public final class BurpSettingsPanel extends JPanel {
             ? cbRootLabel.getEditor().getItem() : cbRootLabel.getSelectedItem();
         config.setRouteRootLabel(rootObj != null ? String.valueOf(rootObj) : "/");
         config.setApiBasePrefix(tfApiPrefix.getText());
+        config.setStrictSeedPathScope(cbStrictSeedPath.isSelected());
         config.setStrictExcelOnly(cbStrictExcel.isSelected());
         config.setIgnoreTrailingSlash(cbIgnoreTrailingSlash.isSelected());
         config.setNormalizeRouteIds(cbNormalizeIds.isSelected());

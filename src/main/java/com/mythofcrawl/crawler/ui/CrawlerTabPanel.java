@@ -425,7 +425,7 @@ public final class CrawlerTabPanel extends JPanel {
         refreshModeFromState();
         refreshSafetySummary();
         refreshPendingCount();
-        logFromUi("theMythOfCrawl Crawler V_1.0_beta sẵn sàng [Form TEXT: \""
+        logFromUi("theMythOfCrawl Crawler V_1.1_beta sẵn sàng [Form TEXT: \""
             + this.config.getFormFillProfile().get(FormFillProfile.Field.TEXT) + "\"].");
     }
 
@@ -632,11 +632,11 @@ public final class CrawlerTabPanel extends JPanel {
     }
 
     private void startCrawlModeFromUi(boolean autoMode) {
-        String hosts = treeWorkspacePanel.getTargetHostInput();
+        String hosts = CrawlConfig.unwrapMarkdownLinks(treeWorkspacePanel.getTargetHostInput()).trim();
         if (hosts.isEmpty()) {
             hosts = config.getAllowedHostsCsv();
         }
-        String seed = treeWorkspacePanel.getSeedUrlInput();
+        String seed = CrawlConfig.unwrapMarkdownLinks(treeWorkspacePanel.getSeedUrlInput()).trim();
         if (seed.isEmpty()) {
             seed = config.getSeedUrl();
         }
@@ -657,13 +657,16 @@ public final class CrawlerTabPanel extends JPanel {
             treeWorkspacePanel.focusTargetHostInput();
             toast.showWarning(
                 "Thiếu Target Host",
-                "Nhập Target Host (ví dụ: app.example.com hoặc *) hoặc dán Seed URL đầy đủ trước khi bật "
+                "Nhập Target Host / URL nhánh (ví dụ: vnexpress.net/the-gioi hoặc *) hoặc dán Seed URL trước khi bật "
                     + (autoMode ? "Auto-Crawl." : "Capture."));
             refreshModeFromState();
             treeWorkspacePanel.refreshAutoCrawlTelemetry();
             return;
         }
         config.setAllowedHostsCsv(hosts);
+        if (seed.isEmpty() && config.hasPathScopeRestriction()) {
+            seed = config.getPrimaryAllowedEntryUrl();
+        }
         config.setSeedUrl(seed);
         config.setAllowAutoRequests(autoMode);
         treeWorkspacePanel.syncInputsFromConfig();

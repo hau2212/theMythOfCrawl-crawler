@@ -277,6 +277,28 @@ public final class ActionGroupStore {
     }
 
     /**
+     * Thread-safely attaches an additional semantic audit NOTE (such as GraphQL 200 errors or
+     * disguised JSON 401/500 envelopes) to a recorded {@link ApiCall}, deduplicating by {@link AuditNote.Type}.
+     */
+    public void attachCallNoteIfAbsent(ApiCall call, AuditNote.Severity sev, AuditNote.Type type, String msg) {
+        if (call == null || sev == null || type == null || msg == null || msg.trim().isEmpty()) {
+            return;
+        }
+        rwl.writeLock().lock();
+        try {
+            for (AuditNote existing : call.getNotes()) {
+                if (existing.type == type) {
+                    return;
+                }
+            }
+            addNote(call, sev, type, msg.trim());
+            version.incrementAndGet();
+        } finally {
+            rwl.writeLock().unlock();
+        }
+    }
+
+    /**
      * Records a standalone group-level audit NOTE (e.g., external redirect link or deferred redirect trap
      * that did not yield a normal backend API call, so it still appears in Bảng NOTE and on the Group).
      */

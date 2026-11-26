@@ -102,9 +102,10 @@ public final class TreeWorkspacePanel extends JPanel {
     private final JPanel northContainer = new JPanel(new BorderLayout(0, 0));
     private final JPanel autoCrawlStrip = new JPanel(new BorderLayout(Theme.SPACE_2, 0));
     private final JLabel lblHost = new JLabel("Host:");
-    private final JTextField txtTargetHost = new JTextField(10);
+    private final JTextField txtTargetHost = new JTextField(9);
     private final JLabel lblSeed = new JLabel("Seed:");
-    private final JTextField txtSeedUrl = new JTextField(14);
+    private final JTextField txtSeedUrl = new JTextField(12);
+    private final Ui.UiButton btnLockSeedPath;
     private final Ui.UiButton btnStartAuto;
     private final Ui.UiButton btnPauseAuto;
     private final Ui.UiButton btnOpenFirefox;
@@ -196,6 +197,7 @@ public final class TreeWorkspacePanel extends JPanel {
         this.onTogglePauseCrawl = onTogglePauseCrawl;
         this.onPersistConfig = onPersistConfig;
 
+        this.btnLockSeedPath = Ui.secondaryBtn("Khóa nhánh", VectorIcons.unlock(null));
         this.btnStartAuto = Ui.solidPrimary("Bắt đầu Auto", VectorIcons.play(Theme.inkWhite()));
         this.btnPauseAuto = Ui.secondaryBtn("Tạm dừng", VectorIcons.pause(Theme.text()));
         this.btnOpenFirefox = Ui.tonalBtn(Theme.Token.INFO, "Mở Firefox",
@@ -252,8 +254,9 @@ public final class TreeWorkspacePanel extends JPanel {
             BorderFactory.createMatteBorder(0, 0, 1, 0, Theme.border()),
             BorderFactory.createEmptyBorder(Theme.SPACE_1, Theme.SPACE_2, Theme.SPACE_1, Theme.SPACE_2)));
 
-        txtTargetHost.setToolTipText("Target Host(s) phân tách bằng dấu phẩy (ví dụ: app.example.com hoặc *)");
-        txtSeedUrl.setToolTipText("Seed URL đầy đủ (ví dụ: https://app.example.com/dashboard)");
+        txtTargetHost.setToolTipText("Target Host hoặc nhánh URL cho phép (ví dụ: vnexpress.net/the-gioi, https://vnexpress.net/the-gioi hoặc *)");
+        txtSeedUrl.setToolTipText("Seed URL đầy đủ (ví dụ: https://vnexpress.net/the-gioi — hỗ trợ dán link Markdown)");
+        btnLockSeedPath.setToolTipText("Khi bật: chỉ crawl bên trong nhánh đường dẫn của Seed URL (ví dụ /the-gioi), chặn trang gốc / và các nhánh khác cùng domain");
 
         JPanel left = new JPanel(new FlowLayout(FlowLayout.LEFT, Theme.SPACE_1, 0));
         left.setOpaque(false);
@@ -261,6 +264,7 @@ public final class TreeWorkspacePanel extends JPanel {
         left.add(txtTargetHost);
         left.add(lblSeed);
         left.add(txtSeedUrl);
+        left.add(btnLockSeedPath);
         left.add(btnStartAuto);
         left.add(btnPauseAuto);
         left.add(btnOpenFirefox);
@@ -287,6 +291,7 @@ public final class TreeWorkspacePanel extends JPanel {
         FocusAdapter persistOnBlur = new FocusAdapter() {
             @Override
             public void focusLost(FocusEvent e) {
+                syncInputsFromConfig();
                 if (onPersistConfig != null) {
                     onPersistConfig.run();
                 }
@@ -297,6 +302,7 @@ public final class TreeWorkspacePanel extends JPanel {
         txtTargetHost.addActionListener(e -> triggerStartAuto());
         txtSeedUrl.addActionListener(e -> triggerStartAuto());
 
+        btnLockSeedPath.addActionListener(e -> onToggleLockSeedPath());
         btnStartAuto.addActionListener(e -> triggerStartAuto());
         btnPauseAuto.addActionListener(e -> {
             if (onTogglePauseCrawl != null) {
@@ -307,18 +313,73 @@ public final class TreeWorkspacePanel extends JPanel {
         btnOpenFirefox.addActionListener(e -> onLaunchFirefoxClicked());
     }
 
+    private void onToggleLockSeedPath() {
+        if (config == null) {
+            return;
+        }
+        boolean next = !config.isStrictSeedPathScope();
+        config.setStrictSeedPathScope(next);
+        refreshLockSeedPathButton();
+        if (onPersistConfig != null) {
+            onPersistConfig.run();
+        }
+        if (toast != null) {
+            if (next) {
+                String primary = config.getPrimaryAllowedEntryUrl();
+                toast.showInfo("Đã bật Khóa nhánh URL",
+                    primary.isEmpty()
+                        ? "Hãy nhập Seed URL có đường dẫn con (ví dụ https://vnexpress.net/the-gioi)."
+                        : ("Chỉ crawl bên trong nhánh: " + primary));
+            } else {
+                toast.showInfo("Đã tắt Khóa nhánh Seed",
+                    config.hasPathScopeRestriction()
+                        ? "Ô Host vẫn đang chứa đường dẫn nhánh nên phạm vi nhánh vẫn được giữ."
+                        : "Cho phép crawl toàn bộ domain trong Target Host.");
+            }
+        }
+    }
+
+    private void refreshLockSeedPathButton() {
+        boolean strictSeed = config != null && config.isStrictSeedPathScope();
+        boolean hostSubPath = config != null && !strictSeed && config.hasPathScopeRestriction();
+        if (strictSeed || hostSubPath) {
+            btnLockSeedPath.setStyle(Ui.Style.TONAL);
+            btnLockSeedPath.setToken(Theme.Token.ACCENT);
+            btnLockSeedPath.setLabelAndIcon("Khóa nhánh", VectorIcons.lock(null));
+            btnLockSeedPath.setSelectedVisual(true);
+        } else {
+            btnLockSeedPath.setStyle(Ui.Style.SECONDARY);
+            btnLockSeedPath.setToken(Theme.Token.NEUTRAL);
+            btnLockSeedPath.setLabelAndIcon("Khóa nhánh", VectorIcons.unlock(null));
+            btnLockSeedPath.setSelectedVisual(false);
+        }
+    }
+
     private void onHostEdited() {
         if (syncingAutoStrip || config == null) {
             return;
         }
         config.setAllowedHostsCsv(txtTargetHost.getText().trim());
+        if (txtSeedUrl.getText().trim().isEmpty() && config.hasPathScopeRestriction()) {
+            String primary = config.getPrimaryAllowedEntryUrl();
+            if (!primary.isEmpty()) {
+                syncingAutoStrip = true;
+                try {
+                    txtSeedUrl.setText(primary);
+                    config.setSeedUrl(primary);
+                } finally {
+                    syncingAutoStrip = false;
+                }
+            }
+        }
+        refreshLockSeedPathButton();
     }
 
     private void onSeedEdited() {
         if (syncingAutoStrip || config == null) {
             return;
         }
-        String seed = txtSeedUrl.getText().trim();
+        String seed = CrawlConfig.unwrapMarkdownLinks(txtSeedUrl.getText()).trim();
         config.setSeedUrl(seed);
         if (txtTargetHost.getText().trim().isEmpty() && !seed.isEmpty()) {
             String host = extractHostFromUrl(seed);
@@ -332,26 +393,25 @@ public final class TreeWorkspacePanel extends JPanel {
                 }
             }
         }
+        refreshLockSeedPathButton();
     }
 
     private void triggerStartAuto() {
         if (config != null) {
-            String seed = txtSeedUrl.getText().trim();
-            String hosts = txtTargetHost.getText().trim();
+            String seed = CrawlConfig.unwrapMarkdownLinks(txtSeedUrl.getText()).trim();
+            String hosts = CrawlConfig.unwrapMarkdownLinks(txtTargetHost.getText()).trim();
             if (hosts.isEmpty() && !seed.isEmpty()) {
                 String extracted = extractHostFromUrl(seed);
                 if (!extracted.isEmpty()) {
                     hosts = extracted;
-                    syncingAutoStrip = true;
-                    try {
-                        txtTargetHost.setText(hosts);
-                    } finally {
-                        syncingAutoStrip = false;
-                    }
                 }
             }
             config.setAllowedHostsCsv(hosts);
+            if (seed.isEmpty() && config.hasPathScopeRestriction()) {
+                seed = config.getPrimaryAllowedEntryUrl();
+            }
             config.setSeedUrl(seed);
+            syncInputsFromConfig();
         }
         if (onStartAutoCrawl != null) {
             onStartAutoCrawl.run();
@@ -360,9 +420,9 @@ public final class TreeWorkspacePanel extends JPanel {
     }
 
     private void onLaunchFirefoxClicked() {
-        String url = txtSeedUrl.getText().trim();
+        String url = CrawlConfig.unwrapMarkdownLinks(txtSeedUrl.getText()).trim();
         if (url.isEmpty()) {
-            String hostCsv = txtTargetHost.getText().trim();
+            String hostCsv = CrawlConfig.unwrapMarkdownLinks(txtTargetHost.getText()).trim();
             if (hostCsv.isEmpty() && config != null) {
                 hostCsv = config.getAllowedHostsCsv();
             }
@@ -398,7 +458,7 @@ public final class TreeWorkspacePanel extends JPanel {
         if (rawUrl == null) {
             return "";
         }
-        String trimmed = rawUrl.trim();
+        String trimmed = CrawlConfig.unwrapMarkdownLinks(rawUrl).trim();
         if (!trimmed.toLowerCase(Locale.ROOT).startsWith("http://")
             && !trimmed.toLowerCase(Locale.ROOT).startsWith("https://")) {
             return "";
@@ -442,6 +502,7 @@ public final class TreeWorkspacePanel extends JPanel {
                     txtSeedUrl.setText(s);
                 }
             }
+            refreshLockSeedPathButton();
         } finally {
             syncingAutoStrip = false;
         }
@@ -454,6 +515,8 @@ public final class TreeWorkspacePanel extends JPanel {
         CrawlState.AgentTelemetry tel = state.getAgentTelemetrySnapshot();
         int visited = state.getVisitedPagesCount();
         int queued = state.getPendingQueueSize();
+        int endpoints = state.getActionGroups().endpointCount();
+        int ghosts = state.getDiscoveredJsEndpoints().size();
         String phase = tel != null && tel.phase != null && !tel.phase.isEmpty() ? tel.phase : "IDLE";
         int done = tel != null ? tel.actionsDoneOnPage : 0;
         int total = tel != null ? tel.totalTargetsOnPage : 0;
@@ -472,9 +535,11 @@ public final class TreeWorkspacePanel extends JPanel {
 
         lblTelemetryCounters.setText(
             "Trang: " + visited
-            + " | Hàng đợi: " + queued
-            + " | Bước: " + done + "/" + total
-            + " | " + phase);
+            + " | Đợi: " + queued
+            + " | API: " + endpoints
+            + (ghosts > 0 ? (" | Ghost: " + ghosts) : "")
+            + " | " + done + "/" + total
+            + " " + phase);
 
         CrawlState.Status st = state.getStatus();
         boolean paused = st == CrawlState.Status.PAUSED;

@@ -110,6 +110,8 @@ public final class DeepCrawlerTests {
             testHtmlAgentInjectorAndControlPlaneWhenReplayActive();
             testAuditThemeContrastForeground();
             testWaveCAutoCrawlTelemetrySeedAndJsRoutes();
+            testCoverageV11Upgrades(tmpDir);
+            testSubPathScopeLockVnExpressScenario();
             System.out.println("ALL DEEP INTEGRATION TESTS PASSED (" + passed + " test groups verified).");
         } finally {
             deleteRecursive(tmpDir.toFile());
@@ -1143,6 +1145,316 @@ public final class DeepCrawlerTests {
             assertTrue(jsState.getPendingQueueSize() >= 2, "StaticJsScanner enqueued discovered SPA route into crawl frontier");
         } finally {
             scanner.shutdown();
+        }
+
+        passed++;
+    }
+
+    private static void testCoverageV11Upgrades(Path tmpDir) throws Exception {
+        // 1. Priority Frontier: P0_HIGH (admin + missing-Excel hint) beats P1_NORMAL beats P2_LOW (pagination)
+        CrawlConfig cfg = new CrawlConfig();
+        cfg.setAllowedHostsCsv("spa.example.com");
+        cfg.setMaxPaginationSamples(4);
+        cfg.setDeepCrawlMode(true);
+        cfg.setStrictExcelOnly(false);
+
+        CrawlState prioState = new CrawlState();
+        prioState.updateMissingExcelRouteHints(Collections.singletonList("/invoices"));
+        assertTrue(prioState.enqueueUrl("https://spa.example.com/catalog/items/list/view?page=2", cfg), "Enqueue P2 pagination");
+        assertTrue(prioState.enqueueUrl("https://spa.example.com/catalog/items/list/detail", cfg), "Enqueue P1 depth-4 normal");
+        assertTrue(prioState.enqueueUrl("https://spa.example.com/portal/dept/sub/invoices/pending", cfg), "Enqueue P0 missing-Excel hint");
+        assertTrue(prioState.enqueueUrl("https://spa.example.com/admin/roles", cfg), "Enqueue P0 admin module");
+
+        String p1 = prioState.pollNextUnvisitedUrl();
+        String p2 = prioState.pollNextUnvisitedUrl();
+        String p3 = prioState.pollNextUnvisitedUrl();
+        String p4 = prioState.pollNextUnvisitedUrl();
+        assertEquals("https://spa.example.com/portal/dept/sub/invoices/pending", p1, "Missing-Excel hinted route polled first (P0)");
+        assertEquals("https://spa.example.com/admin/roles", p2, "Admin module route polled second (P0)");
+        assertEquals("https://spa.example.com/catalog/items/list/detail", p3, "Normal route polled before pagination (P1)");
+        assertEquals("https://spa.example.com/catalog/items/list/view?page=2", p4, "Pagination polled last (P2)");
+
+        // 2. Incomplete-page revisit: re-queues incomplete page up to 3 times without double-counting uniqueVisitedPages
+        prioState.markUrlVisited("https://spa.example.com/admin/roles");
+        int visitedBefore = prioState.getVisitedPagesCount();
+        assertTrue(prioState.requeueIncompletePage("https://spa.example.com/admin/roles", cfg), "Incomplete page re-queued #1");
+        assertEquals("https://spa.example.com/admin/roles", prioState.pollNextUnvisitedUrl(), "Incomplete page returned at head of P0");
+        prioState.markUrlVisited("https://spa.example.com/admin/roles");
+        assertEquals(visitedBefore, prioState.getVisitedPagesCount(), "Revisiting incomplete page does not inflate unique visited count");
+        prioState.markUrlCompleted("https://spa.example.com/admin/roles");
+        assertTrue(!prioState.requeueIncompletePage("https://spa.example.com/admin/roles", cfg), "Completed page is never re-queued as incomplete");
+
+        // 3. X-Myth-Ctx deterministic request correlation + zero-wire-leak header stripping
+        CrawlState ctxState = new CrawlState();
+        ctxState.setStatus(CrawlState.Status.RUNNING);
+        CrawlState.ActionContextSnapshot snapApprove = ctxState.setCurrentContextSnapshot(
+            "/ > orders > button \"Approve\"", "button", "Approve", "https://spa.example.com/orders", null);
+        CrawlState.ActionContextSnapshot snapExport = ctxState.setCurrentContextSnapshot(
+            "/ > orders > button \"Export\"", "button", "Export", "https://spa.example.com/orders", null);
+        assertTrue(snapExport.contextSeq > snapApprove.contextSeq, "Monotonic contextSeq generated");
+
+        ControlPlaneHandler cph = new ControlPlaneHandler(cfg, ctxState, 19999);
+        HttpService svc = HttpService.httpService("spa.example.com", 443, true);
+        Map<String, String> delayedHdrs = new LinkedHashMap<>();
+        delayedHdrs.put("Host", "spa.example.com");
+        delayedHdrs.put("X-Myth-Ctx", String.valueOf(snapApprove.contextSeq));
+        InterceptedRequest delayedReq = MockMontoyaSupport.mockInterceptedRequest(
+            701, svc, "POST", "/api/v1/orders/approve", delayedHdrs, "{\"id\":1}".getBytes(StandardCharsets.UTF_8));
+        ProxyRequestReceivedAction delayedAct = cph.handleRequestReceived(delayedReq);
+        assertTrue(!delayedAct.request().hasHeader("X-Myth-Ctx"), "X-Myth-Ctx MUST be stripped before leaving Proxy");
+        assertEquals("/ > orders > button \"Approve\"", ctxState.consumeMessageActionPath(701),
+            "Delayed async request correlated to exact originating Approve context despite newer Export context");
+
+        // 4. ES6 Template-Literal JS Scanner + Router Props + LiveIdPool Dynamic Concretization + OpenAPI
+        com.mythofcrawl.crawler.core.guardrail.LiveIdPool idPool = new com.mythofcrawl.crawler.core.guardrail.LiveIdPool();
+        CrawlState dynState = new CrawlState();
+        StaticJsScanner dynScanner = new StaticJsScanner(cfg, dynState, null);
+        dynScanner.setLiveIdPool(idPool);
+        try {
+            String modernJs = "const cancelUrl = `${API_ROOT}/api/v1/orders/${order.id}/cancel`;\n"
+                + "const router = [{ path: 'orders/:orderId/audit' }, { path: '/billing/summary' }];";
+            dynScanner.submitJsScan("https://spa.example.com/assets/modern.js", modernJs);
+            long waitDeadline = System.currentTimeMillis() + 3000L;
+            while (System.currentTimeMillis() < waitDeadline && dynState.getDiscoveredJsEndpoints().size() < 3) {
+                Thread.sleep(20L);
+            }
+            List<String> jsEps = dynState.getDiscoveredJsEndpoints();
+            assertTrue(jsEps.stream().anyMatch(s -> s.contains("/api/v1/orders/{orderId}/cancel")),
+                "ES6 template literal endpoint normalized and extracted: " + jsEps);
+            assertEquals("https://spa.example.com/billing/summary", dynState.pollNextUnvisitedUrl(),
+                "Static router path enqueued immediately");
+            assertEquals(0, dynState.getPendingQueueSize(), "Parameterized /orders/:orderId/audit waits for LiveIdPool ID");
+
+            // Simulate harvesting {"id": 7788} from GET /api/v1/orders -> triggers concretization!
+            int harvested = idPool.harvestFromJson("/api/v1/orders", "{\"data\":[{\"id\":7788}]}");
+            assertTrue(harvested >= 1, "LiveIdPool harvested order id 7788");
+            dynScanner.tryConcretizePendingRoutes();
+            assertEquals("https://spa.example.com/orders/7788/audit", dynState.pollNextUnvisitedUrl(),
+                "Parameterized JS route concretized with real harvested ID 7788 and enqueued");
+
+            // OpenAPI 3.0 discovery
+            String openApiJson = "{\"openapi\":\"3.0.1\",\"paths\":{\"/api/v1/invoices/{id}\":{\"get\":{},\"delete\":{}}}}";
+            int oaFound = com.mythofcrawl.crawler.proxy.SeedDiscoveryHelper.parseOpenApiSpecJson(
+                openApiJson, "https://spa.example.com", "/openapi.json", cfg, dynState, null);
+            assertEquals(2, oaFound, "Parsed 2 OpenAPI operations");
+            assertTrue(dynState.getDiscoveredJsEndpoints().stream().anyMatch(s -> s.contains("[OpenAPI] DELETE /api/v1/invoices/{id}")),
+                "OpenAPI DELETE endpoint recorded in Ghost discovery");
+        } finally {
+            dynScanner.shutdown();
+        }
+
+        // 5. GET GraphQL Op Extraction + HTTP 200 GraphQL Error & Disguised JSON 401 + Ghost Coverage Report
+        MockMontoyaSupport.MockEnv env = new MockMontoyaSupport.MockEnv();
+        MontoyaApi api = MockMontoyaSupport.mockMontoyaApi(env);
+        CrawlState qualState = new CrawlState();
+        qualState.setStatus(CrawlState.Status.RUNNING);
+        qualState.setCurrentContext("/ > audit > button \"Check\"", "button", "Check", "https://spa.example.com/audit");
+        qualState.addDiscoveredJsEndpoint("[OpenAPI] DELETE /api/v1/hidden-admin  (from /openapi.json)");
+        qualState.addDiscoveredJsEndpoint("/api/v1/profile  (from app.js)");
+
+        ControlPlaneHandler qCph = new ControlPlaneHandler(cfg, qualState, 19999);
+        StaticJsScanner qScanner = new StaticJsScanner(cfg, qualState, null);
+        HtmlAgentInjector qInjector = new HtmlAgentInjector(api, cfg, qualState, qCph, qScanner, null, null, null);
+        qInjector.setLiveIdPool(idPool);
+        try {
+            // GET GraphQL with HTTP 200 errors[]
+            HttpRequest gqlGetReq = MockMontoyaSupport.mockInterceptedRequest(
+                801, svc, "GET", "/graphql?operationName=ListSecrets&query=query+ListSecrets+%7B+secrets+%7D",
+                Collections.singletonMap("Host", "spa.example.com"), new byte[0]);
+            byte[] gqlErrBody = "{\"data\":null,\"errors\":[{\"message\":\"Access denied to secrets\"}]}".getBytes(StandardCharsets.UTF_8);
+            InterceptedResponse gqlGetResp = MockMontoyaSupport.mockInterceptedResponse(
+                801, gqlGetReq, 200, Collections.singletonMap("Content-Type", "application/json"),
+                gqlErrBody, MimeType.JSON, MimeType.JSON, env);
+            qInjector.handleResponseReceived(gqlGetResp);
+
+            // Disguised 401 inside HTTP 200 JSON envelope
+            HttpRequest softAuthReq = MockMontoyaSupport.mockInterceptedRequest(
+                802, svc, "POST", "/api/v1/profile",
+                Collections.singletonMap("Host", "spa.example.com"), new byte[0]);
+            byte[] softAuthBody = "{\"code\":401,\"message\":\"Token expired\"}".getBytes(StandardCharsets.UTF_8);
+            InterceptedResponse softAuthResp = MockMontoyaSupport.mockInterceptedResponse(
+                802, softAuthReq, 200, Collections.singletonMap("Content-Type", "application/json"),
+                softAuthBody, MimeType.JSON, MimeType.JSON, env);
+            qInjector.handleResponseReceived(softAuthResp);
+
+            long qWait = System.currentTimeMillis() + 3000L;
+            while (System.currentTimeMillis() < qWait && qualState.getActionGroups().totalCalls() < 2) {
+                Thread.sleep(20L);
+            }
+            // Allow post-record JSON note attachment inside captureWorker to finish
+            Thread.sleep(60L);
+
+            List<AuditNote> qNotes = qualState.getActionGroups().snapshotNotes();
+            assertTrue(qNotes.stream().anyMatch(n -> n.type == AuditNote.Type.GRAPHQL_ERROR && n.endpoint.contains("ListSecrets")),
+                "GET GraphQL op extracted and HTTP 200 GraphQL error flagged: " + qNotes);
+            assertTrue(qNotes.stream().anyMatch(n -> n.type == AuditNote.Type.SOFT_AUTH_OR_ERROR && n.message.contains("401")),
+                "Disguised JSON 401 inside HTTP 200 flagged: " + qNotes);
+
+            File mdReport = tmpDir.resolve("v11_coverage.md").toFile();
+            ReportExporter.exportMarkdown(mdReport, null, qualState.getExtraCaptures(), qualState.getActionGroups(), qualState);
+            String mdText = Files.readString(mdReport.toPath(), StandardCharsets.UTF_8);
+            assertTrue(mdText.contains("UNTRIGGERED_GHOST") && mdText.contains("/api/v1/hidden-admin"),
+                "Markdown report highlights untriggered OpenAPI ghost endpoint");
+            assertTrue(mdText.contains("`CALLED`") && mdText.contains("/api/v1/profile"),
+                "Markdown report marks triggered endpoint as CALLED");
+        } finally {
+            qInjector.shutdown();
+            qScanner.shutdown();
+        }
+
+        passed++;
+    }
+
+    private static void testSubPathScopeLockVnExpressScenario() throws Exception {
+        String mdInput = "[Tin Thế giới, thời sự quốc tế, phân tích an ninh, quân sự - VnExpress](https://vnexpress.net/the-gioi)";
+        assertEquals("https://vnexpress.net/the-gioi", CrawlConfig.unwrapMarkdownLinks(mdInput),
+            "Markdown link unwraps cleanly to https://vnexpress.net/the-gioi");
+
+        // Mode A: User pastes Markdown link / full sub-path URL directly into Host
+        CrawlConfig cfgHostPath = new CrawlConfig();
+        cfgHostPath.setAllowedHostsCsv(mdInput);
+        assertTrue(cfgHostPath.isHostAllowed("vnexpress.net"), "Host-level check allows vnexpress.net for control & API routing");
+        assertTrue(cfgHostPath.hasPathScopeRestriction(), "hasPathScopeRestriction true when Host includes /the-gioi");
+        assertEquals("https://vnexpress.net/the-gioi", cfgHostPath.getPrimaryAllowedEntryUrl(),
+            "Primary allowed entry URL derived from Host sub-path");
+        assertTrue(cfgHostPath.isUrlAllowedForCrawl("https://vnexpress.net/the-gioi"), "/the-gioi allowed");
+        assertTrue(cfgHostPath.isUrlAllowedForCrawl("https://vnexpress.net/the-gioi/"), "/the-gioi/ allowed");
+        assertTrue(cfgHostPath.isUrlAllowedForCrawl("https://vnexpress.net/the-gioi/quan-su-4800123.html"), "Child article allowed");
+        assertTrue(cfgHostPath.isUrlAllowedForCrawl("https://vnexpress.net/the-gioi?page=2"), "Query pagination allowed");
+        assertTrue(cfgHostPath.isUrlAllowedForCrawl("https://vnexpress.net/the-gioi-p2"), "CMS -p2 pagination allowed");
+        assertTrue(!cfgHostPath.isUrlAllowedForCrawl("https://vnexpress.net/"), "Root https://vnexpress.net/ rejected");
+        assertTrue(!cfgHostPath.isUrlAllowedForCrawl("https://vnexpress.net"), "Root https://vnexpress.net rejected");
+        assertTrue(!cfgHostPath.isUrlAllowedForCrawl("https://vnexpress.net/the-thao"), "Sibling /the-thao rejected");
+        assertTrue(!cfgHostPath.isUrlAllowedForCrawl("https://vnexpress.net/the-gioi-moi"), "Prefix collision /the-gioi-moi rejected");
+
+        // Mode B: Host = vnexpress.net + Seed = https://vnexpress.net/the-gioi + strictSeedPathScope = true
+        CrawlConfig cfgSeedLock = new CrawlConfig();
+        cfgSeedLock.setAllowedHostsCsv("vnexpress.net");
+        cfgSeedLock.setSeedUrl(mdInput);
+        cfgSeedLock.setStrictSeedPathScope(true);
+        cfgSeedLock.setAllowAutoRequests(true);
+        assertTrue(cfgSeedLock.hasPathScopeRestriction(), "strictSeedPathScope enables path scope restriction");
+        assertTrue(cfgSeedLock.isUrlAllowedForCrawl("https://vnexpress.net/the-gioi/phan-tich"), "Mode B allows /the-gioi/phan-tich");
+        assertTrue(!cfgSeedLock.isUrlAllowedForCrawl("https://vnexpress.net/"), "Mode B blocks https://vnexpress.net/");
+
+        // Persistence round-trip
+        CrawlConfig reloaded = new CrawlConfig();
+        reloaded.loadFromPersistJson(cfgSeedLock.toPersistJson());
+        assertTrue(reloaded.isStrictSeedPathScope(), "strictSeedPathScope persisted in JSON");
+        assertEquals("https://vnexpress.net/the-gioi", reloaded.getSeedUrl(), "Clean unwrapped seedUrl persisted");
+
+        // Frontier filtering in CrawlState
+        CrawlState state = new CrawlState();
+        state.resetAll("https://vnexpress.net/the-gioi");
+        state.setStatus(CrawlState.Status.RUNNING);
+        assertTrue(!state.enqueueUrl("https://vnexpress.net/", cfgSeedLock), "Frontier rejects root https://vnexpress.net/");
+        assertTrue(!state.enqueueUrl("https://vnexpress.net/the-thao", cfgSeedLock), "Frontier rejects /the-thao");
+        assertTrue(state.enqueueUrl("https://vnexpress.net/the-gioi/tu-lieu", cfgSeedLock), "Frontier accepts /the-gioi/tu-lieu");
+
+        // LocalControlServer /state scopeRules + /bounce_back fallback to https://vnexpress.net/the-gioi
+        LocalControlServer srv = new LocalControlServer(cfgSeedLock, state, null, null, true);
+        srv.start();
+        MockMontoyaSupport.MockEnv env = new MockMontoyaSupport.MockEnv();
+        MontoyaApi api = MockMontoyaSupport.mockMontoyaApi(env);
+        ControlPlaneHandler cph = new ControlPlaneHandler(cfgSeedLock, state, srv.getPort());
+        StaticJsScanner scanner = new StaticJsScanner(cfgSeedLock, state, null);
+        HtmlAgentInjector injector = new HtmlAgentInjector(api, cfgSeedLock, state, cph, scanner, null, null, null);
+        try {
+            int port = srv.getPort();
+            String tok = srv.getSessionToken();
+
+            HttpURLConnection stConn = (HttpURLConnection) new URL("http://127.0.0.1:" + port + "/__myth_crawl/state").openConnection();
+            stConn.setRequestProperty("X-Myth-Token", tok);
+            Map<String, Object> stJson = MiniJson.parseObject(new String(stConn.getInputStream().readAllBytes(), StandardCharsets.UTF_8));
+            assertEquals(Boolean.TRUE, stJson.get("hasPathScope"), "/state reports hasPathScope=true");
+            assertEquals("https://vnexpress.net/the-gioi", stJson.get("seedUrl"), "/state exposes allowed seedUrl");
+            assertTrue(stJson.get("scopeRules") instanceof List<?> && !((List<?>) stJson.get("scopeRules")).isEmpty(),
+                "/state exposes scopeRules for crawler-agent.js");
+
+            HttpService vneSvc = HttpService.httpService("vnexpress.net", 443, true);
+
+            // 1. Top-level browser navigation to disallowed root https://vnexpress.net/ -> intercepted & bounced!
+            Map<String, String> rootDocHdrs = new LinkedHashMap<>();
+            rootDocHdrs.put("Host", "vnexpress.net");
+            rootDocHdrs.put("Accept", "text/html,application/xhtml+xml");
+            rootDocHdrs.put("Sec-Fetch-Dest", "document");
+            rootDocHdrs.put("Sec-Fetch-Mode", "navigate");
+            InterceptedRequest rootReq = MockMontoyaSupport.mockInterceptedRequest(901, vneSvc, "GET", "/", rootDocHdrs, new byte[0]);
+            ProxyRequestReceivedAction rootAct = cph.handleRequestReceived(rootReq);
+            assertEquals(MessageReceivedAction.DO_NOT_INTERCEPT, rootAct.action(),
+                "Top-level GET / on vnexpress.net intercepted before hitting server");
+            assertTrue(rootAct.request().path().startsWith("/__myth_crawl/bounce_back?"),
+                "Disallowed root GET / redirected to local /__myth_crawl/bounce_back");
+
+            // Verify LocalControlServer /__myth_crawl/bounce_back bounces browser to https://vnexpress.net/the-gioi
+            HttpURLConnection bbConn = (HttpURLConnection) new URL("http://127.0.0.1:" + port + rootAct.request().path()).openConnection();
+            String bbHtml = new String(bbConn.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            assertTrue(bbHtml.contains("https://vnexpress.net/the-gioi"),
+                "bounce_back sends browser straight to https://vnexpress.net/the-gioi: " + bbHtml);
+
+            // 2. Top-level browser navigation to allowed https://vnexpress.net/the-gioi -> allowed!
+            InterceptedRequest okDocReq = MockMontoyaSupport.mockInterceptedRequest(902, vneSvc, "GET", "/the-gioi", rootDocHdrs, new byte[0]);
+            ProxyRequestReceivedAction okDocAct = cph.handleRequestReceived(okDocReq);
+            assertEquals(MessageReceivedAction.CONTINUE, okDocAct.action(),
+                "Allowed GET /the-gioi continues normally through proxy");
+
+            // 3. Backend XHR/fetch API call (/api/comment/list) triggered FROM /the-gioi -> allowed & captured!
+            state.setCurrentContextSnapshot("/ > the-gioi > button \"Xem thêm\"", "button", "Xem thêm",
+                "https://vnexpress.net/the-gioi", null);
+            Map<String, String> apiHdrs = new LinkedHashMap<>();
+            apiHdrs.put("Host", "vnexpress.net");
+            apiHdrs.put("Accept", "application/json");
+            apiHdrs.put("Sec-Fetch-Dest", "empty");
+            apiHdrs.put("Sec-Fetch-Mode", "cors");
+            apiHdrs.put("Referer", "https://vnexpress.net/the-gioi");
+            InterceptedRequest apiReq = MockMontoyaSupport.mockInterceptedRequest(903, vneSvc, "GET", "/api/comment/list?id=1", apiHdrs, new byte[0]);
+            ProxyRequestReceivedAction apiAct = cph.handleRequestReceived(apiReq);
+            assertEquals(MessageReceivedAction.CONTINUE, apiAct.action(),
+                "Sub-resource API GET /api/comment/list from /the-gioi is NOT blocked by document path gate");
+            InterceptedResponse apiResp = MockMontoyaSupport.mockInterceptedResponse(
+                903, apiReq, 200, Collections.singletonMap("Content-Type", "application/json"),
+                "{\"items\":[1]}".getBytes(StandardCharsets.UTF_8), MimeType.JSON, MimeType.JSON, env);
+            injector.handleResponseReceived(apiResp);
+
+            // 4. Unbound API call from disallowed background tab (Referer: https://vnexpress.net/) -> ignored!
+            Map<String, String> outTabHdrs = new LinkedHashMap<>();
+            outTabHdrs.put("Host", "vnexpress.net");
+            outTabHdrs.put("Accept", "application/json");
+            outTabHdrs.put("Sec-Fetch-Dest", "empty");
+            outTabHdrs.put("Referer", "https://vnexpress.net/");
+            HttpRequest outTabReq = MockMontoyaSupport.mockInterceptedRequest(999, vneSvc, "GET", "/api/home/box-top", outTabHdrs, new byte[0]);
+            InterceptedResponse outTabResp = MockMontoyaSupport.mockInterceptedResponse(
+                999, outTabReq, 200, Collections.singletonMap("Content-Type", "application/json"),
+                "{\"home\":true}".getBytes(StandardCharsets.UTF_8), MimeType.JSON, MimeType.JSON, env);
+            injector.handleResponseReceived(outTabResp);
+
+            long waitUntil = System.currentTimeMillis() + 3000L;
+            while (System.currentTimeMillis() < waitUntil && state.getActionGroups().totalCalls() < 1) {
+                Thread.sleep(20L);
+            }
+            Thread.sleep(50L);
+            assertEquals(1, state.getActionGroups().totalCalls(),
+                "Only in-scope API from /the-gioi captured; out-of-scope Referer / ignored");
+
+            // 5. HTTP 302 redirect from /the-gioi/old-news -> Location: https://vnexpress.net/ intercepted & bounced!
+            InterceptedRequest oldNewsReq = MockMontoyaSupport.mockInterceptedRequest(904, vneSvc, "GET", "/the-gioi/old-news", rootDocHdrs, new byte[0]);
+            Map<String, String> redirHdrs = new LinkedHashMap<>();
+            redirHdrs.put("Location", "https://vnexpress.net/");
+            InterceptedResponse redirResp = MockMontoyaSupport.mockInterceptedResponse(
+                904, oldNewsReq, 302, redirHdrs, new byte[0], MimeType.NONE, MimeType.NONE, env);
+            ProxyResponseReceivedAction redirAct = injector.handleResponseReceived(redirResp);
+            assertEquals(MessageReceivedAction.DO_NOT_INTERCEPT, redirAct.action(),
+                "HTTP 302 redirecting to disallowed root https://vnexpress.net/ intercepted by HtmlAgentInjector");
+            assertTrue(redirAct.response().bodyToString().contains("https://vnexpress.net/the-gioi"),
+                "HTTP 302 bounce HTML returns browser to allowed /the-gioi scope | status=" + state.getStatus()
+                + " | q=" + state.getPendingQueueSize()
+                + " | defSeed=" + state.isUrlDeferred("https://vnexpress.net/the-gioi")
+                + " | compSeed=" + state.isUrlCompleted("https://vnexpress.net/the-gioi")
+                + " | body=" + redirAct.response().bodyToString());
+        } finally {
+            injector.shutdown();
+            scanner.shutdown();
+            srv.stop();
         }
 
         passed++;

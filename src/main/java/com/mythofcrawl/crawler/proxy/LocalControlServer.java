@@ -1,6 +1,7 @@
 package com.mythofcrawl.crawler.proxy;
 
 import com.mythofcrawl.crawler.core.guardrail.HttpEncodingGuard;
+import com.mythofcrawl.crawler.core.guardrail.LiveIdPool;
 import com.mythofcrawl.crawler.core.guardrail.ProxyInterceptQueue;
 import com.mythofcrawl.crawler.model.AuditNote;
 import com.mythofcrawl.crawler.model.ActionGroup;
@@ -55,6 +56,7 @@ public final class LocalControlServer {
 
     private volatile boolean requireToken;
     private volatile ProxyInterceptQueue interceptQueue;
+    private volatile LiveIdPool liveIdPool;
     private final java.util.concurrent.atomic.AtomicReference<String> latestUiAction =
         new java.util.concurrent.atomic.AtomicReference<>("");
     private ServerSocket serverSocket;
@@ -121,6 +123,10 @@ public final class LocalControlServer {
         if (interceptQueue != null) {
             state.setPendingInterceptCountSupplier(interceptQueue::pendingCount);
         }
+    }
+
+    public void setLiveIdPool(LiveIdPool liveIdPool) {
+        this.liveIdPool = liveIdPool;
     }
 
     public int getPort() {
@@ -326,7 +332,12 @@ public final class LocalControlServer {
             resp.put("normalizeRouteIds", config.isNormalizeRouteIds());
             resp.put("routeRootLabel", config.getRouteRootLabel());
             resp.put("allowedHosts", new java.util.ArrayList<>(config.getAllowedHostsSet()));
+            resp.put("scopeRules", config.getEffectiveScopeRulesForAgent());
+            resp.put("hasPathScope", config.hasPathScopeRestriction());
+            resp.put("seedUrl", config.getPrimaryAllowedEntryUrl());
             resp.put("formFill", config.getFormFillProfile().toAgentMap());
+            resp.put("liveIds", liveIdPool != null ? liveIdPool.snapshotLatestIds(64) : java.util.Collections.emptyMap());
+            resp.put("contextId", state.getLatestContextSeq());
             resp.put("clickedSignatures", state.getClickedSignatures(routeKey));
             resp.put("globalClickedSignatures", state.getGlobalClickedSignatures());
             resp.put("inFlight", state.getInFlightCount());
@@ -370,7 +381,8 @@ public final class LocalControlServer {
             ActionStep step = (locObj instanceof Map<?, ?>)
                 ? ActionStep.fromStepLocatorMap(0, pageUrl, kind, label, actionPath, (Map<?, ?>) locObj)
                 : null;
-            ActionGroup grp = state.setCurrentContext(actionPath, kind, label, pageUrl, step);
+            CrawlState.ActionContextSnapshot snap = state.setCurrentContextSnapshot(actionPath, kind, label, pageUrl, step);
+            ActionGroup grp = snap.group;
             if (logger != null && !actionPath.endsWith("> page load")) {
                 logger.accept("Nhóm thao tác -> " + actionPath);
             }
@@ -381,6 +393,7 @@ public final class LocalControlServer {
             resp.put("ok", true);
             resp.put("actionPath", actionPath);
             resp.put("groupId", grp != null ? grp.id : 0);
+            resp.put("contextId", snap.contextSeq);
             writeJson(out, resp);
             return;
         }
@@ -408,8 +421,19 @@ public final class LocalControlServer {
             if (!pageUrl.isEmpty()) {
                 state.markUrlVisited(pageUrl);
             }
-            List<String> urls = MiniJson.asStringList(req, "urls");
+            String incompleteUrl = MiniJson.asString(req, "incompletePageUrl", "");
+            boolean requeuedIncomplete = false;
+            if (!incompleteUrl.isEmpty()) {
+                requeuedIncomplete = state.requeueIncompletePage(incompleteUrl, config);
+            }
+            List<String> priorityUrls = MiniJson.asStringList(req, "priorityUrls");
             int added = 0;
+            for (String pu : priorityUrls) {
+                if (state.enqueuePriorityUrl(pu, config)) {
+                    added++;
+                }
+            }
+            List<String> urls = MiniJson.asStringList(req, "urls");
             for (String u : urls) {
                 if (state.enqueueUrl(u, config)) {
                     added++;
@@ -433,6 +457,7 @@ public final class LocalControlServer {
             Map<String, Object> resp = new LinkedHashMap<>();
             resp.put("ok", true);
             resp.put("enqueued", added);
+            resp.put("requeuedIncomplete", requeuedIncomplete);
             resp.put("queueRemaining", state.getPendingQueueSize());
             writeJson(out, resp);
             return;
@@ -651,32 +676,67 @@ public final class LocalControlServer {
         String pageUrl = !from.isEmpty() ? from : state.getCurrentPageUrl();
         String actionPath = state.getCurrentActionPath();
         ActionGroup grp = state.getActionGroups().openGroup(actionPath, "", "", pageUrl);
+        boolean sameHostOutOfScope = false;
+        try {
+            java.net.URI du = java.net.URI.create(dest);
+            sameHostOutOfScope = du.getHost() != null && config.isHostAllowed(du.getHost())
+                && !config.isUrlAllowedForCrawl(dest);
+        } catch (Exception ignored) {
+        }
         state.getActionGroups().recordStandaloneNote(
             grp,
             AuditNote.Severity.WARN,
             AuditNote.Type.EXTERNAL_REDIRECT,
             "NAV",
             dest,
-            "Đã chặn chuyển hướng ngoài host khi tự động crawl: " + dest
+            (sameHostOutOfScope
+                ? "Đã chặn điều hướng ngoài nhánh URL cho phép: "
+                : "Đã chặn chuyển hướng ngoài host khi tự động crawl: ") + dest
         );
-        CrawlState.BacktrackResult bt = state.recordRedirectBounce(pageUrl, dest, "1".equals(markFrom));
-        String backUrl = bt.targetUrl;
-        if (bt.exhausted || backUrl.isEmpty()) {
+        CrawlState.BacktrackResult bt;
+        String backUrl;
+        if (from.isEmpty() && !"1".equals(markFrom)) {
+            if (!dest.isEmpty()) {
+                state.markUrlDeferred(dest);
+            }
+            String safeCur = state.getLastKnownSafeUrl();
+            if (!safeCur.isEmpty() && config.isUrlAllowedForCrawl(safeCur) && !state.isUrlDeferred(safeCur)) {
+                bt = new CrawlState.BacktrackResult(safeCur, 0, false, false);
+                backUrl = safeCur;
+            } else {
+                bt = state.resolveBacktrackOrNextPage("", true, false);
+                backUrl = bt.targetUrl;
+            }
+        } else {
+            bt = state.recordRedirectBounce(pageUrl, dest, "1".equals(markFrom));
+            backUrl = bt.targetUrl;
+        }
+        if (bt.exhausted || backUrl.isEmpty() || !config.isUrlAllowedForCrawl(backUrl)) {
+            String fallbackEntry = config.getPrimaryAllowedEntryUrl();
+            if (!fallbackEntry.isEmpty()
+                && config.isUrlAllowedForCrawl(fallbackEntry)
+                && !state.isUrlDeferred(fallbackEntry)
+                && !state.isUrlCompleted(fallbackEntry)) {
+                backUrl = fallbackEntry;
+            } else {
+                backUrl = "";
+            }
+        }
+        if (backUrl.isEmpty()) {
             state.setStatus(CrawlState.Status.STOPPED);
             if (logger != null) {
-                logger.accept("[Redirect Guard] Chặn " + dest + " và hết URL an toàn -> Dừng crawl.");
+                logger.accept("[Scope Guard] Chặn " + dest + " và hết URL an toàn -> Dừng crawl.");
             }
             if (onUiEvent != null) {
                 onUiEvent.run();
             }
             String html = "<!doctype html><html><meta charset=\"utf-8\"><body>"
-                + "<p>Đã chặn chuyển hướng ngoài host và hoàn tất hàng đợi.</p></body></html>";
+                + "<p>Đã chặn điều hướng ngoài phạm vi crawl và hoàn tất hàng đợi.</p></body></html>";
             writeResponse(out, 200, "text/html; charset=utf-8", html.getBytes(StandardCharsets.UTF_8));
             return;
         }
         if (logger != null) {
-            logger.accept("[Redirect Guard] Chặn ra ngoài (" + dest + "), lùi "
-                + bt.levelsBack + " cấp -> " + backUrl);
+            logger.accept("[Scope Guard] Chặn (" + dest + "), quay về URL hợp lệ -> " + backUrl);
         }
         if (onUiEvent != null) {
             onUiEvent.run();
